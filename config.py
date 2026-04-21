@@ -22,7 +22,7 @@ def _require(key: str) -> str:
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN: str = _require("TELEGRAM_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN: str = _require("TELEGRAM_TOKEN")
 
 # ── Database ──────────────────────────────────────────────────────────────────
 DATABASE_URL: str = _require("DATABASE_URL")
@@ -30,9 +30,9 @@ DATABASE_URL: str = _require("DATABASE_URL")
 # ── Anthropic ─────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY: str = _require("ANTHROPIC_API_KEY")
 
-# ── Optional / runtime settings ───────────────────────────────────────────────
-# The environment name ("dev" or "main") — useful for logging.
-ENVIRONMENT: str = os.getenv("ENVIRONMENT", "dev")
+# ── TMDB ──────────────────────────────────────────────────────────────────────
+TMDB_API_KEY: str = _require("TMDB_API_KEY")
 
-# Maximum number of messages stored per user in the interaction log.
+# ── Optional / runtime settings ───────────────────────────────────────────────
+ENVIRONMENT: str = os.getenv("ENVIRONMENT", "dev")
 LOG_HISTORY_LIMIT: int = int(os.getenv("LOG_HISTORY_LIMIT", "500"))
