@@ -82,7 +82,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Hvad kan jeg hjælpe dig med?"
     )
 
-    await update.message.reply_text(reply)
+    await update.message.reply_text(reply, parse_mode="Markdown")
     await database.log_message(
         telegram_id=user.id,
         direction="outgoing",
@@ -116,7 +116,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     reply = await get_ai_response(telegram_id=user.id, user_message=text)
 
     # 4. Send reply to user.
-    await update.message.reply_text(reply)
+    await update.message.reply_text(reply, parse_mode="Markdown")
 
     # 5. Log outgoing message to PostgreSQL.
     await database.log_message(
