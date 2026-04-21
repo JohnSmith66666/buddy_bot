@@ -63,7 +63,7 @@ async def get_ai_response(telegram_id: int, user_message: str) -> str:
 
     try:
         response = _client.messages.create(
-            model="claude-opus-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=1024,
             system=SYSTEM_PROMPT,
             messages=_histories[telegram_id],
