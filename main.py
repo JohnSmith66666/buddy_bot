@@ -5,7 +5,7 @@ Startup sequence:
   1. Validate environment variables (config.py raises on missing keys).
   2. Connect to PostgreSQL and create tables (database.py).
   3. Register command / message handlers.
-  4. Start polling (or webhook in production).
+  4. Start polling.
 """
 
 import logging
@@ -22,6 +22,7 @@ from telegram.ext import (
 
 import config
 import database
+from ai_handler import clear_history, get_ai_response
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -36,10 +37,6 @@ logger = logging.getLogger(__name__)
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 async def _check_whitelist(update: Update) -> bool:
-    """
-    Return True if the user is authorised.
-    Silently ignore the message and return False if they are not.
-    """
     user = update.effective_user
     if user is None:
         return False
@@ -61,11 +58,13 @@ async def _check_whitelist(update: Update) -> bool:
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/start — greet the user in Danish if they are whitelisted."""
+    """/start — greet the user and reset conversation history."""
     if not await _check_whitelist(update):
         return
 
     user = update.effective_user
+    clear_history(user.id)
+
     await database.log_message(
         telegram_id=user.id,
         direction="incoming",
@@ -92,14 +91,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# ── Message handler ───────────────────────────────────────────────────────────
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Catch-all handler for plain text messages (placeholder for Claude integration)."""
+    """Route plain text messages through Claude and return the response."""
     if not await _check_whitelist(update):
         return
 
     user = update.effective_user
     text = update.message.text or ""
 
+    # 1. Log incoming message to PostgreSQL.
     await database.log_message(
         telegram_id=user.id,
         direction="incoming",
@@ -107,10 +109,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         username=user.username,
     )
 
-    # TODO: Route message through Claude Tool Use in a future step.
-    reply = "⚙️ AI-hjernen er ikke tilsluttet endnu — det kommer i næste trin!"
+    # 2. Show typing indicator while waiting for Claude.
+    await update.message.chat.send_action("typing")
+
+    # 3. Get response from Claude.
+    reply = await get_ai_response(telegram_id=user.id, user_message=text)
+
+    # 4. Send reply to user.
     await update.message.reply_text(reply)
 
+    # 5. Log outgoing message to PostgreSQL.
     await database.log_message(
         telegram_id=user.id,
         direction="outgoing",
@@ -122,15 +130,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ── Lifecycle hooks ───────────────────────────────────────────────────────────
 
 async def on_startup(application: Application) -> None:
-    """Called once when the bot starts — connects to the database."""
     await database.setup_db()
-    logger.info(
-        "Bot started in '%s' environment.", config.ENVIRONMENT
-    )
+    logger.info("Bot started in '%s' environment.", config.ENVIRONMENT)
 
 
 async def on_shutdown(application: Application) -> None:
-    """Called once when the bot shuts down — closes DB pool cleanly."""
     await database.close_db()
     logger.info("Bot shut down cleanly.")
 
@@ -146,7 +150,6 @@ def main() -> None:
         .build()
     )
 
-    # Register handlers.
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
