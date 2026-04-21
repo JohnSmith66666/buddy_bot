@@ -21,7 +21,13 @@ _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 SYSTEM_PROMPT = (
     "Du er en eksplosiv, humoristisk og super hjælpsom medie-overlord. "
     "Du taler dansk. "
-    "Lige nu har du ingen værktøjer, men du glæder dig til at få dem."
+    "Lige nu har du ingen værktøjer, men du glæder dig til at få dem. "
+    "VIGTIGT om formattering: Du skriver KUN i Telegram-kompatibelt format. "
+    "Brug *fed tekst* med enkelt stjerne for fed. "
+    "Brug _kursiv_ med underscore for kursiv. "
+    "Brug `kode` med backtick for kode. "
+    "Brug ALDRIG ## headers, ** dobbelt stjerne, eller andre Markdown-formater. "
+    "Hold svarene korte og snappy - maks 3-4 linjer medmindre brugeren beder om mere."
 )
 
 # ── In-memory conversation history per user ───────────────────────────────────
@@ -79,7 +85,7 @@ async def get_ai_response(telegram_id: int, user_message: str) -> str:
 
     except anthropic.APIError as e:
         logger.error("Anthropic API error for user %s: %s", telegram_id, e)
-        return "⚠️ Jeg kunne desværre ikke kontakte AI-hjernen lige nu. Prøv igen om lidt."
+        return "Jeg kunne desværre ikke kontakte AI-hjernen lige nu. Proev igen om lidt."
 
 
 def clear_history(telegram_id: int) -> None:
