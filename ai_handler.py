@@ -1,14 +1,19 @@
 """
 ai_handler.py - Manages all communication with the Anthropic Claude API.
-Maintains per-user conversation history in memory for multi-turn dialogue.
+
+Uses Tool Use (function calling) so Claude can query TMDB when the user
+asks about films or TV shows. New tools can be added to TOOLS and
+_handle_tool_call() as the project grows.
 """
 
+import json
 import logging
 from collections import defaultdict
 
 import anthropic
 
 from config import ANTHROPIC_API_KEY
+from services.tmdb_service import get_media_details, search_media
 
 logger = logging.getLogger(__name__)
 
@@ -21,30 +26,108 @@ _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 SYSTEM_PROMPT = (
     "Du er en eksplosiv, humoristisk og super hjælpsom medie-overlord. "
     "Du taler dansk. "
-    "Lige nu har du ingen værktøjer, men du glæder dig til at få dem. "
+    "Naar brugeren spoerger om film eller serier, bruger du ALTID dine vaerktoejer "
+    "til at hente opdaterede data fra TMDB - du finder aldrig paa information selv. "
+    "Naar du praesentererer soegeresultater, viser du titel, aar, genre og en kort beskrivelse. "
     "VIGTIGT om formattering: Du skriver KUN i Telegram-kompatibelt format. "
     "Brug *fed tekst* med enkelt stjerne for fed. "
     "Brug _kursiv_ med underscore for kursiv. "
-    "Brug `kode` med backtick for kode. "
     "Brug ALDRIG ## headers, ** dobbelt stjerne, eller andre Markdown-formater. "
     "Hold svarene korte og snappy - maks 3-4 linjer medmindre brugeren beder om mere."
 )
 
+# ── Tool definitions (sent to Claude on every request) ────────────────────────
+
+TOOLS = [
+    {
+        "name": "search_media",
+        "description": (
+            "Soeg efter film og/eller TV-serier paa TMDB. "
+            "Brug dette vaerktoej naar brugeren spoerger om en bestemt film eller serie, "
+            "vil finde noget at se, eller naevner en titel. "
+            "Returnerer op til 5 resultater per type med titel, aar, genre og beskrivelse."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Soegetermet - typisk en titel eller nogleord.",
+                },
+                "media_type": {
+                    "type": "string",
+                    "enum": ["movie", "tv", "both"],
+                    "description": (
+                        "Hvilken type medie der soges efter. "
+                        "Brug 'movie' for film, 'tv' for serier, 'both' hvis det er uklart."
+                    ),
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "get_media_details",
+        "description": (
+            "Hent detaljerede oplysninger om en specifik film eller TV-serie fra TMDB. "
+            "Brug dette vaerktoej naar brugeren vil vide mere om et bestemt resultat, "
+            "f.eks. spilletid, antal saesoner, IMDb-ID eller fuld beskrivelse. "
+            "Kraever et TMDB ID som faas fra search_media."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tmdb_id": {
+                    "type": "integer",
+                    "description": "TMDB ID paa filmen eller serien.",
+                },
+                "media_type": {
+                    "type": "string",
+                    "enum": ["movie", "tv"],
+                    "description": "Om det er en film eller en serie.",
+                },
+            },
+            "required": ["tmdb_id", "media_type"],
+        },
+    },
+]
+
 # ── In-memory conversation history per user ───────────────────────────────────
-# Format: { telegram_id: [ {"role": "user"|"assistant", "content": "..."}, ... ] }
-# This is reset when the bot restarts. Persistent history lives in PostgreSQL.
 
 _histories: dict[int, list[dict]] = defaultdict(list)
-
-# Maximum number of messages to keep per user in memory (older ones are pruned).
 _MAX_HISTORY = 20
 
 
 def _trim_history(telegram_id: int) -> None:
-    """Keep only the most recent _MAX_HISTORY messages for a user."""
     history = _histories[telegram_id]
     if len(history) > _MAX_HISTORY:
         _histories[telegram_id] = history[-_MAX_HISTORY:]
+
+
+# ── Tool execution ────────────────────────────────────────────────────────────
+
+async def _handle_tool_call(tool_name: str, tool_input: dict) -> str:
+    """
+    Execute the requested tool and return the result as a JSON string.
+    Claude receives this as a tool_result message.
+    """
+    logger.info("Tool call: %s(%s)", tool_name, tool_input)
+
+    if tool_name == "search_media":
+        results = await search_media(
+            query=tool_input["query"],
+            media_type=tool_input.get("media_type", "both"),
+        )
+        return json.dumps(results, ensure_ascii=False)
+
+    if tool_name == "get_media_details":
+        details = await get_media_details(
+            tmdb_id=tool_input["tmdb_id"],
+            media_type=tool_input["media_type"],
+        )
+        return json.dumps(details, ensure_ascii=False)
+
+    return json.dumps({"error": f"Ukendt vaerktoej: {tool_name}"})
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -53,39 +136,66 @@ async def get_ai_response(telegram_id: int, user_message: str) -> str:
     """
     Send a message to Claude and return the assistant's reply.
 
-    Maintains conversation history per user so Claude has context
-    across multiple turns in the same session.
-
-    Args:
-        telegram_id:   The Telegram user ID (used as history key).
-        user_message:  The raw text message from the user.
-
-    Returns:
-        The assistant's reply as a plain string.
+    Handles the full Tool Use agentic loop:
+      1. Send message + tools to Claude.
+      2. If Claude requests a tool, execute it and send the result back.
+      3. Repeat until Claude returns a plain text response.
     """
-    # Append the new user message to history.
     _histories[telegram_id].append({"role": "user", "content": user_message})
     _trim_history(telegram_id)
 
     try:
-        response = _client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=_histories[telegram_id],
-        )
+        # ── Agentic loop ──────────────────────────────────────────────────────
+        while True:
+            response = _client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1024,
+                system=SYSTEM_PROMPT,
+                tools=TOOLS,
+                messages=_histories[telegram_id],
+            )
 
-        reply = response.content[0].text
+            # ── Case 1: Claude wants to use a tool ────────────────────────────
+            if response.stop_reason == "tool_use":
+                # Add Claude's full response (with tool_use blocks) to history.
+                _histories[telegram_id].append(
+                    {"role": "assistant", "content": response.content}
+                )
 
-        # Append assistant reply to history for next turn.
-        _histories[telegram_id].append({"role": "assistant", "content": reply})
-        _trim_history(telegram_id)
+                # Execute every requested tool and collect results.
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        result_json = await _handle_tool_call(block.name, block.input)
+                        tool_results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": result_json,
+                            }
+                        )
 
-        return reply
+                # Feed all tool results back to Claude in one user turn.
+                _histories[telegram_id].append(
+                    {"role": "user", "content": tool_results}
+                )
+                _trim_history(telegram_id)
+                # Loop — Claude will now formulate its final answer.
+                continue
+
+            # ── Case 2: Claude returns a plain text answer ────────────────────
+            reply = next(
+                (block.text for block in response.content if hasattr(block, "text")),
+                "Jeg fik ikke et svar fra AI-hjernen. Proev igen.",
+            )
+
+            _histories[telegram_id].append({"role": "assistant", "content": reply})
+            _trim_history(telegram_id)
+            return reply
 
     except anthropic.APIError as e:
         logger.error("Anthropic API error for user %s: %s", telegram_id, e)
-        return "Jeg kunne desværre ikke kontakte AI-hjernen lige nu. Proev igen om lidt."
+        return "Jeg kunne desvaerre ikke kontakte AI-hjernen lige nu. Proev igen om lidt."
 
 
 def clear_history(telegram_id: int) -> None:
