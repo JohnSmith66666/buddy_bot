@@ -1,9 +1,9 @@
 """
 ai_handler.py - Manages all communication with the Anthropic Claude API.
 
-Uses Tool Use (function calling) so Claude can query TMDB when the user
-asks about films, TV shows, or people. New tools can be added to TOOLS
-and _handle_tool_call() as the project grows.
+Uses Tool Use (function calling) so Claude can query TMDB and request
+media via Seerr. New tools can be added to TOOLS and _handle_tool_call()
+as the project grows.
 """
 
 import json
@@ -13,6 +13,7 @@ from collections import defaultdict
 import anthropic
 
 from config import ANTHROPIC_API_KEY
+from services.seerr_service import request_movie, request_tv
 from services.tmdb_service import (
     get_media_details,
     get_person_filmography,
@@ -31,22 +32,35 @@ _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = (
-    "Du er en eksplosiv, humoristisk og super hjælpsom medie-overlord. "
-    "Du taler dansk. "
-    "Naar brugeren spoerger om film, serier, skuespillere eller instruktoerer, "
-    "bruger du ALTID dine vaerktoejer til at hente opdaterede data fra TMDB - "
-    "du finder aldrig paa information selv. "
-    "Naar du praesentererer soegeresultater, viser du titel, aar, genre og en kort beskrivelse. "
-    "Naar du praesentererer en person, viser du navn, rolle (skuespiller/instruktoer) "
-    "og deres mest kendte vaerker. "
-    "Naar du viser streaming-udbydere, naevner du KUN danske tjenester. "
-    "VIGTIGT om formattering: Du skriver KUN i Telegram-kompatibelt format. "
-    "Brug *fed tekst* med enkelt stjerne for fed. "
-    "Brug _kursiv_ med underscore for kursiv. "
-    "Brug ALDRIG ## headers, ** dobbelt stjerne, eller andre Markdown-formater. "
-    "Hold svarene korte og snappy - maks 3-4 linjer medmindre brugeren beder om mere."
-)
+SYSTEM_PROMPT = """Du er en eksplosiv, humoristisk og super hjælpsom medie-overlord. Du taler dansk.
+
+DATAHENTNING:
+Naar brugeren spoerger om film, serier, skuespillere eller instruktoerer, bruger du ALTID dine vaerktoejer til at hente opdaterede data fra TMDB - du finder aldrig paa information selv.
+
+ANMODNING VIA SEERR - SORTERINGSREGLER:
+Foer du anmoder via Seerr, SKAL du altid slaa op i TMDB foerst for at faa genre_ids og original_language.
+
+For FILM - vaelg category saaledes:
+- category="animation"  hvis genre ID 16 (Animation) er til stede
+- category="dansk"      hvis original_language er "da" (OG filmen ikke er animation)
+- category="standard"   i alle andre tilfaelde
+
+For SERIER - vaelg category saaledes:
+- category="tv_program"  hvis genren indeholder Reality (10764), Talk (10767) eller News (10763)
+- category="standard"    for Drama, Komedie og al anden fiktion - ogsaa selvom sproget er dansk
+
+PRAESENTATION:
+Naar du praesentererer soegeresultater, viser du titel, aar, genre og en kort beskrivelse.
+Naar du praesentererer en person, viser du navn, rolle og deres mest kendte vaerker.
+Naar du viser streaming-udbydere, naevner du KUN danske tjenester.
+Naar du bekraefter en anmodning, fortaeller du hvilken mappe titlen er sendt til.
+
+FORMATTERING:
+Du skriver KUN i Telegram-kompatibelt format.
+Brug *fed tekst* med enkelt stjerne for fed.
+Brug _kursiv_ med underscore for kursiv.
+Brug ALDRIG ## headers, ** dobbelt stjerne, eller andre Markdown-formater.
+Hold svarene korte og snappy - maks 3-4 linjer medmindre brugeren beder om mere."""
 
 # ── Tool definitions ──────────────────────────────────────────────────────────
 
@@ -57,7 +71,7 @@ TOOLS = [
             "Soeg efter film og/eller TV-serier paa TMDB. "
             "Brug dette vaerktoej naar brugeren spoerger om en bestemt film eller serie, "
             "vil finde noget at se, eller naevner en titel. "
-            "Returnerer op til 5 resultater per type med titel, aar, genre og beskrivelse."
+            "Returnerer op til 5 resultater per type med titel, aar, genre_ids og beskrivelse."
         ),
         "input_schema": {
             "type": "object",
@@ -83,8 +97,9 @@ TOOLS = [
         "description": (
             "Hent detaljerede oplysninger om en specifik film eller TV-serie fra TMDB. "
             "Brug dette vaerktoej naar brugeren vil vide mere om et bestemt resultat, "
-            "f.eks. spilletid, antal saesoner, IMDb-ID eller fuld beskrivelse. "
-            "Kraever et TMDB ID som faas fra search_media."
+            "ELLER naar du skal forberede en Seerr-anmodning og har brug for "
+            "genre_ids og original_language til at bestemme den korrekte rootFolder. "
+            "Kraever et TMDB ID fra search_media."
         ),
         "input_schema": {
             "type": "object",
@@ -108,7 +123,7 @@ TOOLS = [
             "Soeg efter en skuespiller, instruktoer eller andet filmhold-medlem paa TMDB. "
             "Brug dette vaerktoej naar brugeren naevner et personnavn, spoerger om en "
             "skuespillers karriere, eller vil finde film med en bestemt person. "
-            "Returnerer navn, rolle (skuespiller/instruktoer) og deres mest kendte vaerker."
+            "Returnerer navn, rolle og deres mest kendte vaerker."
         ),
         "input_schema": {
             "type": "object",
@@ -125,9 +140,7 @@ TOOLS = [
         "name": "get_person_filmography",
         "description": (
             "Hent den fulde filmografi for en specifik person - baade film og TV-serier. "
-            "Brug dette vaerktoej naar brugeren vil se alle film en skuespiller har medvirket i, "
-            "eller alle film en instruktoer har lavet. "
-            "Kraever et TMDB person-ID som faas fra search_person."
+            "Kraever et TMDB person-ID fra search_person."
         ),
         "input_schema": {
             "type": "object",
@@ -145,8 +158,7 @@ TOOLS = [
         "description": (
             "Hent de mest populaere og trendende film og serier denne uge. "
             "Brug dette vaerktoej naar brugeren spoerger om hvad der er populaert lige nu, "
-            "hvad der er trending, eller bare vil have inspiration til noget at se. "
-            "Returnerer en blanding af film og serier sorteret efter popularitet."
+            "hvad der er trending, eller bare vil have inspiration til noget at se."
         ),
         "input_schema": {
             "type": "object",
@@ -158,17 +170,15 @@ TOOLS = [
         "name": "get_recommendations",
         "description": (
             "Find film eller serier der ligner en specifik titel. "
-            "Brug dette vaerktoej naar brugeren vil have anbefalinger baseret paa noget de "
-            "allerede kan lide, f.eks. 'find noget der ligner Inception' eller "
-            "'hvad skal jeg se hvis jeg elsker Breaking Bad'. "
-            "Kraever et TMDB ID fra search_media eller get_media_details."
+            "Brug dette vaerktoej naar brugeren vil have anbefalinger baseret paa noget "
+            "de allerede kan lide. Kraever et TMDB ID fra search_media."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "tmdb_id": {
                     "type": "integer",
-                    "description": "TMDB ID paa den titel der skal baseres anbefalinger paa.",
+                    "description": "TMDB ID paa den titel der baseres anbefalinger paa.",
                 },
                 "media_type": {
                     "type": "string",
@@ -183,10 +193,8 @@ TOOLS = [
         "name": "get_watch_providers",
         "description": (
             "Find ud af hvilke danske streamingtjenester en film eller serie er tilgaengelig paa. "
-            "Brug dette vaerktoej naar brugeren spoerger 'hvor kan jeg se X', "
-            "'er X paa Netflix', eller 'hvilken streaming har X'. "
-            "Returnerer KUN danske udbydere (DK) opdelt i abonnement, leje og koeb. "
-            "Kraever et TMDB ID fra search_media eller get_media_details."
+            "Brug dette vaerktoej naar brugeren spoerger 'hvor kan jeg se X' eller "
+            "'er X paa Netflix'. Returnerer KUN danske udbydere (DK)."
         ),
         "input_schema": {
             "type": "object",
@@ -202,6 +210,70 @@ TOOLS = [
                 },
             },
             "required": ["tmdb_id", "media_type"],
+        },
+    },
+    {
+        "name": "request_movie",
+        "description": (
+            "Anmod om download af en film via Seerr. "
+            "Brug dette vaerktoej naar brugeren beder om at tilfoeje, downloade eller "
+            "hente en film. "
+            "VIGTIGT: Kald altid get_media_details foerst for at bestemme den korrekte category. "
+            "Saet category='animation' hvis genre ID 16 er til stede. "
+            "Saet category='dansk' hvis original_language='da' og filmen ikke er animation. "
+            "Saet category='standard' i alle andre tilfaelde."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tmdb_id": {
+                    "type": "integer",
+                    "description": "TMDB ID paa filmen der skal anmodes om.",
+                },
+                "category": {
+                    "type": "string",
+                    "enum": ["animation", "dansk", "standard"],
+                    "description": (
+                        "Routing-kategori der bestemmer Radarr root folder. "
+                        "'animation' → Animation-mappen, "
+                        "'dansk' → Dansk-mappen, "
+                        "'standard' → Film-mappen."
+                    ),
+                },
+            },
+            "required": ["tmdb_id", "category"],
+        },
+    },
+    {
+        "name": "request_tv",
+        "description": (
+            "Anmod om download af en TV-serie via Seerr. "
+            "Brug dette vaerktoej naar brugeren beder om at tilfoeje, downloade eller "
+            "hente en serie. "
+            "VIGTIGT: Kald altid get_media_details foerst for at bestemme den korrekte category. "
+            "Saet category='tv_program' hvis genren indeholder Reality (10764), "
+            "Talk (10767) eller News (10763). "
+            "Saet category='standard' for Drama, Komedie og al anden fiktion - "
+            "ogsaa selvom sproget er dansk."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tmdb_id": {
+                    "type": "integer",
+                    "description": "TMDB ID paa serien der skal anmodes om.",
+                },
+                "category": {
+                    "type": "string",
+                    "enum": ["tv_program", "standard"],
+                    "description": (
+                        "Routing-kategori der bestemmer Sonarr root folder. "
+                        "'tv_program' → TV-programmer-mappen (reality, talk, nyheder), "
+                        "'standard' → Serier-mappen (fiktion, drama, komedie)."
+                    ),
+                },
+            },
+            "required": ["tmdb_id", "category"],
         },
     },
 ]
@@ -264,6 +336,20 @@ async def _handle_tool_call(tool_name: str, tool_input: dict) -> str:
         )
         return json.dumps(providers, ensure_ascii=False)
 
+    if tool_name == "request_movie":
+        result = await request_movie(
+            tmdb_id=tool_input["tmdb_id"],
+            category=tool_input.get("category", "standard"),
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    if tool_name == "request_tv":
+        result = await request_tv(
+            tmdb_id=tool_input["tmdb_id"],
+            category=tool_input.get("category", "standard"),
+        )
+        return json.dumps(result, ensure_ascii=False)
+
     return json.dumps({"error": f"Ukendt vaerktoej: {tool_name}"})
 
 
@@ -291,7 +377,6 @@ async def get_ai_response(telegram_id: int, user_message: str) -> str:
                 messages=_histories[telegram_id],
             )
 
-            # ── Case 1: Claude wants to use a tool ────────────────────────────
             if response.stop_reason == "tool_use":
                 _histories[telegram_id].append(
                     {"role": "assistant", "content": response.content}
@@ -315,7 +400,6 @@ async def get_ai_response(telegram_id: int, user_message: str) -> str:
                 _trim_history(telegram_id)
                 continue
 
-            # ── Case 2: Claude returns a plain text answer ────────────────────
             reply = next(
                 (block.text for block in response.content if hasattr(block, "text")),
                 "Jeg fik ikke et svar fra AI-hjernen. Proev igen.",

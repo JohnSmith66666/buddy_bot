@@ -33,6 +33,17 @@ ANTHROPIC_API_KEY: str = _require("ANTHROPIC_API_KEY")
 # ── TMDB ──────────────────────────────────────────────────────────────────────
 TMDB_API_KEY: str = _require("TMDB_API_KEY")
 
+# ── Seerr ─────────────────────────────────────────────────────────────────────
+SEERR_API_KEY: str = _require("SEERR_API")
+SEERR_URL: str = _require("SEERR_URL")
+
+# ── Media root folders ────────────────────────────────────────────────────────
+ROOT_MOVIE_ANIMATION: str = "/mnt/unionfs/Media/Movies/Animation"
+ROOT_MOVIE_DANSK: str     = "/mnt/unionfs/Media/Movies/Dansk"
+ROOT_MOVIE_STANDARD: str  = "/mnt/unionfs/Media/Movies/Film"
+ROOT_TV_STANDARD: str     = "/mnt/unionfs/Media/TV/Serier"
+ROOT_TV_PROGRAMMER: str   = "/mnt/unionfs/Media/TV/TV"
+
 # ── Optional / runtime settings ───────────────────────────────────────────────
 ENVIRONMENT: str = os.getenv("ENVIRONMENT", "dev")
 LOG_HISTORY_LIMIT: int = int(os.getenv("LOG_HISTORY_LIMIT", "500"))
