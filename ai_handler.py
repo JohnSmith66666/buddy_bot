@@ -38,30 +38,28 @@ DATAHENTNING:
 Naar brugeren spoerger om film, serier, skuespillere eller instruktoerer, bruger du ALTID dine vaerktoejer til at hente opdaterede data fra TMDB - du finder aldrig paa information selv.
 
 ANMODNING VIA SEERR - SORTERINGSREGLER:
-Foer du anmoder via Seerr, SKAL du altid kalde get_media_details foerst for at faa genre_ids, original_language og number_of_seasons.
+Foer du anmoder via Seerr, SKAL du altid kalde get_media_details foerst for at faa genre_ids og original_language.
 
 For FILM - vaelg category saaledes:
 - category="animation"  hvis genre ID 16 (Animation) er til stede
 - category="dansk"      hvis original_language er "da" OG filmen ikke er animation
 - category="standard"   i alle andre tilfaelde
 
-For SERIER - naar du kalder request_tv SKAL du sende season_count baseret paa number_of_seasons fra TMDB.
-Vaelg category saaledes:
+For SERIER - vaelg category saaledes:
 - category="tv_program" hvis een eller flere af disse betingelser er opfyldt:
-    * genren indeholder Reality (10764), Talk (10767) eller News (10763)
-    * genren indeholder Dokumentar (99)
+    * genren indeholder Reality (10764), Talk (10767), News (10763) eller Dokumentar (99)
     * original_language er "da" OG genren indeholder Familie (10751)
-    * original_language er "da" OG genren mangler tunge fiktionsgenrer (18=Drama, 80=Krimi)
-- category="standard" for internationale serier og ren dansk fiktion (Drama/Krimi)
-  Eksempel: Argang 0 Forever er dansk + mangler Drama/Krimi → tv_program.
-  Eksempel: en dansk krimiserie har genre 80 → standard.
-  Eksempel: Breaking Bad er international Drama → standard.
+    * original_language er "da" OG genren mangler baade Drama (18) og Krimi (80)
+- category="standard" for internationale serier og ren dansk fiktion med Drama (18) eller Krimi (80)
+  Eksempel: Argang 0 Forever = dansk + ingen Drama/Krimi → tv_program
+  Eksempel: Dansk krimiserie = dansk + genre 80 → standard
+  Eksempel: Breaking Bad = international Drama → standard
 
 PRAESENTATION:
 Naar du praesentererer soegeresultater, viser du titel, aar, genre og en kort beskrivelse.
 Naar du praesentererer en person, viser du navn, rolle og deres mest kendte vaerker.
 Naar du viser streaming-udbydere, naevner du KUN danske tjenester.
-Naar du bekraefter en anmodning, fortaeller du titel, antal saesoner (for serier) og hvilken mappe titlen er sendt til.
+Naar du bekraefter en anmodning, fortaeller du titel og hvilken mappe titlen er sendt til.
 
 FORMATTERING:
 Du skriver KUN i Telegram-kompatibelt format.
@@ -106,8 +104,7 @@ TOOLS = [
             "Hent detaljerede oplysninger om en specifik film eller TV-serie fra TMDB. "
             "Brug dette vaerktoej naar brugeren vil vide mere om et bestemt resultat, "
             "ELLER naar du skal forberede en Seerr-anmodning og har brug for "
-            "genre_ids, original_language og number_of_seasons til at bestemme "
-            "den korrekte category og season_count. "
+            "genre_ids og original_language til at bestemme den korrekte category. "
             "Kraever et TMDB ID fra search_media."
         ),
         "input_schema": {
@@ -131,8 +128,7 @@ TOOLS = [
         "description": (
             "Soeg efter en skuespiller, instruktoer eller andet filmhold-medlem paa TMDB. "
             "Brug dette vaerktoej naar brugeren naevner et personnavn, spoerger om en "
-            "skuespillers karriere, eller vil finde film med en bestemt person. "
-            "Returnerer navn, rolle og deres mest kendte vaerker."
+            "skuespillers karriere, eller vil finde film med en bestemt person."
         ),
         "input_schema": {
             "type": "object",
@@ -166,8 +162,8 @@ TOOLS = [
         "name": "get_trending",
         "description": (
             "Hent de mest populaere og trendende film og serier denne uge. "
-            "Brug dette vaerktoej naar brugeren spoerger om hvad der er populaert lige nu, "
-            "hvad der er trending, eller bare vil have inspiration til noget at se."
+            "Brug dette vaerktoej naar brugeren spoerger om hvad der er populaert lige nu "
+            "eller vil have inspiration til noget at se."
         ),
         "input_schema": {
             "type": "object",
@@ -242,7 +238,6 @@ TOOLS = [
                     "type": "string",
                     "enum": ["animation", "dansk", "standard"],
                     "description": (
-                        "Routing-kategori der bestemmer Radarr root folder. "
                         "'animation' → Animation-mappen, "
                         "'dansk' → Dansk-mappen, "
                         "'standard' → Film-mappen."
@@ -255,13 +250,12 @@ TOOLS = [
     {
         "name": "request_tv",
         "description": (
-            "Anmod om download af en TV-serie via Seerr. "
+            "Anmod om download af en TV-serie via Seerr (alle saesoner anmodes automatisk). "
             "Brug dette vaerktoej naar brugeren beder om at tilfoeje, downloade eller hente en serie. "
-            "VIGTIGT: Kald altid get_media_details foerst for at faa number_of_seasons og genre_ids. "
-            "season_count SKAL vaere number_of_seasons fra TMDB. "
-            "SORTERING: Saet category='tv_program' hvis: genren indeholder Reality (10764), "
-            "Talk (10767), News (10763) eller Dokumentar (99) — ELLER hvis original_language='da' "
-            "og genren indeholder Familie (10751) eller mangler Drama (18) og Krimi (80). "
+            "VIGTIGT: Kald altid get_media_details foerst for at bestemme den korrekte category. "
+            "Saet category='tv_program' hvis: genren indeholder Reality (10764), Talk (10767), "
+            "News (10763) eller Dokumentar (99) — ELLER hvis original_language='da' og genren "
+            "indeholder Familie (10751) eller mangler baade Drama (18) og Krimi (80). "
             "Saet category='standard' for international fiktion og dansk Drama/Krimi."
         ),
         "input_schema": {
@@ -271,24 +265,16 @@ TOOLS = [
                     "type": "integer",
                     "description": "TMDB ID paa serien der skal anmodes om.",
                 },
-                "season_count": {
-                    "type": "integer",
-                    "description": (
-                        "Antal saesoner der skal anmodes om. "
-                        "Skal vaere number_of_seasons fra get_media_details."
-                    ),
-                },
                 "category": {
                     "type": "string",
                     "enum": ["tv_program", "standard"],
                     "description": (
-                        "Routing-kategori der bestemmer Sonarr root folder. "
                         "'tv_program' → TV-programmer-mappen (reality, talk, nyheder, dansk underholdning). "
                         "'standard' → Serier-mappen (international fiktion, dansk Drama/Krimi)."
                     ),
                 },
             },
-            "required": ["tmdb_id", "season_count", "category"],
+            "required": ["tmdb_id", "category"],
         },
     },
 ]
@@ -361,7 +347,6 @@ async def _handle_tool_call(tool_name: str, tool_input: dict) -> str:
     if tool_name == "request_tv":
         result = await request_tv(
             tmdb_id=tool_input["tmdb_id"],
-            season_count=tool_input["season_count"],
             category=tool_input.get("category", "standard"),
         )
         return json.dumps(result, ensure_ascii=False)
