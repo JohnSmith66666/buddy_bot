@@ -78,13 +78,23 @@ async def handle_approve_callback(update: Update, context: ContextTypes.DEFAULT_
     # Approve in DB
     await database.approve_user(new_user_id)
 
-    # Update the admin message to show approval is done
     user_row = await database.get_user(new_user_id)
     display = user_row.get("telegram_name") or str(new_user_id) if user_row else str(new_user_id)
-    await query.edit_message_text(
-        f"✅ *{display}* er nu godkendt og kan bruge Buddy.",
-        parse_mode="Markdown",
-    )
+
+    # Delete the approval message from the Buddy chat so it stays clean
+    try:
+        await query.delete_message()
+    except Exception:
+        pass  # Not critical if delete fails
+
+    # Send confirmation directly to admin as a private DM
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_TELEGRAM_ID,
+            text=f"✅ {display} er nu godkendt og kan bruge Buddy.",
+        )
+    except Exception as e:
+        logger.error("Could not send admin confirmation: %s", e)
 
     # Welcome the new user and prompt for Plex username
     welcome = (
