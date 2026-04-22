@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 _BASE_URL = "https://api.themoviedb.org/3"
 _POSTER_BASE = "https://image.tmdb.org/t/p/w500"
 _BACKDROP_BASE = "https://image.tmdb.org/t/p/original"
+_PROFILE_BASE = "https://image.tmdb.org/t/p/w185"
 _LANGUAGE = "da-DK"
 
 # Genre ID → Danish label (film)
@@ -52,6 +53,10 @@ def _poster_url(path: str | None) -> str | None:
 
 def _backdrop_url(path: str | None) -> str | None:
     return f"{_BACKDROP_BASE}{path}" if path else None
+
+
+def _profile_url(path: str | None) -> str | None:
+    return f"{_PROFILE_BASE}{path}" if path else None
 
 
 def _genre_names(genre_ids: list[int], is_tv: bool = False) -> list[str]:
@@ -189,3 +194,137 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
             "status": data.get("status"),
             "media_type": "tv",
         }
+
+
+async def search_person(query: str) -> list[dict]:
+    """
+    Search TMDB for actors, directors, and other crew members.
+
+    Args:
+        query: The person's name to search for.
+
+    Returns:
+        A list of up to 5 results with name, known_for_department,
+        profile photo URL, and their most known titles.
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(
+                f"{_BASE_URL}/search/person",
+                params=_params(query=query),
+            )
+            resp.raise_for_status()
+            raw_results = resp.json().get("results", [])[:5]
+        except httpx.HTTPError as e:
+            logger.error("TMDB person search error: %s", e)
+            return []
+
+    results = []
+    for person in raw_results:
+        # Build a short list of their most known titles.
+        known_for = []
+        for item in person.get("known_for", []):
+            title = item.get("title") or item.get("name") or item.get("original_title")
+            year = (item.get("release_date") or item.get("first_air_date") or "")[:4]
+            media = "film" if item.get("media_type") == "movie" else "serie"
+            if title:
+                known_for.append(f"{title} ({year}) [{media}]" if year else f"{title} [{media}]")
+
+        results.append({
+            "id": person.get("id"),
+            "name": person.get("name"),
+            "known_for_department": person.get("known_for_department", "Ukendt"),
+            "popularity": round(person.get("popularity", 0), 1),
+            "profile_url": _profile_url(person.get("profile_path")),
+            "known_for": known_for,
+        })
+
+    return results
+
+
+async def get_person_filmography(person_id: int) -> dict | None:
+    """
+    Fetch the full filmography (movie + TV credits) for a person.
+
+    Args:
+        person_id: The TMDB person ID (from search_person results).
+
+    Returns:
+        A dict with person details and sorted lists of movie/TV credits,
+        or None if not found.
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            # Fetch biography and basic details.
+            bio_resp = await client.get(
+                f"{_BASE_URL}/person/{person_id}",
+                params=_params(),
+            )
+            bio_resp.raise_for_status()
+            bio = bio_resp.json()
+
+            # Fetch combined credits (movies + TV in one call).
+            credits_resp = await client.get(
+                f"{_BASE_URL}/person/{person_id}/combined_credits",
+                params=_params(),
+            )
+            credits_resp.raise_for_status()
+            credits = credits_resp.json()
+
+        except httpx.HTTPError as e:
+            logger.error("TMDB filmography error (id=%s): %s", person_id, e)
+            return None
+
+    # Process movie credits — sort by release date descending.
+    movie_credits = []
+    for item in credits.get("cast", []):
+        if item.get("media_type") != "movie":
+            continue
+        movie_credits.append({
+            "id": item.get("id"),
+            "title": item.get("title") or item.get("original_title"),
+            "release_date": item.get("release_date", "")[:4] or "Ukendt",
+            "character": item.get("character"),
+            "vote_average": round(item.get("vote_average", 0), 1),
+        })
+    movie_credits.sort(key=lambda x: x["release_date"], reverse=True)
+
+    # Process TV credits — sort by first air date descending.
+    tv_credits = []
+    for item in credits.get("cast", []):
+        if item.get("media_type") != "tv":
+            continue
+        tv_credits.append({
+            "id": item.get("id"),
+            "title": item.get("name") or item.get("original_name"),
+            "first_air_date": item.get("first_air_date", "")[:4] or "Ukendt",
+            "character": item.get("character"),
+            "vote_average": round(item.get("vote_average", 0), 1),
+        })
+    tv_credits.sort(key=lambda x: x["first_air_date"], reverse=True)
+
+    # Crew credits (director, writer, etc.) — movies only, top 10.
+    crew_credits = []
+    for item in credits.get("crew", []):
+        if item.get("media_type") != "movie":
+            continue
+        crew_credits.append({
+            "id": item.get("id"),
+            "title": item.get("title") or item.get("original_title"),
+            "release_date": item.get("release_date", "")[:4] or "Ukendt",
+            "job": item.get("job"),
+        })
+    crew_credits.sort(key=lambda x: x["release_date"], reverse=True)
+
+    return {
+        "id": bio.get("id"),
+        "name": bio.get("name"),
+        "biography": (bio.get("biography") or "Ingen biografi tilgængelig.")[:500],
+        "birthday": bio.get("birthday"),
+        "place_of_birth": bio.get("place_of_birth"),
+        "known_for_department": bio.get("known_for_department", "Ukendt"),
+        "profile_url": _profile_url(bio.get("profile_path")),
+        "movie_credits": movie_credits[:10],
+        "tv_credits": tv_credits[:10],
+        "crew_credits": crew_credits[:10],
+    }

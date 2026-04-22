@@ -2,8 +2,8 @@
 ai_handler.py - Manages all communication with the Anthropic Claude API.
 
 Uses Tool Use (function calling) so Claude can query TMDB when the user
-asks about films or TV shows. New tools can be added to TOOLS and
-_handle_tool_call() as the project grows.
+asks about films, TV shows, or people. New tools can be added to TOOLS
+and _handle_tool_call() as the project grows.
 """
 
 import json
@@ -13,7 +13,12 @@ from collections import defaultdict
 import anthropic
 
 from config import ANTHROPIC_API_KEY
-from services.tmdb_service import get_media_details, search_media
+from services.tmdb_service import (
+    get_media_details,
+    get_person_filmography,
+    search_media,
+    search_person,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +31,12 @@ _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 SYSTEM_PROMPT = (
     "Du er en eksplosiv, humoristisk og super hjælpsom medie-overlord. "
     "Du taler dansk. "
-    "Naar brugeren spoerger om film eller serier, bruger du ALTID dine vaerktoejer "
-    "til at hente opdaterede data fra TMDB - du finder aldrig paa information selv. "
+    "Naar brugeren spoerger om film, serier, skuespillere eller instruktoerer, "
+    "bruger du ALTID dine vaerktoejer til at hente opdaterede data fra TMDB - "
+    "du finder aldrig paa information selv. "
     "Naar du praesentererer soegeresultater, viser du titel, aar, genre og en kort beskrivelse. "
+    "Naar du praesentererer en person, viser du navn, rolle (skuespiller/instruktoer) "
+    "og deres mest kendte vaerker. "
     "VIGTIGT om formattering: Du skriver KUN i Telegram-kompatibelt format. "
     "Brug *fed tekst* med enkelt stjerne for fed. "
     "Brug _kursiv_ med underscore for kursiv. "
@@ -36,7 +44,7 @@ SYSTEM_PROMPT = (
     "Hold svarene korte og snappy - maks 3-4 linjer medmindre brugeren beder om mere."
 )
 
-# ── Tool definitions (sent to Claude on every request) ────────────────────────
+# ── Tool definitions ──────────────────────────────────────────────────────────
 
 TOOLS = [
     {
@@ -90,6 +98,44 @@ TOOLS = [
             "required": ["tmdb_id", "media_type"],
         },
     },
+    {
+        "name": "search_person",
+        "description": (
+            "Soeg efter en skuespiller, instruktoer eller andet filmhold-medlem paa TMDB. "
+            "Brug dette vaerktoej naar brugeren naevner et personnavn, spoerger om en "
+            "skuespillers karriere, eller vil finde film med en bestemt person. "
+            "Returnerer navn, rolle (skuespiller/instruktoer) og deres mest kendte vaerker."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Personens navn, f.eks. 'Tom Hanks' eller 'Christopher Nolan'.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "get_person_filmography",
+        "description": (
+            "Hent den fulde filmografi for en specifik person - baade film og TV-serier. "
+            "Brug dette vaerktoej naar brugeren vil se alle film en skuespiller har medvirket i, "
+            "eller alle film en instruktoer har lavet. "
+            "Kraever et TMDB person-ID som faas fra search_person."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "person_id": {
+                    "type": "integer",
+                    "description": "TMDB person-ID fra search_person resultater.",
+                },
+            },
+            "required": ["person_id"],
+        },
+    },
 ]
 
 # ── In-memory conversation history per user ───────────────────────────────────
@@ -127,6 +173,14 @@ async def _handle_tool_call(tool_name: str, tool_input: dict) -> str:
         )
         return json.dumps(details, ensure_ascii=False)
 
+    if tool_name == "search_person":
+        results = await search_person(query=tool_input["query"])
+        return json.dumps(results, ensure_ascii=False)
+
+    if tool_name == "get_person_filmography":
+        filmography = await get_person_filmography(person_id=tool_input["person_id"])
+        return json.dumps(filmography, ensure_ascii=False)
+
     return json.dumps({"error": f"Ukendt vaerktoej: {tool_name}"})
 
 
@@ -145,7 +199,6 @@ async def get_ai_response(telegram_id: int, user_message: str) -> str:
     _trim_history(telegram_id)
 
     try:
-        # ── Agentic loop ──────────────────────────────────────────────────────
         while True:
             response = _client.messages.create(
                 model="claude-haiku-4-5-20251001",
@@ -157,12 +210,10 @@ async def get_ai_response(telegram_id: int, user_message: str) -> str:
 
             # ── Case 1: Claude wants to use a tool ────────────────────────────
             if response.stop_reason == "tool_use":
-                # Add Claude's full response (with tool_use blocks) to history.
                 _histories[telegram_id].append(
                     {"role": "assistant", "content": response.content}
                 )
 
-                # Execute every requested tool and collect results.
                 tool_results = []
                 for block in response.content:
                     if block.type == "tool_use":
@@ -175,12 +226,10 @@ async def get_ai_response(telegram_id: int, user_message: str) -> str:
                             }
                         )
 
-                # Feed all tool results back to Claude in one user turn.
                 _histories[telegram_id].append(
                     {"role": "user", "content": tool_results}
                 )
                 _trim_history(telegram_id)
-                # Loop — Claude will now formulate its final answer.
                 continue
 
             # ── Case 2: Claude returns a plain text answer ────────────────────
