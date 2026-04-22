@@ -659,13 +659,14 @@ def _validate_user_sync(plex_username: str) -> dict:
                 (getattr(user, "title", "") or "").lower(),
             }
             if norm in user_names:
-                display = (
-                    getattr(user, "title", None)
-                    or getattr(user, "username", None)
+                # Use actual Plex username (matches Seerr plexUsername field)
+                actual_username = (
+                    getattr(user, "username", None)
+                    or getattr(user, "title", None)
                     or plex_username
                 )
-                logger.info("Validated as shared friend: %s", display)
-                return {"valid": True, "username": display, "user_type": "friend"}
+                logger.info("Validated as shared friend: %s", actual_username)
+                return {"valid": True, "username": actual_username, "user_type": "friend"}
     except Exception as e:
         logger.warning("Could not check shared users: %s", e)
 
@@ -678,13 +679,14 @@ def _validate_user_sync(plex_username: str) -> dict:
                 (getattr(user, "title", "") or "").lower(),
             }
             if norm in user_names:
-                display = (
-                    getattr(user, "title", None)
-                    or getattr(user, "username", None)
+                # Use actual Plex username (matches Seerr plexUsername field)
+                actual_username = (
+                    getattr(user, "username", None)
+                    or getattr(user, "title", None)
                     or plex_username
                 )
-                logger.info("Validated as managed home user: %s", display)
-                return {"valid": True, "username": display, "user_type": "managed"}
+                logger.info("Validated as managed home user: %s", actual_username)
+                return {"valid": True, "username": actual_username, "user_type": "managed"}
     except Exception as e:
         logger.warning("Could not check home users: %s", e)
 
