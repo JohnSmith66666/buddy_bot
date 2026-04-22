@@ -20,13 +20,14 @@ async def notify_admin_new_user(update: Update) -> None:
     """
     Send the admin a notification with an approval button when an
     unknown user tries to use Buddy.
+    Uses plain text only — no parse_mode — to avoid Markdown errors
+    from special characters in usernames.
     """
     user = update.effective_user
     if user is None:
         return
 
     display = f"@{user.username}" if user.username else (user.first_name or "Ukendt")
-    # Plain text — no parse_mode — avoids Markdown errors from special chars in names
     text = (
         f"🔔 Ny bruger ønsker adgang til Buddy\n\n"
         f"Navn: {display}\n"
@@ -54,11 +55,12 @@ async def notify_admin_new_user(update: Update) -> None:
 
 async def handle_approve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handle the 'Godkend ✅' button press from the admin.
+    Handle the 'Godkend' button press from the admin.
 
     - Whitelists the user in the database.
-    - Updates the admin message to confirm approval.
-    - Sends the new user a welcome message asking for their Plex username.
+    - Deletes the approval message from the Buddy chat.
+    - Sends a confirmation DM to the admin.
+    - Sends a plain-text welcome to the new user asking for Plex username.
     """
     query = update.callback_query
     await query.answer()
@@ -81,11 +83,11 @@ async def handle_approve_callback(update: Update, context: ContextTypes.DEFAULT_
     user_row = await database.get_user(new_user_id)
     display = user_row.get("telegram_name") or str(new_user_id) if user_row else str(new_user_id)
 
-    # Delete the approval message from the Buddy chat so it stays clean
+    # Delete the approval message from the Buddy chat
     try:
         await query.delete_message()
     except Exception:
-        pass  # Not critical if delete fails
+        pass
 
     # Send confirmation directly to admin as a private DM
     try:
@@ -96,18 +98,18 @@ async def handle_approve_callback(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error("Could not send admin confirmation: %s", e)
 
-    # Welcome the new user and prompt for Plex username
+    # Welcome the new user — plain text only, no parse_mode
+    # Avoids BadRequest errors from underscores/asterisks in usernames
     welcome = (
         "🎩 Du er nu godkendt!\n\n"
         "For at jeg kan give dig personlige svar, skal jeg kende dit "
-        "*Plex-brugernavn*.\n\n"
-        "Skriv det herunder — jeg tjekker det med det samme 🎬"
+        "Plex-brugernavn.\n\n"
+        "Skriv det herunder - jeg tjekker det med det samme 🎬"
     )
     try:
         await context.bot.send_message(
             chat_id=new_user_id,
             text=welcome,
-            parse_mode="Markdown",
         )
     except Exception as e:
         logger.error("Could not send welcome to user %s: %s", new_user_id, e)

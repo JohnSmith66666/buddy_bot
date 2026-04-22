@@ -71,12 +71,12 @@ async def _needs_plex_setup(update: Update) -> bool:
         return False
 
     _awaiting_plex_username.add(user.id)
+    # Plain text only — no parse_mode — avoids Markdown errors
     await update.message.reply_text(
         f"👋 Hej {user.first_name}!\n\n"
         "For at jeg kan give dig personlige svar, skal jeg kende dit "
-        "*Plex-brugernavn*.\n\n"
-        "Skriv det herunder — jeg tjekker det med det samme 🎬",
-        parse_mode="Markdown",
+        "Plex-brugernavn.\n\n"
+        "Skriv det herunder - jeg tjekker det med det samme 🎬"
     )
     return True
 
