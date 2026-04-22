@@ -16,6 +16,9 @@ from config import ANTHROPIC_API_KEY
 from services.tmdb_service import (
     get_media_details,
     get_person_filmography,
+    get_recommendations,
+    get_trending,
+    get_watch_providers,
     search_media,
     search_person,
 )
@@ -37,6 +40,7 @@ SYSTEM_PROMPT = (
     "Naar du praesentererer soegeresultater, viser du titel, aar, genre og en kort beskrivelse. "
     "Naar du praesentererer en person, viser du navn, rolle (skuespiller/instruktoer) "
     "og deres mest kendte vaerker. "
+    "Naar du viser streaming-udbydere, naevner du KUN danske tjenester. "
     "VIGTIGT om formattering: Du skriver KUN i Telegram-kompatibelt format. "
     "Brug *fed tekst* med enkelt stjerne for fed. "
     "Brug _kursiv_ med underscore for kursiv. "
@@ -136,6 +140,70 @@ TOOLS = [
             "required": ["person_id"],
         },
     },
+    {
+        "name": "get_trending",
+        "description": (
+            "Hent de mest populaere og trendende film og serier denne uge. "
+            "Brug dette vaerktoej naar brugeren spoerger om hvad der er populaert lige nu, "
+            "hvad der er trending, eller bare vil have inspiration til noget at se. "
+            "Returnerer en blanding af film og serier sorteret efter popularitet."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "get_recommendations",
+        "description": (
+            "Find film eller serier der ligner en specifik titel. "
+            "Brug dette vaerktoej naar brugeren vil have anbefalinger baseret paa noget de "
+            "allerede kan lide, f.eks. 'find noget der ligner Inception' eller "
+            "'hvad skal jeg se hvis jeg elsker Breaking Bad'. "
+            "Kraever et TMDB ID fra search_media eller get_media_details."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tmdb_id": {
+                    "type": "integer",
+                    "description": "TMDB ID paa den titel der skal baseres anbefalinger paa.",
+                },
+                "media_type": {
+                    "type": "string",
+                    "enum": ["movie", "tv"],
+                    "description": "Om det er en film eller en serie.",
+                },
+            },
+            "required": ["tmdb_id", "media_type"],
+        },
+    },
+    {
+        "name": "get_watch_providers",
+        "description": (
+            "Find ud af hvilke danske streamingtjenester en film eller serie er tilgaengelig paa. "
+            "Brug dette vaerktoej naar brugeren spoerger 'hvor kan jeg se X', "
+            "'er X paa Netflix', eller 'hvilken streaming har X'. "
+            "Returnerer KUN danske udbydere (DK) opdelt i abonnement, leje og koeb. "
+            "Kraever et TMDB ID fra search_media eller get_media_details."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tmdb_id": {
+                    "type": "integer",
+                    "description": "TMDB ID paa filmen eller serien.",
+                },
+                "media_type": {
+                    "type": "string",
+                    "enum": ["movie", "tv"],
+                    "description": "Om det er en film eller en serie.",
+                },
+            },
+            "required": ["tmdb_id", "media_type"],
+        },
+    },
 ]
 
 # ── In-memory conversation history per user ───────────────────────────────────
@@ -153,10 +221,7 @@ def _trim_history(telegram_id: int) -> None:
 # ── Tool execution ────────────────────────────────────────────────────────────
 
 async def _handle_tool_call(tool_name: str, tool_input: dict) -> str:
-    """
-    Execute the requested tool and return the result as a JSON string.
-    Claude receives this as a tool_result message.
-    """
+    """Execute the requested tool and return the result as a JSON string."""
     logger.info("Tool call: %s(%s)", tool_name, tool_input)
 
     if tool_name == "search_media":
@@ -180,6 +245,24 @@ async def _handle_tool_call(tool_name: str, tool_input: dict) -> str:
     if tool_name == "get_person_filmography":
         filmography = await get_person_filmography(person_id=tool_input["person_id"])
         return json.dumps(filmography, ensure_ascii=False)
+
+    if tool_name == "get_trending":
+        results = await get_trending()
+        return json.dumps(results, ensure_ascii=False)
+
+    if tool_name == "get_recommendations":
+        results = await get_recommendations(
+            tmdb_id=tool_input["tmdb_id"],
+            media_type=tool_input["media_type"],
+        )
+        return json.dumps(results, ensure_ascii=False)
+
+    if tool_name == "get_watch_providers":
+        providers = await get_watch_providers(
+            tmdb_id=tool_input["tmdb_id"],
+            media_type=tool_input["media_type"],
+        )
+        return json.dumps(providers, ensure_ascii=False)
 
     return json.dumps({"error": f"Ukendt vaerktoej: {tool_name}"})
 

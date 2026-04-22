@@ -65,7 +65,6 @@ def _genre_names(genre_ids: list[int], is_tv: bool = False) -> list[str]:
 
 
 def _format_movie_result(item: dict) -> dict:
-    """Flatten a raw TMDB movie result into a clean dict."""
     return {
         "id": item.get("id"),
         "title": item.get("title") or item.get("original_title"),
@@ -80,7 +79,6 @@ def _format_movie_result(item: dict) -> dict:
 
 
 def _format_tv_result(item: dict) -> dict:
-    """Flatten a raw TMDB TV result into a clean dict."""
     return {
         "id": item.get("id"),
         "title": item.get("name") or item.get("original_name"),
@@ -94,23 +92,18 @@ def _format_tv_result(item: dict) -> dict:
     }
 
 
+def _format_provider_list(providers: list[dict]) -> list[str]:
+    """Extract provider names from a list of provider dicts."""
+    return [p["provider_name"] for p in providers if "provider_name" in p]
+
+
 # ── Public functions ──────────────────────────────────────────────────────────
 
 async def search_media(query: str, media_type: str = "both") -> list[dict]:
-    """
-    Search TMDB for films and/or TV shows matching the query.
-
-    Args:
-        query:       The search string (title or keywords).
-        media_type:  "movie", "tv", or "both" (default).
-
-    Returns:
-        A list of up to 5 results per type, each as a clean dict.
-    """
+    """Search TMDB for films and/or TV shows matching the query."""
     results: list[dict] = []
 
     async with httpx.AsyncClient(timeout=10) as client:
-
         if media_type in ("movie", "both"):
             try:
                 resp = await client.get(
@@ -139,16 +132,7 @@ async def search_media(query: str, media_type: str = "both") -> list[dict]:
 
 
 async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
-    """
-    Fetch full details for a specific film or TV show.
-
-    Args:
-        tmdb_id:     The TMDB ID of the title.
-        media_type:  "movie" or "tv".
-
-    Returns:
-        A detailed dict, or None if not found.
-    """
+    """Fetch full details for a specific film or TV show."""
     endpoint = "movie" if media_type == "movie" else "tv"
 
     async with httpx.AsyncClient(timeout=10) as client:
@@ -197,16 +181,7 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
 
 
 async def search_person(query: str) -> list[dict]:
-    """
-    Search TMDB for actors, directors, and other crew members.
-
-    Args:
-        query: The person's name to search for.
-
-    Returns:
-        A list of up to 5 results with name, known_for_department,
-        profile photo URL, and their most known titles.
-    """
+    """Search TMDB for actors, directors, and other crew members."""
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             resp = await client.get(
@@ -221,7 +196,6 @@ async def search_person(query: str) -> list[dict]:
 
     results = []
     for person in raw_results:
-        # Build a short list of their most known titles.
         known_for = []
         for item in person.get("known_for", []):
             title = item.get("title") or item.get("name") or item.get("original_title")
@@ -243,19 +217,9 @@ async def search_person(query: str) -> list[dict]:
 
 
 async def get_person_filmography(person_id: int) -> dict | None:
-    """
-    Fetch the full filmography (movie + TV credits) for a person.
-
-    Args:
-        person_id: The TMDB person ID (from search_person results).
-
-    Returns:
-        A dict with person details and sorted lists of movie/TV credits,
-        or None if not found.
-    """
+    """Fetch the full filmography (movie + TV credits) for a person."""
     async with httpx.AsyncClient(timeout=10) as client:
         try:
-            # Fetch biography and basic details.
             bio_resp = await client.get(
                 f"{_BASE_URL}/person/{person_id}",
                 params=_params(),
@@ -263,58 +227,62 @@ async def get_person_filmography(person_id: int) -> dict | None:
             bio_resp.raise_for_status()
             bio = bio_resp.json()
 
-            # Fetch combined credits (movies + TV in one call).
             credits_resp = await client.get(
                 f"{_BASE_URL}/person/{person_id}/combined_credits",
                 params=_params(),
             )
             credits_resp.raise_for_status()
             credits = credits_resp.json()
-
         except httpx.HTTPError as e:
             logger.error("TMDB filmography error (id=%s): %s", person_id, e)
             return None
 
-    # Process movie credits — sort by release date descending.
-    movie_credits = []
-    for item in credits.get("cast", []):
-        if item.get("media_type") != "movie":
-            continue
-        movie_credits.append({
-            "id": item.get("id"),
-            "title": item.get("title") or item.get("original_title"),
-            "release_date": item.get("release_date", "")[:4] or "Ukendt",
-            "character": item.get("character"),
-            "vote_average": round(item.get("vote_average", 0), 1),
-        })
-    movie_credits.sort(key=lambda x: x["release_date"], reverse=True)
+    movie_credits = sorted(
+        [
+            {
+                "id": item.get("id"),
+                "title": item.get("title") or item.get("original_title"),
+                "release_date": item.get("release_date", "")[:4] or "Ukendt",
+                "character": item.get("character"),
+                "vote_average": round(item.get("vote_average", 0), 1),
+            }
+            for item in credits.get("cast", [])
+            if item.get("media_type") == "movie"
+        ],
+        key=lambda x: x["release_date"],
+        reverse=True,
+    )
 
-    # Process TV credits — sort by first air date descending.
-    tv_credits = []
-    for item in credits.get("cast", []):
-        if item.get("media_type") != "tv":
-            continue
-        tv_credits.append({
-            "id": item.get("id"),
-            "title": item.get("name") or item.get("original_name"),
-            "first_air_date": item.get("first_air_date", "")[:4] or "Ukendt",
-            "character": item.get("character"),
-            "vote_average": round(item.get("vote_average", 0), 1),
-        })
-    tv_credits.sort(key=lambda x: x["first_air_date"], reverse=True)
+    tv_credits = sorted(
+        [
+            {
+                "id": item.get("id"),
+                "title": item.get("name") or item.get("original_name"),
+                "first_air_date": item.get("first_air_date", "")[:4] or "Ukendt",
+                "character": item.get("character"),
+                "vote_average": round(item.get("vote_average", 0), 1),
+            }
+            for item in credits.get("cast", [])
+            if item.get("media_type") == "tv"
+        ],
+        key=lambda x: x["first_air_date"],
+        reverse=True,
+    )
 
-    # Crew credits (director, writer, etc.) — movies only, top 10.
-    crew_credits = []
-    for item in credits.get("crew", []):
-        if item.get("media_type") != "movie":
-            continue
-        crew_credits.append({
-            "id": item.get("id"),
-            "title": item.get("title") or item.get("original_title"),
-            "release_date": item.get("release_date", "")[:4] or "Ukendt",
-            "job": item.get("job"),
-        })
-    crew_credits.sort(key=lambda x: x["release_date"], reverse=True)
+    crew_credits = sorted(
+        [
+            {
+                "id": item.get("id"),
+                "title": item.get("title") or item.get("original_title"),
+                "release_date": item.get("release_date", "")[:4] or "Ukendt",
+                "job": item.get("job"),
+            }
+            for item in credits.get("crew", [])
+            if item.get("media_type") == "movie"
+        ],
+        key=lambda x: x["release_date"],
+        reverse=True,
+    )
 
     return {
         "id": bio.get("id"),
@@ -327,4 +295,105 @@ async def get_person_filmography(person_id: int) -> dict | None:
         "movie_credits": movie_credits[:10],
         "tv_credits": tv_credits[:10],
         "crew_credits": crew_credits[:10],
+    }
+
+
+async def get_trending() -> list[dict]:
+    """
+    Fetch the trending films and TV shows in Denmark this week.
+
+    Returns:
+        A list of up to 10 trending titles (mixed film + TV).
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(
+                f"{_BASE_URL}/trending/all/week",
+                params=_params(),
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results", [])[:10]
+        except httpx.HTTPError as e:
+            logger.error("TMDB trending error: %s", e)
+            return []
+
+    formatted = []
+    for item in results:
+        media_type = item.get("media_type")
+        if media_type == "movie":
+            formatted.append(_format_movie_result(item))
+        elif media_type == "tv":
+            formatted.append(_format_tv_result(item))
+        # Skip "person" entries that occasionally appear in trending
+
+    return formatted
+
+
+async def get_recommendations(tmdb_id: int, media_type: str) -> list[dict]:
+    """
+    Fetch recommendations similar to a specific film or TV show.
+
+    Args:
+        tmdb_id:    The TMDB ID of the title.
+        media_type: "movie" or "tv".
+
+    Returns:
+        A list of up to 8 recommended titles.
+    """
+    endpoint = "movie" if media_type == "movie" else "tv"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(
+                f"{_BASE_URL}/{endpoint}/{tmdb_id}/recommendations",
+                params=_params(),
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results", [])[:8]
+        except httpx.HTTPError as e:
+            logger.error("TMDB recommendations error (id=%s type=%s): %s", tmdb_id, media_type, e)
+            return []
+
+    if media_type == "movie":
+        return [_format_movie_result(item) for item in results]
+    return [_format_tv_result(item) for item in results]
+
+
+async def get_watch_providers(tmdb_id: int, media_type: str) -> dict:
+    """
+    Fetch Danish streaming providers (DK) for a specific film or TV show.
+
+    Args:
+        tmdb_id:    The TMDB ID of the title.
+        media_type: "movie" or "tv".
+
+    Returns:
+        A dict with lists of providers split by type:
+        flatrate (subscription), rent, buy — all filtered for Denmark only.
+    """
+    endpoint = "movie" if media_type == "movie" else "tv"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(
+                f"{_BASE_URL}/{endpoint}/{tmdb_id}/watch/providers",
+                params={"api_key": TMDB_API_KEY},  # No language param for this endpoint
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPError as e:
+            logger.error("TMDB watch providers error (id=%s type=%s): %s", tmdb_id, media_type, e)
+            return {"available_in_dk": False}
+
+    # Filter for Denmark only.
+    dk_data = data.get("results", {}).get("DK")
+    if not dk_data:
+        return {"available_in_dk": False}
+
+    return {
+        "available_in_dk": True,
+        "link": dk_data.get("link"),
+        "flatrate": _format_provider_list(dk_data.get("flatrate", [])),
+        "rent": _format_provider_list(dk_data.get("rent", [])),
+        "buy": _format_provider_list(dk_data.get("buy", [])),
     }
