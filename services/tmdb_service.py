@@ -402,3 +402,46 @@ async def get_watch_providers(tmdb_id: int, media_type: str) -> dict:
         "rent": _format_provider_list(dk_data.get("rent", [])),
         "buy": _format_provider_list(dk_data.get("buy", [])),
     }
+
+async def get_now_playing() -> list[dict]:
+    """
+    Fetch films currently playing in cinemas (Danish region).
+
+    Returns up to 10 results sorted by popularity.
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(
+                f"{_BASE_URL}/movie/now_playing",
+                params=_params(region="DK"),
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results", [])[:10]
+        except httpx.HTTPError as e:
+            logger.error("TMDB now_playing error: %s", e)
+            return []
+
+    return [_format_movie_result(item) for item in results]
+
+
+async def get_upcoming() -> list[dict]:
+    """
+    Fetch films coming soon to cinemas (Danish region).
+
+    Returns up to 10 results sorted by release date.
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(
+                f"{_BASE_URL}/movie/upcoming",
+                params=_params(region="DK"),
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results", [])[:10]
+        except httpx.HTTPError as e:
+            logger.error("TMDB upcoming error: %s", e)
+            return []
+
+    # Sort by release date ascending so nearest release is first
+    results.sort(key=lambda x: x.get("release_date") or "")
+    return [_format_movie_result(item) for item in results]

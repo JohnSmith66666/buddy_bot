@@ -263,3 +263,79 @@ async def request_tv(
         result["seasons_requested"] = seasons_payload
 
     return result
+
+async def get_all_requests() -> dict:
+    """
+    Fetch all active media requests from Seerr.
+
+    Returns a list of requests with title, type, status and date.
+    """
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.get(
+                f"{_base_url()}/api/v1/request",
+                headers=_HEADERS,
+                params={"take": 50, "skip": 0, "sort": "added", "filter": "all"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPError as e:
+            logger.error("Seerr get_all_requests error: %s", e)
+            return {"success": False, "message": f"Kunne ikke hente bestillinger: {e}"}
+
+    requests_list = []
+    for item in data.get("results", []):
+        media     = item.get("media", {}) or {}
+        req_type  = item.get("type", "unknown")
+        status    = media.get("status", 1)
+
+        # Map numeric status to human-friendly label
+        status_label = {
+            1: "afventer",
+            2: "bestilt",
+            3: "på_vej",
+            4: "delvist_klar",
+            5: "klar",
+        }.get(status, "ukendt")
+
+        title = (
+            media.get("originalTitle")
+            or media.get("title")
+            or f"ID {media.get('tmdbId', '?')}"
+        )
+
+        requests_list.append({
+            "title":      title,
+            "type":       req_type,
+            "status":     status_label,
+            "requested":  item.get("createdAt", "")[:10],
+            "tmdb_id":    media.get("tmdbId"),
+        })
+
+    return {
+        "success":  True,
+        "requests": requests_list,
+        "total":    data.get("pageInfo", {}).get("results", len(requests_list)),
+    }
+
+
+async def get_request_status(title: str) -> dict:
+    """
+    Look up the Seerr status for a specific title by name.
+
+    Searches all requests and returns the best match.
+    """
+    result = await get_all_requests()
+    if not result.get("success"):
+        return result
+
+    title_lower = title.lower()
+    matches = [
+        r for r in result["requests"]
+        if title_lower in (r.get("title") or "").lower()
+    ]
+
+    if not matches:
+        return {"success": True, "found": False, "message": f"Ingen aktiv bestilling fundet for '{title}'."}
+
+    return {"success": True, "found": True, "matches": matches}
