@@ -57,7 +57,6 @@ async def request_movie(tmdb_id: int, category: str = "standard") -> dict:
     Args:
         tmdb_id:  The TMDB ID of the film.
         category: Routing category — "animation", "dansk", or "standard".
-                  Defaults to "standard" if an unknown value is passed.
 
     Returns:
         A dict with keys: success (bool), status, message, and request_id (if created).
@@ -125,31 +124,39 @@ async def request_movie(tmdb_id: int, category: str = "standard") -> dict:
     }
 
 
-async def request_tv(tmdb_id: int, category: str = "standard") -> dict:
+async def request_tv(
+    tmdb_id: int,
+    season_count: int,
+    category: str = "standard",
+) -> dict:
     """
     Send a TV series request to Seerr and route it to the correct Sonarr root folder.
 
     Args:
-        tmdb_id:  The TMDB ID of the series.
-        category: Routing category — "tv_program" or "standard".
-                  Defaults to "standard" if an unknown value is passed.
+        tmdb_id:      The TMDB ID of the series.
+        season_count: Number of seasons to request (from TMDB number_of_seasons).
+                      Builds an explicit seasons list so all seasons are monitored.
+        category:     Routing category — "tv_program" or "standard".
 
     Returns:
         A dict with keys: success (bool), status, message, and request_id (if created).
     """
     root_folder = _TV_ROOTS.get(category, ROOT_TV_STANDARD)
 
+    # Build explicit season list so Sonarr monitors all seasons (fixes unmonitored bug).
+    seasons = list(range(1, season_count + 1))
+
     payload = {
         "mediaType": "tv",
         "mediaId": tmdb_id,
         "rootFolder": root_folder,
         "is4k": False,
-        "seasons": "all",
+        "seasons": seasons,
     }
 
     logger.info(
-        "Requesting TV tmdb_id=%s category=%s rootFolder=%s",
-        tmdb_id, category, root_folder,
+        "Requesting TV tmdb_id=%s seasons=%s category=%s rootFolder=%s",
+        tmdb_id, seasons, category, root_folder,
     )
 
     async with httpx.AsyncClient(timeout=15) as client:
@@ -165,9 +172,10 @@ async def request_tv(tmdb_id: int, category: str = "standard") -> dict:
                 return {
                     "success": True,
                     "status": "requested",
-                    "message": "Serien er tilføjet til køen!",
+                    "message": f"Serien er tilføjet til køen! ({season_count} sæson{'er' if season_count != 1 else ''})",
                     "request_id": data.get("id"),
                     "root_folder": root_folder,
+                    "seasons_requested": seasons,
                 }
 
             if resp.status_code == 409:
