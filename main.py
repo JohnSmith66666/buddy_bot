@@ -36,7 +36,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Users currently in the Plex-username onboarding flow
+# Users currently in the Plex-username onboarding flow.
+# Exported so admin_handlers can register users upon approval.
 _awaiting_plex_username: set[int] = set()
 
 
@@ -64,11 +65,18 @@ async def _guard(update: Update) -> bool:
 async def _needs_plex_setup(update: Update) -> bool:
     """
     Return True (and send the prompt) if the user has no Plex username yet.
+
+    Skips sending a new prompt if the user is already in _awaiting_plex_username
+    (i.e. a prompt was already sent by admin_handlers upon approval).
     """
     user = update.effective_user
     plex_username = await database.get_plex_username(user.id)
     if plex_username:
         return False
+
+    # Already waiting for their reply — don't send a second prompt
+    if user.id in _awaiting_plex_username:
+        return True
 
     _awaiting_plex_username.add(user.id)
     # Plain text only — no parse_mode — avoids Markdown errors
