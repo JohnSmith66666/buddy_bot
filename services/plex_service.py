@@ -61,11 +61,13 @@ def _titles_match(title_a: str, title_b: str) -> bool:
 
 def _connect(plex_username: str | None = None) -> PlexServer | dict:
     """
-    Return a PlexServer connection.
+    Return a user-scoped PlexServer connection.
 
-    If plex_username is provided, attempts to return a user-scoped connection
-    (shared user gets their own library view). Falls back to the admin
-    connection if switching fails.
+    Priority order:
+      1. Server owner      → use admin token directly
+      2. Shared friend     → get token via account.user().get_token()
+      3. Managed home user → get token via switchHomeUser()
+      4. No match          → fall back to admin token with warning
     """
     try:
         admin_plex = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=15)
@@ -79,20 +81,23 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
     if not plex_username:
         return admin_plex
 
+    norm = plex_username.strip().lower()
+
     try:
         account = admin_plex.myPlexAccount()
-        norm = plex_username.strip().lower()
 
-        # Check if it is the server owner
+        # ── 1. Server owner ───────────────────────────────────────────────────
         owner_names = {
             (account.username or "").lower(),
             (account.email or "").lower(),
             (account.title or "").lower(),
         }
         if norm in owner_names:
-            return admin_plex  # Owner uses the admin token directly
+            logger.debug("Plex connect: owner '%s'", plex_username)
+            return admin_plex
 
-        # Switch to shared user
+        # ── 2. Shared friend (has own Plex account) ───────────────────────────
+        # account.users() returns friends/shared users with their own accounts.
         for user in account.users():
             user_names = {
                 (getattr(user, "username", "") or "").lower(),
@@ -100,14 +105,54 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
                 (getattr(user, "title", "") or "").lower(),
             }
             if norm in user_names:
-                user_token = account.switchHomeUser(user).authToken
-                return PlexServer(PLEX_URL, user_token, timeout=15)
+                try:
+                    # get_token() returns a server-specific token for this user
+                    user_token = account.user(user.username).get_token(
+                        admin_plex.machineIdentifier
+                    )
+                    logger.debug("Plex connect: shared friend '%s'", plex_username)
+                    return PlexServer(PLEX_URL, user_token, timeout=15)
+                except Exception as e:
+                    logger.warning(
+                        "get_token() failed for shared user '%s': %s — trying switchHomeUser",
+                        plex_username, e,
+                    )
+                    # Fall through to managed user attempt below
 
-        logger.warning("Plex user '%s' not found — falling back to admin", plex_username)
+        # ── 3. Managed home user (no own Plex account) ───────────────────────
+        # account.homeUsers() returns managed users under Plex Home.
+        try:
+            home_users = account.homeUsers()
+        except Exception:
+            home_users = []
+
+        for user in home_users:
+            user_names = {
+                (getattr(user, "username", "") or "").lower(),
+                (getattr(user, "email", "") or "").lower(),
+                (getattr(user, "title", "") or "").lower(),
+            }
+            if norm in user_names:
+                try:
+                    switched = account.switchHomeUser(user)
+                    logger.debug("Plex connect: managed home user '%s'", plex_username)
+                    return PlexServer(PLEX_URL, switched.authToken, timeout=15)
+                except Exception as e:
+                    logger.warning(
+                        "switchHomeUser() failed for '%s': %s — falling back to admin",
+                        plex_username, e,
+                    )
+                    return admin_plex
+
+        # ── 4. No match ───────────────────────────────────────────────────────
+        logger.warning(
+            "Plex user '%s' not found in friends or home users — falling back to admin",
+            plex_username,
+        )
         return admin_plex
 
     except Exception as e:
-        logger.warning("User switch failed (%s) — falling back to admin: %s", plex_username, e)
+        logger.warning("_connect() error for '%s': %s — falling back to admin", plex_username, e)
         return admin_plex
 
 
@@ -578,51 +623,75 @@ async def validate_plex_user(plex_username: str) -> dict:
 
 
 def _validate_user_sync(plex_username: str) -> dict:
-    """Synchronous Plex user validation — runs in thread pool."""
-    plex = _connect(plex_username)
-    if isinstance(plex, dict):
-        return {"valid": False, "message": plex.get("message", "Forbindelsesfejl")}
+    """
+    Synchronous Plex user validation — runs in thread pool.
 
-    norm_input = plex_username.strip().lower()
-
+    Checks in order:
+      1. Server owner
+      2. Shared friends (own Plex account)
+      3. Managed home users (no own account)
+    """
     try:
-        # Check if it's the server owner
-        account = plex.myPlexAccount()
-        owner_names = {
-            (account.username or "").lower(),
-            (account.email or "").lower(),
-            (account.title or "").lower(),
-        }
-        if norm_input in owner_names:
-            logger.info("Plex user validated as owner: %s", plex_username)
-            return {
-                "valid": True,
-                "username": account.title or account.username,
-                "is_owner": True,
-            }
+        admin_plex = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=15)
+        account = admin_plex.myPlexAccount()
+    except Exception as e:
+        return {"valid": False, "message": f"Forbindelsesfejl: {e}"}
 
-        # Check shared/managed users
+    norm = plex_username.strip().lower()
+
+    # 1. Server owner
+    owner_names = {
+        (account.username or "").lower(),
+        (account.email or "").lower(),
+        (account.title or "").lower(),
+    }
+    if norm in owner_names:
+        display = account.title or account.username or plex_username
+        logger.info("Validated as owner: %s", display)
+        return {"valid": True, "username": display, "user_type": "owner"}
+
+    # 2. Shared friends (own Plex account)
+    try:
         for user in account.users():
             user_names = {
                 (getattr(user, "username", "") or "").lower(),
                 (getattr(user, "email", "") or "").lower(),
                 (getattr(user, "title", "") or "").lower(),
             }
-            if norm_input in user_names:
+            if norm in user_names:
                 display = (
                     getattr(user, "title", None)
                     or getattr(user, "username", None)
                     or plex_username
                 )
-                logger.info("Plex user validated as shared user: %s", display)
-                return {"valid": True, "username": display, "is_owner": False}
-
+                logger.info("Validated as shared friend: %s", display)
+                return {"valid": True, "username": display, "user_type": "friend"}
     except Exception as e:
-        logger.error("Plex user lookup error: %s", e)
-        return {"valid": False, "message": f"Kunne ikke slaa brugeren op: {e}"}
+        logger.warning("Could not check shared users: %s", e)
 
-    return {"valid": False, "message": f"Brugernavnet '{plex_username}' blev ikke fundet paa Plex-serveren."}
+    # 3. Managed home users (no own Plex account)
+    try:
+        for user in account.homeUsers():
+            user_names = {
+                (getattr(user, "username", "") or "").lower(),
+                (getattr(user, "email", "") or "").lower(),
+                (getattr(user, "title", "") or "").lower(),
+            }
+            if norm in user_names:
+                display = (
+                    getattr(user, "title", None)
+                    or getattr(user, "username", None)
+                    or plex_username
+                )
+                logger.info("Validated as managed home user: %s", display)
+                return {"valid": True, "username": display, "user_type": "managed"}
+    except Exception as e:
+        logger.warning("Could not check home users: %s", e)
 
+    return {
+        "valid": False,
+        "message": f"Brugernavnet '{plex_username}' blev ikke fundet — hverken som ven eller hjembruger.",
+    }
 
 async def get_plex_for_user(plex_username: str):
     """
