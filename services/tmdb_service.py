@@ -170,6 +170,11 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
             "overview": data.get("overview") or "Ingen beskrivelse tilgængelig.",
             "first_air_date": data.get("first_air_date", "Ukendt"),
             "number_of_seasons": data.get("number_of_seasons"),
+            "season_numbers": [
+                s["season_number"]
+                for s in data.get("seasons", [])
+                if s.get("season_number", 0) > 0  # skip season 0 / specials
+            ],
             "number_of_episodes": data.get("number_of_episodes"),
             "vote_average": round(data.get("vote_average", 0), 1),
             "genres": [g["name"] for g in data.get("genres", [])],

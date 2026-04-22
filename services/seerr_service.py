@@ -3,8 +3,12 @@ services/seerr_service.py - Overseerr/Jellyseerr API integration.
 
 Handles media requests routed to the correct Radarr/Sonarr root folder
 based on content category (animation, dansk, standard, tv_program).
-Seasons are intentionally omitted from TV payloads — Seerr automatically
-requests all seasons when the key is absent.
+
+Per the Seerr API spec:
+- Movies: seasons key can be omitted or set to "all"
+- TV Shows: seasons MUST be an array of integers (actual season numbers)
+  Missing this key causes a 500 Internal Server Error.
+Both 201 Created and 202 Accepted are treated as success.
 """
 
 import logging
@@ -58,7 +62,8 @@ async def _post_request(payload: dict) -> dict:
                 json=payload,
             )
 
-            if resp.status_code == 201:
+            # Both 201 Created (movies) and 202 Accepted (TV) are success.
+            if resp.status_code in (201, 202):
                 return {
                     "success": True,
                     "status": "requested",
@@ -70,6 +75,13 @@ async def _post_request(payload: dict) -> dict:
                     "success": False,
                     "status": "already_requested",
                     "message": "Allerede anmodet om eller findes i biblioteket.",
+                }
+
+            if resp.status_code == 403:
+                return {
+                    "success": False,
+                    "status": "forbidden",
+                    "message": "Adgang nægtet af Seerr. Tjek API-nøglen.",
                 }
 
             resp.raise_for_status()
@@ -121,29 +133,43 @@ async def request_movie(tmdb_id: int, category: str = "standard") -> dict:
     return result
 
 
-async def request_tv(tmdb_id: int, category: str = "standard") -> dict:
+async def request_tv(
+    tmdb_id: int,
+    season_numbers: list[int],
+    category: str = "standard",
+) -> dict:
     """
     Send a TV series request to Seerr routed to the correct Sonarr root folder.
-    Seasons key is intentionally omitted — Seerr requests all seasons automatically.
+
+    Per the Seerr API spec, 'seasons' MUST be an array of integers representing
+    the actual season numbers. Omitting it causes a 500 error.
 
     Args:
-        tmdb_id:  The TMDB ID of the series.
-        category: "tv_program" or "standard".
+        tmdb_id:        The TMDB ID of the series.
+        season_numbers: List of actual season numbers, e.g. [1, 2, 3].
+                        Must be fetched from TMDB's seasons list
+                        (use season_number field, skip season 0/specials).
+        category:       "tv_program" or "standard".
     """
     root_folder = _TV_ROOTS.get(category, ROOT_TV_STANDARD)
 
-    logger.info("Requesting TV tmdb_id=%s category=%s rootFolder=%s",
-                tmdb_id, category, root_folder)
+    logger.info("Requesting TV tmdb_id=%s seasons=%s category=%s rootFolder=%s",
+                tmdb_id, season_numbers, category, root_folder)
 
     result = await _post_request({
         "mediaType": "tv",
         "mediaId": tmdb_id,
+        "seasons": season_numbers,   # REQUIRED — array of ints per Seerr API spec
         "rootFolder": root_folder,
         "is4k": False,
     })
 
     if result.get("status") == "requested":
-        result["message"] = "Serien er tilføjet til køen!"
+        result["message"] = (
+            f"Serien er tilføjet til køen! "
+            f"({len(season_numbers)} sæson{'er' if len(season_numbers) != 1 else ''})"
+        )
         result["root_folder"] = root_folder
+        result["seasons_requested"] = season_numbers
 
     return result
