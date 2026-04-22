@@ -1,9 +1,9 @@
 """
 ai_handler.py - Manages all communication with the Anthropic Claude API.
 
-Uses Tool Use (function calling) so Claude can query TMDB and request
-media via Seerr. New tools can be added to TOOLS and _handle_tool_call()
-as the project grows.
+Uses Tool Use (function calling) so Claude can query TMDB, check Plex,
+and request media via Seerr. New tools can be added to TOOLS and
+_handle_tool_call() as the project grows.
 """
 
 import json
@@ -13,6 +13,7 @@ from collections import defaultdict
 import anthropic
 
 from config import ANTHROPIC_API_KEY
+from services.plex_service import check_library
 from services.seerr_service import request_movie, request_tv
 from services.tmdb_service import (
     get_media_details,
@@ -37,8 +38,14 @@ SYSTEM_PROMPT = """Du er en eksplosiv, humoristisk og super hjælpsom medie-over
 DATAHENTNING:
 Naar brugeren spoerger om film, serier, skuespillere eller instruktoerer, bruger du ALTID dine vaerktoejer til at hente opdaterede data fra TMDB - du finder aldrig paa information selv.
 
+PLEX-TJEK FOER SEERR — BENHAARD REGEL:
+Foer du NOGENSINDE bruger et Seerr-vaerktoej (request_movie eller request_tv), SKAL du:
+1. Kalde check_plex_library med titel og aar fra TMDB.
+2. Hvis status er "found": Fortael brugeren at vi allerede har det paa Plex. Stop her. Anmod IKKE.
+3. Kun hvis status er "missing": Fortsaet med Seerr-logikken nedenfor.
+
 ANMODNING VIA SEERR - SORTERINGSREGLER:
-Foer du anmoder via Seerr, SKAL du altid kalde get_media_details foerst for at faa genre_ids, original_language og season_numbers.
+Foer du anmoder via Seerr, SKAL du kalde get_media_details for at faa genre_ids, original_language og season_numbers.
 
 For FILM - vaelg category saaledes:
 - category="animation"  hvis genre ID 16 (Animation) er til stede
@@ -48,18 +55,12 @@ For FILM - vaelg category saaledes:
 For SERIER:
 - Du SKAL sende season_numbers NOEJAGTIGT som de fremgaar af 'season_numbers' feltet i get_media_details.
 - Du maa ALDRIG antage eller opdigte saesonnumre. Hvis TMDB kun viser [25], sender du [25]. Ikke [1, 25].
-- Du maa ALDRIG tilfoeje Saeson 1 hvis den ikke er listet i TMDB's season_numbers.
-- Brug KUN de heltal der faktisk staar i listen.
-
 - Vaelg category saaledes:
   * category="tv_program" hvis een eller flere af disse betingelser er opfyldt:
       - genren indeholder Reality (10764), Talk (10767), News (10763) eller Dokumentar (99)
       - original_language er "da" OG genren indeholder Familie (10751)
       - original_language er "da" OG genren mangler baade Drama (18) og Krimi (80)
   * category="standard" for internationale serier og ren dansk fiktion med Drama (18) eller Krimi (80)
-  Eksempel: Argang 0 Forever = dansk + ingen Drama/Krimi → tv_program, season_numbers=[25]
-  Eksempel: Dansk krimiserie = dansk + genre 80 → standard
-  Eksempel: Breaking Bad = international Drama → standard
 
 PRAESENTATION:
 Naar du praesentererer soegeresultater, viser du titel, aar, genre og en kort beskrivelse.
@@ -110,9 +111,7 @@ TOOLS = [
             "Hent detaljerede oplysninger om en specifik film eller TV-serie fra TMDB. "
             "Brug dette vaerktoej naar brugeren vil vide mere om et bestemt resultat, "
             "ELLER naar du skal forberede en Seerr-anmodning. "
-            "For serier returnerer dette felt 'season_numbers' — en liste af de eksakte "
-            "saesonnumre der rent faktisk findes paa TMDB (f.eks. [25] eller [1, 2, 3]). "
-            "Disse tal skal sendes NOEJAGTIGT videre til request_tv uden aendringer. "
+            "For serier returnerer dette felt 'season_numbers' som skal sendes direkte til request_tv. "
             "Kraever et TMDB ID fra search_media."
         ),
         "input_schema": {
@@ -129,6 +128,35 @@ TOOLS = [
                 },
             },
             "required": ["tmdb_id", "media_type"],
+        },
+    },
+    {
+        "name": "check_plex_library",
+        "description": (
+            "Tjek om en film eller serie allerede findes i Plex-biblioteket. "
+            "SKAL altid kaldes foer request_movie eller request_tv. "
+            "Hvis status er 'found', skal du fortaelle brugeren at vi allerede har det paa Plex "
+            "og IKKE sende en Seerr-anmodning. "
+            "Hvis status er 'missing', kan du fortsaette med Seerr."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Titlen paa filmen eller serien (fra TMDB).",
+                },
+                "year": {
+                    "type": "integer",
+                    "description": "Udgivelsesaaret fra TMDB (bruges til praeciis matching).",
+                },
+                "media_type": {
+                    "type": "string",
+                    "enum": ["movie", "tv"],
+                    "description": "Om det er en film eller en serie.",
+                },
+            },
+            "required": ["title", "media_type"],
         },
     },
     {
@@ -229,7 +257,7 @@ TOOLS = [
         "name": "request_movie",
         "description": (
             "Anmod om download af en film via Seerr. "
-            "Brug dette vaerktoej naar brugeren beder om at tilfoeje eller downloade en film. "
+            "MUS KUN kaldes hvis check_plex_library returnerede status='missing'. "
             "VIGTIGT: Kald altid get_media_details foerst for at bestemme den korrekte category. "
             "Saet category='animation' hvis genre ID 16 er til stede. "
             "Saet category='dansk' hvis original_language='da' og filmen ikke er animation. "
@@ -259,9 +287,9 @@ TOOLS = [
         "name": "request_tv",
         "description": (
             "Anmod om download af en TV-serie via Seerr. "
-            "Brug dette vaerktoej naar brugeren beder om at tilfoeje eller downloade en serie. "
+            "MUS KUN kaldes hvis check_plex_library returnerede status='missing'. "
             "VIGTIGT: Kald altid get_media_details foerst. "
-            "Brug 'season_numbers' fra get_media_details NOEJAGTIGT som de er — ingen aendringer. "
+            "Brug 'season_numbers' fra get_media_details NOEJAGTIGT som de er. "
             "Tilfoej ALDRIG saesonnumre der ikke staar i TMDB's liste. "
             "SORTERING: Saet category='tv_program' hvis genren indeholder Reality (10764), "
             "Talk (10767), News (10763) eller Dokumentar (99) — ELLER hvis original_language='da' "
@@ -280,16 +308,15 @@ TOOLS = [
                     "items": {"type": "integer"},
                     "description": (
                         "Eksakte saesonnumre fra 'season_numbers' i get_media_details. "
-                        "Kopier listen direkte — tilfoej eller fjern ikke noget. "
-                        "Eksempel: hvis TMDB returnerer [25], send [25]. Ikke [1, 25]."
+                        "Kopier listen direkte — tilfoej eller fjern ikke noget."
                     ),
                 },
                 "category": {
                     "type": "string",
                     "enum": ["tv_program", "standard"],
                     "description": (
-                        "'tv_program' → TV-programmer-mappen (reality, talk, nyheder, dansk underholdning). "
-                        "'standard' → Serier-mappen (international fiktion, dansk Drama/Krimi)."
+                        "'tv_program' → TV-programmer-mappen. "
+                        "'standard' → Serier-mappen."
                     ),
                 },
             },
@@ -329,6 +356,14 @@ async def _handle_tool_call(tool_name: str, tool_input: dict) -> str:
             media_type=tool_input["media_type"],
         )
         return json.dumps(details, ensure_ascii=False)
+
+    if tool_name == "check_plex_library":
+        result = await check_library(
+            title=tool_input["title"],
+            year=tool_input.get("year"),
+            media_type=tool_input["media_type"],
+        )
+        return json.dumps(result, ensure_ascii=False)
 
     if tool_name == "search_person":
         results = await search_person(query=tool_input["query"])

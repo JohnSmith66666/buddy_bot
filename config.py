@@ -37,6 +37,10 @@ TMDB_API_KEY: str = _require("TMDB_API_KEY")
 SEERR_API_KEY: str = _require("SEERR_API")
 SEERR_URL: str = _require("SEERR_URL")
 
+# ── Plex ──────────────────────────────────────────────────────────────────────
+PLEX_URL: str = _require("PLEX_URL")
+PLEX_TOKEN: str = _require("PLEX_TOKEN")
+
 # ── Media root folders ────────────────────────────────────────────────────────
 ROOT_MOVIE_ANIMATION: str = "/mnt/unionfs/Media/Movies/Animation"
 ROOT_MOVIE_DANSK: str     = "/mnt/unionfs/Media/Movies/Dansk"
