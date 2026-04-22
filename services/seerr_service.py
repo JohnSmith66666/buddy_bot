@@ -284,14 +284,24 @@ async def _get_seerr_user_id(plex_username: str) -> int | None:
             return None
 
     norm = plex_username.strip().lower()
+
+    # Log all users for debugging so we can see exact field names/values
     for user in users:
-        # Seerr stores the Plex username in plexUsername or displayName
+        logger.info(
+            "Seerr user — id=%s displayName=%r plexUsername=%r email=%r",
+            user.get("id"),
+            user.get("displayName"),
+            user.get("plexUsername"),
+            user.get("email"),
+        )
         plex_name = (user.get("plexUsername") or "").lower()
-        display    = (user.get("displayName") or "").lower()
-        email      = (user.get("email") or "").lower()
+        display   = (user.get("displayName") or "").lower()
+        email     = (user.get("email") or "").lower()
         if norm in {plex_name, display, email}:
+            logger.info("Seerr user match: id=%s for plex_username=%r", user.get("id"), plex_username)
             return user.get("id")
 
+    logger.warning("No Seerr user found for plex_username=%r (checked %d users)", plex_username, len(users))
     return None
 
 async def get_all_requests(plex_username: str | None = None) -> dict:
