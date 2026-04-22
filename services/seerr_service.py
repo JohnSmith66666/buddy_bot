@@ -264,18 +264,58 @@ async def request_tv(
 
     return result
 
-async def get_all_requests() -> dict:
-    """
-    Fetch all active media requests from Seerr.
 
-    Returns a list of requests with title, type, status and date.
+async def _get_seerr_user_id(plex_username: str) -> int | None:
     """
+    Look up a Seerr user ID by matching their Plex username.
+    Returns None if not found.
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(
+                f"{_base_url()}/api/v1/user",
+                headers=_HEADERS,
+                params={"take": 50, "skip": 0},
+            )
+            resp.raise_for_status()
+            users = resp.json().get("results", [])
+        except httpx.HTTPError as e:
+            logger.error("Seerr user lookup error: %s", e)
+            return None
+
+    norm = plex_username.strip().lower()
+    for user in users:
+        # Seerr stores the Plex username in plexUsername or displayName
+        plex_name = (user.get("plexUsername") or "").lower()
+        display    = (user.get("displayName") or "").lower()
+        email      = (user.get("email") or "").lower()
+        if norm in {plex_name, display, email}:
+            return user.get("id")
+
+    return None
+
+async def get_all_requests(plex_username: str | None = None) -> dict:
+    """
+    Fetch media requests from Seerr.
+
+    If plex_username is provided, only returns requests made by that user.
+    Otherwise returns all requests (admin view).
+    """
+    # Resolve Seerr user ID if we have a Plex username
+    seerr_user_id: int | None = None
+    if plex_username:
+        seerr_user_id = await _get_seerr_user_id(plex_username)
+
+    params: dict = {"take": 50, "skip": 0, "sort": "added", "filter": "all"}
+    if seerr_user_id:
+        params["requestedBy"] = seerr_user_id
+
     async with httpx.AsyncClient(timeout=15) as client:
         try:
             resp = await client.get(
                 f"{_base_url()}/api/v1/request",
                 headers=_HEADERS,
-                params={"take": 50, "skip": 0, "sort": "added", "filter": "all"},
+                params=params,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -319,13 +359,13 @@ async def get_all_requests() -> dict:
     }
 
 
-async def get_request_status(title: str) -> dict:
+async def get_request_status(title: str, plex_username: str | None = None) -> dict:
     """
     Look up the Seerr status for a specific title by name.
 
     Searches all requests and returns the best match.
     """
-    result = await get_all_requests()
+    result = await get_all_requests(plex_username=plex_username)
     if not result.get("success"):
         return result
 

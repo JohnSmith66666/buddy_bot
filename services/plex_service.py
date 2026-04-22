@@ -59,16 +59,56 @@ def _titles_match(title_a: str, title_b: str) -> bool:
 
 # ── Plex connection helper ────────────────────────────────────────────────────
 
-def _connect() -> PlexServer | dict:
-    """Return a connected PlexServer or an error dict."""
+def _connect(plex_username: str | None = None) -> PlexServer | dict:
+    """
+    Return a PlexServer connection.
+
+    If plex_username is provided, attempts to return a user-scoped connection
+    (shared user gets their own library view). Falls back to the admin
+    connection if switching fails.
+    """
     try:
-        return PlexServer(PLEX_URL, PLEX_TOKEN, timeout=15)
+        admin_plex = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=15)
     except Unauthorized:
         logger.error("Plex auth failed — check PLEX_TOKEN")
         return {"status": STATUS_ERROR, "message": "Ugyldig Plex-token."}
     except Exception as e:
         logger.error("Plex connection error: %s", e)
         return {"status": STATUS_ERROR, "message": f"Kunne ikke forbinde til Plex: {e}"}
+
+    if not plex_username:
+        return admin_plex
+
+    try:
+        account = admin_plex.myPlexAccount()
+        norm = plex_username.strip().lower()
+
+        # Check if it is the server owner
+        owner_names = {
+            (account.username or "").lower(),
+            (account.email or "").lower(),
+            (account.title or "").lower(),
+        }
+        if norm in owner_names:
+            return admin_plex  # Owner uses the admin token directly
+
+        # Switch to shared user
+        for user in account.users():
+            user_names = {
+                (getattr(user, "username", "") or "").lower(),
+                (getattr(user, "email", "") or "").lower(),
+                (getattr(user, "title", "") or "").lower(),
+            }
+            if norm in user_names:
+                user_token = account.switchHomeUser(user).authToken
+                return PlexServer(PLEX_URL, user_token, timeout=15)
+
+        logger.warning("Plex user '%s' not found — falling back to admin", plex_username)
+        return admin_plex
+
+    except Exception as e:
+        logger.warning("User switch failed (%s) — falling back to admin: %s", plex_username, e)
+        return admin_plex
 
 
 def _sections(plex: PlexServer, plex_type: str) -> list:
@@ -139,78 +179,78 @@ def _stream_info(media_item) -> dict:
 # PUBLIC ASYNC FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def check_library(title: str, year: int | None, media_type: str) -> dict:
+async def check_library(title: str, year: int | None, media_type: str, plex_username: str | None = None) -> dict:
     """Check whether a specific title exists in Plex."""
     try:
         return await asyncio.to_thread(
-            partial(_check_sync, title=title, year=year, media_type=media_type)
+            partial(_check_sync, title=title, year=year, media_type=media_type, plex_username=plex_username)
         )
     except Exception as e:
         logger.error("check_library error: %s", e)
         return {"status": STATUS_ERROR, "message": str(e)}
 
 
-async def get_collection(keyword: str, media_type: str) -> dict:
+async def get_collection(keyword: str, media_type: str, plex_username: str | None = None) -> dict:
     """Search Plex for ALL titles matching a keyword."""
     try:
         return await asyncio.to_thread(
-            partial(_collection_sync, keyword=keyword, media_type=media_type)
+            partial(_collection_sync, keyword=keyword, media_type=media_type, plex_username=plex_username)
         )
     except Exception as e:
         logger.error("get_collection error: %s", e)
         return {"status": STATUS_ERROR, "message": str(e)}
 
 
-async def get_on_deck() -> dict:
+async def get_on_deck(plex_username: str | None = None) -> dict:
     """Return the user's 'Continue Watching' list (up to 8 items)."""
     try:
-        return await asyncio.to_thread(_on_deck_sync)
+        return await asyncio.to_thread(partial(_on_deck_sync, plex_username=plex_username))
     except Exception as e:
         logger.error("get_on_deck error: %s", e)
         return {"status": STATUS_ERROR, "message": str(e)}
 
 
-async def get_plex_metadata(title: str, year: int | None) -> dict:
+async def get_plex_metadata(title: str, year: int | None, plex_username: str | None = None) -> dict:
     """Return technical specs for a title — never raw file paths."""
     try:
         return await asyncio.to_thread(
-            partial(_metadata_sync, title=title, year=year)
+            partial(_metadata_sync, title=title, year=year, plex_username=plex_username)
         )
     except Exception as e:
         logger.error("get_plex_metadata error: %s", e)
         return {"status": STATUS_ERROR, "message": str(e)}
 
 
-async def find_unwatched(media_type: str, genre: str | None = None) -> dict:
+async def find_unwatched(media_type: str, genre: str | None = None, plex_username: str | None = None) -> dict:
     """Return up to 6 random unwatched titles, optionally filtered by genre."""
     try:
         return await asyncio.to_thread(
-            partial(_unwatched_sync, media_type=media_type, genre=genre)
+            partial(_unwatched_sync, media_type=media_type, genre=genre, plex_username=plex_username)
         )
     except Exception as e:
         logger.error("find_unwatched error: %s", e)
         return {"status": STATUS_ERROR, "message": str(e)}
 
 
-async def get_similar_in_library(title: str) -> dict:
+async def get_similar_in_library(title: str, plex_username: str | None = None) -> dict:
     """Find titles in the Plex library similar to the given title."""
     try:
         return await asyncio.to_thread(
-            partial(_similar_sync, title=title)
+            partial(_similar_sync, title=title, plex_username=plex_username)
         )
     except Exception as e:
         logger.error("get_similar_in_library error: %s", e)
         return {"status": STATUS_ERROR, "message": str(e)}
 
 
-async def get_missing_from_collection(collection_name: str) -> dict:
+async def get_missing_from_collection(collection_name: str, plex_username: str | None = None) -> dict:
     """
     Compare a Plex collection against TMDB to find missing titles.
     Uses TMDB search to find the collection, then checks each title against Plex.
     """
     try:
         return await asyncio.to_thread(
-            partial(_missing_sync, collection_name=collection_name)
+            partial(_missing_sync, collection_name=collection_name, plex_username=plex_username)
         )
     except Exception as e:
         logger.error("get_missing_from_collection error: %s", e)
@@ -221,9 +261,9 @@ async def get_missing_from_collection(collection_name: str) -> dict:
 # SYNC IMPLEMENTATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _check_sync(title: str, year: int | None, media_type: str) -> dict:
+def _check_sync(title: str, year: int | None, media_type: str, plex_username: str | None = None) -> dict:
     plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
-    plex = _connect()
+    plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
@@ -241,9 +281,9 @@ def _check_sync(title: str, year: int | None, media_type: str) -> dict:
     return {"status": STATUS_MISSING}
 
 
-def _collection_sync(keyword: str, media_type: str) -> dict:
+def _collection_sync(keyword: str, media_type: str, plex_username: str | None = None) -> dict:
     plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
-    plex = _connect()
+    plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
@@ -264,9 +304,9 @@ def _collection_sync(keyword: str, media_type: str) -> dict:
     return {"status": "ok", "found": matches, "count": len(matches)}
 
 
-def _on_deck_sync() -> dict:
+def _on_deck_sync(plex_username: str | None = None) -> dict:
     """Fetch Continue Watching items from Plex."""
-    plex = _connect()
+    plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
@@ -293,9 +333,9 @@ def _on_deck_sync() -> dict:
     return {"status": "ok", "on_deck": items, "count": len(items)}
 
 
-def _metadata_sync(title: str, year: int | None) -> dict:
+def _metadata_sync(title: str, year: int | None, plex_username: str | None = None) -> dict:
     """Return technical specs — never file paths."""
-    plex = _connect()
+    plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
@@ -322,10 +362,10 @@ def _metadata_sync(title: str, year: int | None) -> dict:
     return {"status": STATUS_MISSING, "message": f"'{title}' ikke fundet i Plex."}
 
 
-def _unwatched_sync(media_type: str, genre: str | None) -> dict:
+def _unwatched_sync(media_type: str, genre: str | None, plex_username: str | None = None) -> dict:
     """Return up to 6 random unwatched titles."""
     plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
-    plex = _connect()
+    plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
@@ -369,9 +409,9 @@ def _unwatched_sync(media_type: str, genre: str | None) -> dict:
     }
 
 
-def _similar_sync(title: str) -> dict:
+def _similar_sync(title: str, plex_username: str | None = None) -> dict:
     """Find titles in Plex similar to the given title."""
-    plex = _connect()
+    plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
@@ -440,7 +480,7 @@ def _similar_sync(title: str) -> dict:
     return {"status": "ok", "source": getattr(source_item, "title", title), "similar": similar}
 
 
-def _missing_sync(collection_name: str) -> dict:
+def _missing_sync(collection_name: str, plex_username: str | None = None) -> dict:
     """
     Find TMDB titles for a search query, then check which are missing from Plex.
     Uses TMDB search + Plex lookup to identify gaps.
@@ -473,7 +513,7 @@ def _missing_sync(collection_name: str) -> dict:
         relevant = tmdb_results[:15]
 
     # Connect Plex once
-    plex = _connect()
+    plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
@@ -512,3 +552,126 @@ def _missing_sync(collection_name: str) -> dict:
         "missing_from_plex": missing_from_plex,
         "total_checked": len(relevant),
     }
+
+# ── Plex user validation ──────────────────────────────────────────────────────
+
+async def validate_plex_user(plex_username: str) -> dict:
+    """
+    Check whether a Plex username exists as a shared user on this server.
+
+    Works for both the server owner and managed/shared users.
+
+    Returns:
+        dict with:
+          valid    → True if found
+          username → matched display name
+          is_owner → True if this is the server owner account
+    """
+    try:
+        result = await asyncio.to_thread(
+            partial(_validate_user_sync, plex_username=plex_username)
+        )
+        return result
+    except Exception as e:
+        logger.error("validate_plex_user error: %s", e)
+        return {"valid": False, "message": str(e)}
+
+
+def _validate_user_sync(plex_username: str) -> dict:
+    """Synchronous Plex user validation — runs in thread pool."""
+    plex = _connect(plex_username)
+    if isinstance(plex, dict):
+        return {"valid": False, "message": plex.get("message", "Forbindelsesfejl")}
+
+    norm_input = plex_username.strip().lower()
+
+    try:
+        # Check if it's the server owner
+        account = plex.myPlexAccount()
+        owner_names = {
+            (account.username or "").lower(),
+            (account.email or "").lower(),
+            (account.title or "").lower(),
+        }
+        if norm_input in owner_names:
+            logger.info("Plex user validated as owner: %s", plex_username)
+            return {
+                "valid": True,
+                "username": account.title or account.username,
+                "is_owner": True,
+            }
+
+        # Check shared/managed users
+        for user in account.users():
+            user_names = {
+                (getattr(user, "username", "") or "").lower(),
+                (getattr(user, "email", "") or "").lower(),
+                (getattr(user, "title", "") or "").lower(),
+            }
+            if norm_input in user_names:
+                display = (
+                    getattr(user, "title", None)
+                    or getattr(user, "username", None)
+                    or plex_username
+                )
+                logger.info("Plex user validated as shared user: %s", display)
+                return {"valid": True, "username": display, "is_owner": False}
+
+    except Exception as e:
+        logger.error("Plex user lookup error: %s", e)
+        return {"valid": False, "message": f"Kunne ikke slaa brugeren op: {e}"}
+
+    return {"valid": False, "message": f"Brugernavnet '{plex_username}' blev ikke fundet paa Plex-serveren."}
+
+
+async def get_plex_for_user(plex_username: str):
+    """
+    Return a PlexServer instance scoped to a specific user.
+
+    For the server owner, returns the normal server connection.
+    For shared users, switches to their account context so library
+    access and watch history reflects their permissions.
+    """
+    try:
+        return await asyncio.to_thread(
+            partial(_get_user_server_sync, plex_username=plex_username)
+        )
+    except Exception as e:
+        logger.error("get_plex_for_user error: %s", e)
+        return None
+
+
+def _get_user_server_sync(plex_username: str):
+    """Return a user-scoped PlexServer — runs in thread pool."""
+    plex = _connect(plex_username)
+    if isinstance(plex, dict):
+        return None
+
+    try:
+        account = plex.myPlexAccount()
+        norm_input = plex_username.strip().lower()
+
+        # Owner gets the standard server connection
+        owner_names = {
+            (account.username or "").lower(),
+            (account.email or "").lower(),
+            (account.title or "").lower(),
+        }
+        if norm_input in owner_names:
+            return plex
+
+        # Shared users get a switched connection
+        for user in account.users():
+            user_names = {
+                (getattr(user, "username", "") or "").lower(),
+                (getattr(user, "email", "") or "").lower(),
+                (getattr(user, "title", "") or "").lower(),
+            }
+            if norm_input in user_names:
+                user_token = account.switchHomeUser(user).authToken
+                return PlexServer(PLEX_URL, user_token, timeout=15)
+
+    except Exception as e:
+        logger.error("User server switch error: %s", e)
+
+    return None
