@@ -25,11 +25,12 @@ async def notify_admin_new_user(update: Update) -> None:
     if user is None:
         return
 
-    display = f"@{user.username}" if user.username else user.first_name
+    display = f"@{user.username}" if user.username else (user.first_name or "Ukendt")
+    # Plain text — no parse_mode — avoids Markdown errors from special chars in names
     text = (
-        f"🔔 *Ny bruger ønsker adgang til Buddy*\n\n"
+        f"🔔 Ny bruger ønsker adgang til Buddy\n\n"
         f"Navn: {display}\n"
-        f"Telegram ID: `{user.id}`\n\n"
+        f"Telegram ID: {user.id}\n\n"
         f"Vil du godkende denne bruger?"
     )
 
@@ -44,7 +45,6 @@ async def notify_admin_new_user(update: Update) -> None:
         await update.get_bot().send_message(
             chat_id=ADMIN_TELEGRAM_ID,
             text=text,
-            parse_mode="Markdown",
             reply_markup=keyboard,
         )
         logger.info("Admin notified about new user telegram_id=%s", user.id)
