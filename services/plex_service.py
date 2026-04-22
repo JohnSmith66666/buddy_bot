@@ -9,26 +9,30 @@ blocking the async event loop.
 
 import asyncio
 import logging
+import random
 import re
 import unicodedata
 from functools import partial
 
-from plexapi.exceptions import NotFound, Unauthorized
+import httpx
+from plexapi.exceptions import Unauthorized
 from plexapi.server import PlexServer
 
-from config import PLEX_TOKEN, PLEX_URL
+from config import PLEX_TOKEN, PLEX_URL, TMDB_API_KEY
 
 logger = logging.getLogger(__name__)
 
-# ── Status constants ──────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 
 STATUS_FOUND   = "found"
 STATUS_MISSING = "missing"
 STATUS_ERROR   = "error"
 
-# Plex library types we care about
 _MOVIE_TYPE = "movie"
 _TV_TYPE    = "show"
+
+_TMDB_BASE  = "https://api.themoviedb.org/3"
+_TMDB_LANG  = "da-DK"
 
 
 # ── Title normalisation ───────────────────────────────────────────────────────
@@ -36,73 +40,29 @@ _TV_TYPE    = "show"
 def _normalise(title: str) -> str:
     """
     Normalise a title for fuzzy comparison.
-
-    Steps:
-      1. Unicode NFKD decomposition → strip combining characters (accents etc.)
-      2. Lowercase
-      3. Replace hyphens and underscores with a space
-      4. Remove all non-alphanumeric characters except spaces
-      5. Collapse multiple spaces into one and strip edges
-      6. Remove common articles that differ between languages
-         (the, a, an, den, det, en, et) when they appear at the start.
-
-    Examples:
-      'Olsen-banden'   → 'olsen banden'
-      'Olsen Banden'   → 'olsen banden'
-      'The Dark Knight' → 'dark knight'
-      'Oppenheimer.'   → 'oppenheimer'
+    Strips accents, lowercases, replaces hyphens, removes punctuation,
+    collapses spaces, and strips leading articles.
     """
-    # Decompose unicode and drop combining marks
     nfkd = unicodedata.normalize("NFKD", title)
     ascii_str = "".join(c for c in nfkd if not unicodedata.combining(c))
-
-    # Lowercase
     s = ascii_str.lower()
-
-    # Hyphens and underscores → space
     s = re.sub(r"[-_]", " ", s)
-
-    # Keep only alphanumeric and spaces
     s = re.sub(r"[^a-z0-9\s]", "", s)
-
-    # Collapse whitespace
     s = re.sub(r"\s+", " ", s).strip()
-
-    # Strip leading articles
     s = re.sub(r"^(the|a|an|den|det|en|et)\s+", "", s)
-
     return s
 
 
 def _titles_match(title_a: str, title_b: str) -> bool:
-    """Return True if two titles are equivalent after normalisation."""
     return _normalise(title_a) == _normalise(title_b)
 
 
-# ── Sync helper (runs in thread pool) ────────────────────────────────────────
+# ── Plex connection helper ────────────────────────────────────────────────────
 
-def _check_sync(title: str, year: int | None, media_type: str) -> dict:
-    """
-    Synchronous Plex library lookup across ALL sections dynamically.
-
-    Args:
-        title:      The title to search for (from TMDB).
-        year:       Release year (None = skip year check).
-        media_type: "movie" or "tv".
-
-    Returns:
-        dict with keys:
-          status   → "found" | "missing" | "error"
-          title    → matched Plex title (if found)
-          year     → matched Plex year (if found)
-          library  → Plex section name (if found)
-          message  → error description (if error)
-    """
-    # Map our internal type to Plex section type strings
-    plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
-
+def _connect() -> PlexServer | dict:
+    """Return a connected PlexServer or an error dict."""
     try:
-        plex = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=10)
+        return PlexServer(PLEX_URL, PLEX_TOKEN, timeout=15)
     except Unauthorized:
         logger.error("Plex auth failed — check PLEX_TOKEN")
         return {"status": STATUS_ERROR, "message": "Ugyldig Plex-token."}
@@ -110,163 +70,445 @@ def _check_sync(title: str, year: int | None, media_type: str) -> dict:
         logger.error("Plex connection error: %s", e)
         return {"status": STATUS_ERROR, "message": f"Kunne ikke forbinde til Plex: {e}"}
 
-    # ── Dynamically fetch all sections and filter by type ─────────────────────
+
+def _sections(plex: PlexServer, plex_type: str) -> list:
     try:
-        all_sections = plex.library.sections()
+        return [s for s in plex.library.sections() if s.type == plex_type]
     except Exception as e:
-        logger.error("Could not fetch Plex sections: %s", e)
-        return {"status": STATUS_ERROR, "message": f"Kunne ikke hente Plex-biblioteker: {e}"}
+        logger.error("Could not fetch sections: %s", e)
+        return []
 
-    relevant_sections = [s for s in all_sections if s.type == plex_type]
 
-    if not relevant_sections:
-        logger.warning("No Plex sections found for type '%s'", plex_type)
-        return {"status": STATUS_MISSING}
+def _safe_search(section, title: str) -> list:
+    """Search a section by first normalised word; return empty list on error."""
+    try:
+        first_word = _normalise(title).split()[0] if _normalise(title).split() else title
+        return section.search(title=first_word)
+    except Exception as e:
+        logger.warning("Search error in '%s': %s", section.title, e)
+        return []
 
-    logger.debug(
-        "Searching %d section(s) for '%s' (%s): %s",
-        len(relevant_sections),
-        title,
-        media_type,
-        [s.title for s in relevant_sections],
-    )
 
-    # ── Search each section ───────────────────────────────────────────────────
-    for section in relevant_sections:
-        try:
-            # Search with only the normalised first word — Plex's built-in
-            # search is strict and silently returns nothing for long titles
-            # with special characters (e.g. 'Olsenbanden for fuld musik').
-            # A broad first-word search maximises recall; our fuzzy matcher
-            # below handles false positives from the wider candidate set.
-            first_word = _normalise(title).split()[0] if _normalise(title).split() else title
-            results = section.search(title=first_word)
-        except Exception as e:
-            logger.warning("Search error in section '%s': %s", section.title, e)
-            continue
+# ── Media info helpers ────────────────────────────────────────────────────────
 
-        for item in results:
+def _stream_info(media_item) -> dict:
+    """
+    Extract technical specs from a Plex media item.
+    NEVER returns raw file paths or directory names.
+    """
+    info = {
+        "resolution": None,
+        "hdr": False,
+        "video_codec": None,
+        "audio_codec": None,
+        "audio_channels": None,
+        "bitrate_kbps": None,
+        "container": None,
+        "duration_minutes": None,
+    }
+
+    try:
+        media = media_item.media[0] if media_item.media else None
+        if not media:
+            return info
+
+        info["resolution"]    = getattr(media, "videoResolution", None)
+        info["bitrate_kbps"]  = getattr(media, "bitrate", None)
+        info["container"]     = getattr(media, "container", None)
+        info["duration_minutes"] = round(getattr(media_item, "duration", 0) / 60000) if getattr(media_item, "duration", None) else None
+
+        part = media.parts[0] if media.parts else None
+        if part:
+            for stream in getattr(part, "streams", []):
+                stype = getattr(stream, "streamType", None)
+                if stype == 1:  # video
+                    info["video_codec"] = getattr(stream, "codec", None)
+                    color_trc = getattr(stream, "colorTrc", "") or ""
+                    dv = getattr(stream, "DOVIPresent", False)
+                    info["hdr"] = bool(dv or "smpte2084" in color_trc.lower() or "arib-std-b67" in color_trc.lower())
+                elif stype == 2 and not info["audio_codec"]:  # first audio track
+                    info["audio_codec"]    = getattr(stream, "codec", None)
+                    info["audio_channels"] = getattr(stream, "channels", None)
+    except Exception as e:
+        logger.warning("Stream info error: %s", e)
+
+    return info
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PUBLIC ASYNC FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def check_library(title: str, year: int | None, media_type: str) -> dict:
+    """Check whether a specific title exists in Plex."""
+    try:
+        return await asyncio.to_thread(
+            partial(_check_sync, title=title, year=year, media_type=media_type)
+        )
+    except Exception as e:
+        logger.error("check_library error: %s", e)
+        return {"status": STATUS_ERROR, "message": str(e)}
+
+
+async def get_collection(keyword: str, media_type: str) -> dict:
+    """Search Plex for ALL titles matching a keyword."""
+    try:
+        return await asyncio.to_thread(
+            partial(_collection_sync, keyword=keyword, media_type=media_type)
+        )
+    except Exception as e:
+        logger.error("get_collection error: %s", e)
+        return {"status": STATUS_ERROR, "message": str(e)}
+
+
+async def get_on_deck() -> dict:
+    """Return the user's 'Continue Watching' list (up to 8 items)."""
+    try:
+        return await asyncio.to_thread(_on_deck_sync)
+    except Exception as e:
+        logger.error("get_on_deck error: %s", e)
+        return {"status": STATUS_ERROR, "message": str(e)}
+
+
+async def get_plex_metadata(title: str, year: int | None) -> dict:
+    """Return technical specs for a title — never raw file paths."""
+    try:
+        return await asyncio.to_thread(
+            partial(_metadata_sync, title=title, year=year)
+        )
+    except Exception as e:
+        logger.error("get_plex_metadata error: %s", e)
+        return {"status": STATUS_ERROR, "message": str(e)}
+
+
+async def find_unwatched(media_type: str, genre: str | None = None) -> dict:
+    """Return up to 6 random unwatched titles, optionally filtered by genre."""
+    try:
+        return await asyncio.to_thread(
+            partial(_unwatched_sync, media_type=media_type, genre=genre)
+        )
+    except Exception as e:
+        logger.error("find_unwatched error: %s", e)
+        return {"status": STATUS_ERROR, "message": str(e)}
+
+
+async def get_similar_in_library(title: str) -> dict:
+    """Find titles in the Plex library similar to the given title."""
+    try:
+        return await asyncio.to_thread(
+            partial(_similar_sync, title=title)
+        )
+    except Exception as e:
+        logger.error("get_similar_in_library error: %s", e)
+        return {"status": STATUS_ERROR, "message": str(e)}
+
+
+async def get_missing_from_collection(collection_name: str) -> dict:
+    """
+    Compare a Plex collection against TMDB to find missing titles.
+    Uses TMDB search to find the collection, then checks each title against Plex.
+    """
+    try:
+        return await asyncio.to_thread(
+            partial(_missing_sync, collection_name=collection_name)
+        )
+    except Exception as e:
+        logger.error("get_missing_from_collection error: %s", e)
+        return {"status": STATUS_ERROR, "message": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYNC IMPLEMENTATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _check_sync(title: str, year: int | None, media_type: str) -> dict:
+    plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
+    plex = _connect()
+    if isinstance(plex, dict):
+        return plex
+
+    for section in _sections(plex, plex_type):
+        for item in _safe_search(section, title):
             item_title = getattr(item, "title", "") or ""
             item_year  = getattr(item, "year", None)
-
-            # Fuzzy title match
             if not _titles_match(item_title, title):
                 continue
-
-            # Year match: allow ±1 tolerance for metadata discrepancies
-            if year and item_year:
-                if abs(item_year - year) > 1:
-                    continue
-
-            logger.info(
-                "Plex HIT: '%s' (%s) in section '%s'",
-                item_title, item_year, section.title,
-            )
-            return {
-                "status": STATUS_FOUND,
-                "title": item_title,
-                "year": item_year,
-                "library": section.title,
-            }
+            if year and item_year and abs(item_year - year) > 1:
+                continue
+            logger.info("Plex HIT: '%s' (%s) in '%s'", item_title, item_year, section.title)
+            return {"status": STATUS_FOUND, "title": item_title, "year": item_year, "library": section.title}
 
     return {"status": STATUS_MISSING}
 
 
-# ── Public async function ─────────────────────────────────────────────────────
-
-async def check_library(
-    title: str,
-    year: int | None,
-    media_type: str,
-) -> dict:
-    """
-    Async wrapper — runs the blocking PlexAPI call in a thread pool.
-
-    Args:
-        title:      Title to look up (from TMDB).
-        year:       Release year. Pass None if unknown.
-        media_type: "movie" or "tv".
-
-    Returns:
-        dict with:
-          status   → "found" | "missing" | "error"
-          title    → matched Plex title (if found)
-          year     → matched Plex year (if found)
-          library  → Plex section name (if found)
-          message  → error description (if error)
-    """
-    try:
-        result = await asyncio.to_thread(
-            partial(_check_sync, title=title, year=year, media_type=media_type)
-        )
-        return result
-    except Exception as e:
-        logger.error("Unexpected error in check_library: %s", e)
-        return {"status": STATUS_ERROR, "message": f"Uventet fejl: {e}"}
-
-async def get_collection(keyword: str, media_type: str) -> dict:
-    """
-    Search Plex directly for ALL titles matching a keyword.
-
-    Unlike check_library (which checks one specific title), this function
-    fetches every item in all relevant sections and filters by keyword —
-    giving a complete picture of what exists in the library.
-
-    Args:
-        keyword:    Search term, e.g. 'olsen' or 'star wars'.
-        media_type: 'movie' or 'tv'.
-
-    Returns:
-        dict with:
-          status  → 'ok' | 'error'
-          found   → list of dicts {title, year, library}
-          count   → total number of matches
-    """
-    try:
-        result = await asyncio.to_thread(
-            partial(_collection_sync, keyword=keyword, media_type=media_type)
-        )
-        return result
-    except Exception as e:
-        logger.error('Unexpected error in get_collection: %s', e)
-        return {'status': STATUS_ERROR, 'message': f'Uventet fejl: {e}'}
-
-
 def _collection_sync(keyword: str, media_type: str) -> dict:
-    """Synchronous version of get_collection — runs in thread pool."""
-    plex_type = _MOVIE_TYPE if media_type == 'movie' else _TV_TYPE
+    plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
+    plex = _connect()
+    if isinstance(plex, dict):
+        return plex
 
-    try:
-        plex = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=10)
-        all_sections = plex.library.sections()
-    except Unauthorized:
-        return {'status': STATUS_ERROR, 'message': 'Ugyldig Plex-token.'}
-    except Exception as e:
-        return {'status': STATUS_ERROR, 'message': f'Kunne ikke forbinde til Plex: {e}'}
-
-    relevant_sections = [s for s in all_sections if s.type == plex_type]
     norm_keyword = _normalise(keyword)
     matches = []
 
-    for section in relevant_sections:
-        try:
-            # Search with first normalised word for broad recall
-            first_word = norm_keyword.split()[0] if norm_keyword.split() else keyword
-            results = section.search(title=first_word)
-        except Exception as e:
-            logger.warning('Collection search error in section %s: %s', section.title, e)
-            continue
-
-        for item in results:
-            item_title = getattr(item, 'title', '') or ''
-            item_year  = getattr(item, 'year', None)
-            # Include if keyword appears anywhere in normalised title
+    for section in _sections(plex, plex_type):
+        for item in _safe_search(section, keyword):
+            item_title = getattr(item, "title", "") or ""
             if norm_keyword.split()[0] in _normalise(item_title):
                 matches.append({
-                    'title': item_title,
-                    'year': item_year,
-                    'library': section.title,
+                    "title": item_title,
+                    "year": getattr(item, "year", None),
+                    "library": section.title,
                 })
 
-    matches.sort(key=lambda x: x.get('year') or 0)
-    return {'status': 'ok', 'found': matches, 'count': len(matches)}
+    matches.sort(key=lambda x: x.get("year") or 0)
+    return {"status": "ok", "found": matches, "count": len(matches)}
+
+
+def _on_deck_sync() -> dict:
+    """Fetch Continue Watching items from Plex."""
+    plex = _connect()
+    if isinstance(plex, dict):
+        return plex
+
+    try:
+        on_deck = plex.library.onDeck()[:8]
+    except Exception as e:
+        logger.error("onDeck error: %s", e)
+        return {"status": STATUS_ERROR, "message": str(e)}
+
+    items = []
+    for item in on_deck:
+        entry = {
+            "title": getattr(item, "title", "Ukendt"),
+            "type": getattr(item, "type", "unknown"),
+            "year": getattr(item, "year", None),
+        }
+        if item.type == "episode":
+            entry["show"] = getattr(item, "grandparentTitle", None)
+            entry["season"] = getattr(item, "parentIndex", None)
+            entry["episode"] = getattr(item, "index", None)
+            entry["episode_title"] = getattr(item, "title", None)
+        items.append(entry)
+
+    return {"status": "ok", "on_deck": items, "count": len(items)}
+
+
+def _metadata_sync(title: str, year: int | None) -> dict:
+    """Return technical specs — never file paths."""
+    plex = _connect()
+    if isinstance(plex, dict):
+        return plex
+
+    # Search both movie and TV sections
+    for plex_type in (_MOVIE_TYPE, _TV_TYPE):
+        for section in _sections(plex, plex_type):
+            for item in _safe_search(section, title):
+                item_title = getattr(item, "title", "") or ""
+                item_year  = getattr(item, "year", None)
+                if not _titles_match(item_title, title):
+                    continue
+                if year and item_year and abs(item_year - year) > 1:
+                    continue
+
+                specs = _stream_info(item)
+                return {
+                    "status": STATUS_FOUND,
+                    "title": item_title,
+                    "year": item_year,
+                    "type": plex_type,
+                    "specs": specs,
+                }
+
+    return {"status": STATUS_MISSING, "message": f"'{title}' ikke fundet i Plex."}
+
+
+def _unwatched_sync(media_type: str, genre: str | None) -> dict:
+    """Return up to 6 random unwatched titles."""
+    plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
+    plex = _connect()
+    if isinstance(plex, dict):
+        return plex
+
+    unwatched = []
+    norm_genre = _normalise(genre) if genre else None
+
+    for section in _sections(plex, plex_type):
+        try:
+            filters = {"unwatched": True}
+            results = section.search(**filters)
+        except Exception:
+            try:
+                results = section.search()
+            except Exception as e:
+                logger.warning("Unwatched search error in '%s': %s", section.title, e)
+                continue
+
+        for item in results:
+            # Filter by watched status manually if filter didn't work
+            if getattr(item, "viewCount", 0) > 0:
+                continue
+
+            # Genre filter
+            if norm_genre:
+                item_genres = [_normalise(g.tag) for g in getattr(item, "genres", [])]
+                if not any(norm_genre in g for g in item_genres):
+                    continue
+
+            unwatched.append({
+                "title": getattr(item, "title", "Ukendt"),
+                "year": getattr(item, "year", None),
+                "rating": getattr(item, "audienceRating", None),
+                "library": section.title,
+            })
+
+    random.shuffle(unwatched)
+    return {
+        "status": "ok",
+        "suggestions": unwatched[:6],
+        "total_unwatched": len(unwatched),
+    }
+
+
+def _similar_sync(title: str) -> dict:
+    """Find titles in Plex similar to the given title."""
+    plex = _connect()
+    if isinstance(plex, dict):
+        return plex
+
+    # First find the source item
+    source_item = None
+    source_section = None
+    for plex_type in (_MOVIE_TYPE, _TV_TYPE):
+        for section in _sections(plex, plex_type):
+            for item in _safe_search(section, title):
+                if _titles_match(getattr(item, "title", ""), title):
+                    source_item = item
+                    source_section = section
+                    break
+            if source_item:
+                break
+        if source_item:
+            break
+
+    if not source_item:
+        return {"status": STATUS_MISSING, "message": f"'{title}' ikke fundet i Plex."}
+
+    similar = []
+    try:
+        # Use Plex's built-in similar items
+        related = source_item.related()
+        for hub in related:
+            for item in getattr(hub, "items", [])[:10]:
+                item_title = getattr(item, "title", "") or ""
+                if _normalise(item_title) == _normalise(title):
+                    continue
+                similar.append({
+                    "title": item_title,
+                    "year": getattr(item, "year", None),
+                    "rating": getattr(item, "audienceRating", None),
+                })
+        if similar:
+            return {"status": "ok", "source": getattr(source_item, "title", title), "similar": similar[:8]}
+    except Exception as e:
+        logger.warning("Plex related() failed, falling back to genre match: %s", e)
+
+    # Fallback: find items with overlapping genres in the same section
+    source_genres = {_normalise(g.tag) for g in getattr(source_item, "genres", [])}
+    if not source_genres:
+        return {"status": "ok", "source": getattr(source_item, "title", title), "similar": []}
+
+    candidates = []
+    try:
+        all_items = source_section.search()
+        for item in all_items:
+            item_title = getattr(item, "title", "") or ""
+            if _normalise(item_title) == _normalise(title):
+                continue
+            item_genres = {_normalise(g.tag) for g in getattr(item, "genres", [])}
+            overlap = len(source_genres & item_genres)
+            if overlap > 0:
+                candidates.append((overlap, {
+                    "title": item_title,
+                    "year": getattr(item, "year", None),
+                    "rating": getattr(item, "audienceRating", None),
+                }))
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        similar = [c[1] for c in candidates[:8]]
+    except Exception as e:
+        logger.warning("Genre fallback error: %s", e)
+
+    return {"status": "ok", "source": getattr(source_item, "title", title), "similar": similar}
+
+
+def _missing_sync(collection_name: str) -> dict:
+    """
+    Find TMDB titles for a search query, then check which are missing from Plex.
+    Uses TMDB search + Plex lookup to identify gaps.
+    """
+    import httpx as _httpx
+
+    # Search TMDB for movies matching the collection name
+    try:
+        resp = _httpx.get(
+            f"{_TMDB_BASE}/search/movie",
+            params={"api_key": TMDB_API_KEY, "language": _TMDB_LANG, "query": collection_name},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        tmdb_results = resp.json().get("results", [])[:30]
+    except Exception as e:
+        logger.error("TMDB search error in _missing_sync: %s", e)
+        return {"status": STATUS_ERROR, "message": f"Kunne ikke søge på titler: {e}"}
+
+    if not tmdb_results:
+        return {"status": "ok", "found_in_plex": [], "missing_from_plex": [], "total": 0}
+
+    # Filter results to those whose title contains the collection keyword
+    norm_kw = _normalise(collection_name).split()[0]
+    relevant = [
+        r for r in tmdb_results
+        if norm_kw in _normalise(r.get("title") or r.get("original_title") or "")
+    ]
+    if not relevant:
+        relevant = tmdb_results[:15]
+
+    # Connect Plex once
+    plex = _connect()
+    if isinstance(plex, dict):
+        return plex
+
+    found_in_plex   = []
+    missing_from_plex = []
+
+    for movie in relevant:
+        tmdb_title = movie.get("title") or movie.get("original_title") or ""
+        tmdb_year  = int((movie.get("release_date") or "0")[:4] or 0) or None
+
+        # Check all movie sections
+        in_plex = False
+        for section in _sections(plex, _MOVIE_TYPE):
+            for item in _safe_search(section, tmdb_title):
+                item_title = getattr(item, "title", "") or ""
+                item_year  = getattr(item, "year", None)
+                if not _titles_match(item_title, tmdb_title):
+                    continue
+                if tmdb_year and item_year and abs(item_year - tmdb_year) > 1:
+                    continue
+                in_plex = True
+                break
+            if in_plex:
+                break
+
+        entry = {"title": tmdb_title, "year": tmdb_year, "tmdb_id": movie.get("id")}
+        if in_plex:
+            found_in_plex.append(entry)
+        else:
+            missing_from_plex.append(entry)
+
+    return {
+        "status": "ok",
+        "collection": collection_name,
+        "found_in_plex": found_in_plex,
+        "missing_from_plex": missing_from_plex,
+        "total_checked": len(relevant),
+    }

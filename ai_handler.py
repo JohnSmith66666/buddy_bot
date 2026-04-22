@@ -13,7 +13,15 @@ from collections import defaultdict
 import anthropic
 
 from config import ANTHROPIC_API_KEY
-from services.plex_service import check_library, get_collection
+from services.plex_service import (
+    check_library,
+    find_unwatched,
+    get_collection,
+    get_missing_from_collection,
+    get_on_deck,
+    get_plex_metadata,
+    get_similar_in_library,
+)
 from services.seerr_service import request_movie, request_tv
 from services.tmdb_service import (
     get_media_details,
@@ -67,7 +75,11 @@ For SERIER:
   * category="standard" for internationale serier og ren dansk fiktion med Drama (18) eller Krimi (80)
 
 PRAESENTATION:
-Naar brugeren spoerger om hvad vi har af en bestemt franchise eller samling (f.eks. Olsenbanden, Marvel, Star Wars), skal du ALTID bruge get_plex_collection foerst for at faa det komplette og noejagtigt antal direkte fra biblioteket.
+Naar brugeren spoerger om hvad vi har af en bestemt franchise eller samling, skal du ALTID bruge get_plex_collection foerst.
+Naar brugeren spoerger hvad der MANGLER af en samling (f.eks. "hvad mangler jeg af Olsen-banden"), skal du bruge get_missing_from_collection.
+Naar brugeren er ubeslutsom eller spoerger "hvad skal jeg se", skal du proaktivt foreslaa noget fra find_unwatched eller get_on_deck.
+Naar brugeren spoerger om tekniske detaljer (opløsning, HDR, lyd), skal du bruge get_plex_metadata. Naevn ALDRIG filnavne eller mappestier.
+Naar brugeren vil have noget der ligner en bestemt titel, skal du bruge get_similar_in_library.
 Naar du praesentererer soegeresultater, viser du titel, aar, genre og en kort beskrivelse.
 Naar du praesentererer en person, viser du navn, rolle og deres mest kendte vaerker.
 Naar du viser streaming-udbydere, naevner du KUN danske tjenester.
@@ -207,6 +219,104 @@ TOOLS = [
         },
     },
     {
+        "name": "get_on_deck",
+        "description": (
+            "Hent brugerens 'Se videre'-liste fra Plex — titler der er paabegyndt men ikke faerdigset. "
+            "Brug dette vaerktoej naar brugeren spoerger 'hvad er jeg i gang med', "
+            "'hvad skal jeg fortsaette med' eller virker ubeslutsom om hvad de vil se."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "get_plex_metadata",
+        "description": (
+            "Hent tekniske specifikationer for en titel i Plex: oplosning, HDR-status, "
+            "videocodec, lydformat og bitrate. "
+            "Brug dette vaerktoej naar brugeren spoerger om kvalitet, "
+            "'er den i 4K', 'har den HDR' eller 'hvad er lydformatet'. "
+            "Returner KUN tekniske specs — aldrig filnavne eller mappestier."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Titlen paa filmen eller serien.",
+                },
+                "year": {
+                    "type": "integer",
+                    "description": "Udgivelsesaar (valgfrit, bruges til praeciis matching).",
+                },
+            },
+            "required": ["title"],
+        },
+    },
+    {
+        "name": "find_unwatched",
+        "description": (
+            "Find tilfaeldige film eller serier i Plex-biblioteket som brugeren endnu ikke har set. "
+            "Brug dette vaerktoej naar brugeren er ubeslutsom, spoerger 'hvad skal jeg se i aften', "
+            "'find mig noget jeg ikke har set' eller vil have inspiration."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "media_type": {
+                    "type": "string",
+                    "enum": ["movie", "tv"],
+                    "description": "Om det er film eller serier der soges efter.",
+                },
+                "genre": {
+                    "type": "string",
+                    "description": "Valgfrit genre-filter, f.eks. 'action' eller 'komedie'.",
+                },
+            },
+            "required": ["media_type"],
+        },
+    },
+    {
+        "name": "get_similar_in_library",
+        "description": (
+            "Find titler i Plex-biblioteket der ligner en bestemt film eller serie. "
+            "Brug dette vaerktoej naar brugeren siger 'find noget der ligner X', "
+            "'hvad er i samme stil som Y' eller 'jeg har set X og vil have noget lignende'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Titlen der skal bruges som reference.",
+                },
+            },
+            "required": ["title"],
+        },
+    },
+    {
+        "name": "get_missing_from_collection",
+        "description": (
+            "Sammenlign en samling eller franchise i Plex med alle kendte titler "
+            "for at finde hvad der mangler. "
+            "Brug dette vaerktoej naar brugeren spoerger 'hvad mangler jeg af X', "
+            "'er jeg komplet med Y-serien' eller 'hvilke X-film har vi ikke'. "
+            "Eksempel: 'hvad mangler jeg af Olsen-banden' eller 'hvilke Marvel-film mangler'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "collection_name": {
+                    "type": "string",
+                    "description": "Navn paa samlingen eller franchisen, f.eks. 'Olsen-banden' eller 'Marvel'.",
+                },
+            },
+            "required": ["collection_name"],
+        },
+    },
+        {
         "name": "search_person",
         "description": (
             "Soeg efter en skuespiller, instruktoer eller andet filmhold-medlem paa TMDB. "
@@ -409,6 +519,34 @@ async def _handle_tool_call(tool_name: str, tool_input: dict) -> str:
             title=tool_input["title"],
             year=tool_input.get("year"),
             media_type=tool_input["media_type"],
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    if tool_name == "get_on_deck":
+        result = await get_on_deck()
+        return json.dumps(result, ensure_ascii=False)
+
+    if tool_name == "get_plex_metadata":
+        result = await get_plex_metadata(
+            title=tool_input["title"],
+            year=tool_input.get("year"),
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    if tool_name == "find_unwatched":
+        result = await find_unwatched(
+            media_type=tool_input["media_type"],
+            genre=tool_input.get("genre"),
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    if tool_name == "get_similar_in_library":
+        result = await get_similar_in_library(title=tool_input["title"])
+        return json.dumps(result, ensure_ascii=False)
+
+    if tool_name == "get_missing_from_collection":
+        result = await get_missing_from_collection(
+            collection_name=tool_input["collection_name"]
         )
         return json.dumps(result, ensure_ascii=False)
 
