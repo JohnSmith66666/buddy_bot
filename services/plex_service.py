@@ -134,9 +134,13 @@ def _check_sync(title: str, year: int | None, media_type: str) -> dict:
     # ── Search each section ───────────────────────────────────────────────────
     for section in relevant_sections:
         try:
-            # Use Plex's own title search to get a candidate list,
-            # then apply our own fuzzy matching on top.
-            results = section.search(title=title)
+            # Search with only the normalised first word — Plex's built-in
+            # search is strict and silently returns nothing for long titles
+            # with special characters (e.g. 'Olsenbanden for fuld musik').
+            # A broad first-word search maximises recall; our fuzzy matcher
+            # below handles false positives from the wider candidate set.
+            first_word = _normalise(title).split()[0] if _normalise(title).split() else title
+            results = section.search(title=first_word)
         except Exception as e:
             logger.warning("Search error in section '%s': %s", section.title, e)
             continue
