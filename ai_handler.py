@@ -13,7 +13,7 @@ from collections import defaultdict
 import anthropic
 
 from config import ANTHROPIC_API_KEY
-from services.plex_service import check_library
+from services.plex_service import check_library, get_collection
 from services.seerr_service import request_movie, request_tv
 from services.tmdb_service import (
     get_media_details,
@@ -67,6 +67,7 @@ For SERIER:
   * category="standard" for internationale serier og ren dansk fiktion med Drama (18) eller Krimi (80)
 
 PRAESENTATION:
+Naar brugeren spoerger om hvad vi har af en bestemt franchise eller samling (f.eks. Olsenbanden, Marvel, Star Wars), skal du ALTID bruge get_plex_collection foerst for at faa det komplette og noejagtigt antal direkte fra biblioteket.
 Naar du praesentererer soegeresultater, viser du titel, aar, genre og en kort beskrivelse.
 Naar du praesentererer en person, viser du navn, rolle og deres mest kendte vaerker.
 Naar du viser streaming-udbydere, naevner du KUN danske tjenester.
@@ -178,6 +179,31 @@ TOOLS = [
                 },
             },
             "required": ["title", "media_type"],
+        },
+    },
+    {
+        "name": "get_plex_collection",
+        "description": (
+            "Soeg i Plex-biblioteket efter ALLE titler der matcher et nogleord. "
+            "Brug dette vaerktoej naar brugeren spoerger om hvad vi har af en bestemt serie, "
+            "samling eller franchise — f.eks. 'hvilke Olsenbanden film har vi', "
+            "'hvor mange Star Wars film ligger der' eller 'hvad har vi af Marvel'. "
+            "Returnerer en komplet liste med antal og titler direkte fra Plex."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keyword": {
+                    "type": "string",
+                    "description": "Soegerord der skal matche mod titler i Plex, f.eks. 'olsen' eller 'star wars'.",
+                },
+                "media_type": {
+                    "type": "string",
+                    "enum": ["movie", "tv"],
+                    "description": "Om det er film eller serier der soges efter.",
+                },
+            },
+            "required": ["keyword", "media_type"],
         },
     },
     {
@@ -382,6 +408,13 @@ async def _handle_tool_call(tool_name: str, tool_input: dict) -> str:
         result = await check_library(
             title=tool_input["title"],
             year=tool_input.get("year"),
+            media_type=tool_input["media_type"],
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    if tool_name == "get_plex_collection":
+        result = await get_collection(
+            keyword=tool_input["keyword"],
             media_type=tool_input["media_type"],
         )
         return json.dumps(result, ensure_ascii=False)

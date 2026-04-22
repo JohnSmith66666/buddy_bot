@@ -111,7 +111,7 @@ async def search_media(query: str, media_type: str = "both") -> list[dict]:
                     params=_params(query=query),
                 )
                 resp.raise_for_status()
-                for item in resp.json().get("results", [])[:5]:
+                for item in resp.json().get("results", [])[:30]:
                     results.append(_format_movie_result(item))
             except httpx.HTTPError as e:
                 logger.error("TMDB movie search error: %s", e)
@@ -123,7 +123,7 @@ async def search_media(query: str, media_type: str = "both") -> list[dict]:
                     params=_params(query=query),
                 )
                 resp.raise_for_status()
-                for item in resp.json().get("results", [])[:5]:
+                for item in resp.json().get("results", [])[:30]:
                     results.append(_format_tv_result(item))
             except httpx.HTTPError as e:
                 logger.error("TMDB TV search error: %s", e)

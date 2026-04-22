@@ -203,3 +203,70 @@ async def check_library(
     except Exception as e:
         logger.error("Unexpected error in check_library: %s", e)
         return {"status": STATUS_ERROR, "message": f"Uventet fejl: {e}"}
+
+async def get_collection(keyword: str, media_type: str) -> dict:
+    """
+    Search Plex directly for ALL titles matching a keyword.
+
+    Unlike check_library (which checks one specific title), this function
+    fetches every item in all relevant sections and filters by keyword —
+    giving a complete picture of what exists in the library.
+
+    Args:
+        keyword:    Search term, e.g. 'olsen' or 'star wars'.
+        media_type: 'movie' or 'tv'.
+
+    Returns:
+        dict with:
+          status  → 'ok' | 'error'
+          found   → list of dicts {title, year, library}
+          count   → total number of matches
+    """
+    try:
+        result = await asyncio.to_thread(
+            partial(_collection_sync, keyword=keyword, media_type=media_type)
+        )
+        return result
+    except Exception as e:
+        logger.error('Unexpected error in get_collection: %s', e)
+        return {'status': STATUS_ERROR, 'message': f'Uventet fejl: {e}'}
+
+
+def _collection_sync(keyword: str, media_type: str) -> dict:
+    """Synchronous version of get_collection — runs in thread pool."""
+    plex_type = _MOVIE_TYPE if media_type == 'movie' else _TV_TYPE
+
+    try:
+        plex = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=10)
+        all_sections = plex.library.sections()
+    except Unauthorized:
+        return {'status': STATUS_ERROR, 'message': 'Ugyldig Plex-token.'}
+    except Exception as e:
+        return {'status': STATUS_ERROR, 'message': f'Kunne ikke forbinde til Plex: {e}'}
+
+    relevant_sections = [s for s in all_sections if s.type == plex_type]
+    norm_keyword = _normalise(keyword)
+    matches = []
+
+    for section in relevant_sections:
+        try:
+            # Search with first normalised word for broad recall
+            first_word = norm_keyword.split()[0] if norm_keyword.split() else keyword
+            results = section.search(title=first_word)
+        except Exception as e:
+            logger.warning('Collection search error in section %s: %s', section.title, e)
+            continue
+
+        for item in results:
+            item_title = getattr(item, 'title', '') or ''
+            item_year  = getattr(item, 'year', None)
+            # Include if keyword appears anywhere in normalised title
+            if norm_keyword.split()[0] in _normalise(item_title):
+                matches.append({
+                    'title': item_title,
+                    'year': item_year,
+                    'library': section.title,
+                })
+
+    matches.sort(key=lambda x: x.get('year') or 0)
+    return {'status': 'ok', 'found': matches, 'count': len(matches)}
