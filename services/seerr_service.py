@@ -124,6 +124,7 @@ async def request_movie(tmdb_id: int, category: str = "standard") -> dict:
         "mediaId": tmdb_id,
         "rootFolder": root_folder,
         "is4k": False,
+        "isDefault": False,
     })
 
     if result.get("status") == "requested":
@@ -142,34 +143,39 @@ async def request_tv(
     Send a TV series request to Seerr routed to the correct Sonarr root folder.
 
     Per the Seerr API spec, 'seasons' MUST be an array of integers representing
-    the actual season numbers. Omitting it causes a 500 error.
+    the actual season numbers that exist on TMDB. Omitting it causes a 500 error.
 
     Args:
         tmdb_id:        The TMDB ID of the series.
-        season_numbers: List of actual season numbers, e.g. [1, 2, 3].
-                        Must be fetched from TMDB's seasons list
-                        (use season_number field, skip season 0/specials).
+        season_numbers: Exact season numbers from TMDB's seasons list
+                        (season_number field, specials/season 0 excluded).
+                        Each value is cast to int to ensure correct JSON type.
         category:       "tv_program" or "standard".
     """
     root_folder = _TV_ROOTS.get(category, ROOT_TV_STANDARD)
 
+    # Cast every entry to int — guards against strings sneaking in from Claude.
+    seasons_payload = [int(s) for s in season_numbers]
+
     logger.info("Requesting TV tmdb_id=%s seasons=%s category=%s rootFolder=%s",
-                tmdb_id, season_numbers, category, root_folder)
+                tmdb_id, seasons_payload, category, root_folder)
 
     result = await _post_request({
         "mediaType": "tv",
         "mediaId": tmdb_id,
-        "seasons": season_numbers,   # REQUIRED — array of ints per Seerr API spec
+        "seasons": seasons_payload,   # REQUIRED — array of ints per Seerr API spec
         "rootFolder": root_folder,
         "is4k": False,
+        "isDefault": False,
     })
 
     if result.get("status") == "requested":
         result["message"] = (
             f"Serien er tilføjet til køen! "
-            f"({len(season_numbers)} sæson{'er' if len(season_numbers) != 1 else ''})"
+            f"({len(seasons_payload)} sæson{'er' if len(seasons_payload) != 1 else ''}:"
+            f" {seasons_payload})"
         )
         result["root_folder"] = root_folder
-        result["seasons_requested"] = season_numbers
+        result["seasons_requested"] = seasons_payload
 
     return result

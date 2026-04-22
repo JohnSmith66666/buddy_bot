@@ -46,16 +46,18 @@ For FILM - vaelg category saaledes:
 - category="standard"   i alle andre tilfaelde
 
 For SERIER:
-- Du SKAL sende season_numbers fra get_media_details direkte som season_numbers i request_tv.
-  season_numbers er listen af faktiske saesonnumre fra TMDB (f.eks. [1, 2, 3]).
-  Spring aldrig saeson 0 over - den er allerede filtreret fra i TMDB-svaret.
+- Du SKAL sende season_numbers NOEJAGTIGT som de fremgaar af 'season_numbers' feltet i get_media_details.
+- Du maa ALDRIG antage eller opdigte saesonnumre. Hvis TMDB kun viser [25], sender du [25]. Ikke [1, 25].
+- Du maa ALDRIG tilfoeje Saeson 1 hvis den ikke er listet i TMDB's season_numbers.
+- Brug KUN de heltal der faktisk staar i listen.
+
 - Vaelg category saaledes:
   * category="tv_program" hvis een eller flere af disse betingelser er opfyldt:
       - genren indeholder Reality (10764), Talk (10767), News (10763) eller Dokumentar (99)
       - original_language er "da" OG genren indeholder Familie (10751)
       - original_language er "da" OG genren mangler baade Drama (18) og Krimi (80)
   * category="standard" for internationale serier og ren dansk fiktion med Drama (18) eller Krimi (80)
-  Eksempel: Argang 0 Forever = dansk + ingen Drama/Krimi → tv_program
+  Eksempel: Argang 0 Forever = dansk + ingen Drama/Krimi → tv_program, season_numbers=[25]
   Eksempel: Dansk krimiserie = dansk + genre 80 → standard
   Eksempel: Breaking Bad = international Drama → standard
 
@@ -63,7 +65,7 @@ PRAESENTATION:
 Naar du praesentererer soegeresultater, viser du titel, aar, genre og en kort beskrivelse.
 Naar du praesentererer en person, viser du navn, rolle og deres mest kendte vaerker.
 Naar du viser streaming-udbydere, naevner du KUN danske tjenester.
-Naar du bekraefter en anmodning, fortaeller du titel, antal saesoner og hvilken mappe titlen er sendt til.
+Naar du bekraefter en anmodning, fortaeller du titel, de eksakte saesonnumre og hvilken mappe titlen er sendt til.
 
 FORMATTERING:
 Du skriver KUN i Telegram-kompatibelt format.
@@ -108,8 +110,9 @@ TOOLS = [
             "Hent detaljerede oplysninger om en specifik film eller TV-serie fra TMDB. "
             "Brug dette vaerktoej naar brugeren vil vide mere om et bestemt resultat, "
             "ELLER naar du skal forberede en Seerr-anmodning. "
-            "For serier returnerer dette felt 'season_numbers' — en liste af faktiske "
-            "saesonnumre (f.eks. [1, 2, 3]) som skal sendes direkte til request_tv. "
+            "For serier returnerer dette felt 'season_numbers' — en liste af de eksakte "
+            "saesonnumre der rent faktisk findes paa TMDB (f.eks. [25] eller [1, 2, 3]). "
+            "Disse tal skal sendes NOEJAGTIGT videre til request_tv uden aendringer. "
             "Kraever et TMDB ID fra search_media."
         ),
         "input_schema": {
@@ -258,7 +261,8 @@ TOOLS = [
             "Anmod om download af en TV-serie via Seerr. "
             "Brug dette vaerktoej naar brugeren beder om at tilfoeje eller downloade en serie. "
             "VIGTIGT: Kald altid get_media_details foerst. "
-            "Brug 'season_numbers' fra get_media_details direkte som season_numbers her. "
+            "Brug 'season_numbers' fra get_media_details NOEJAGTIGT som de er — ingen aendringer. "
+            "Tilfoej ALDRIG saesonnumre der ikke staar i TMDB's liste. "
             "SORTERING: Saet category='tv_program' hvis genren indeholder Reality (10764), "
             "Talk (10767), News (10763) eller Dokumentar (99) — ELLER hvis original_language='da' "
             "og genren indeholder Familie (10751) eller mangler baade Drama (18) og Krimi (80). "
@@ -275,9 +279,9 @@ TOOLS = [
                     "type": "array",
                     "items": {"type": "integer"},
                     "description": (
-                        "Liste af faktiske saesonnumre fra TMDB, f.eks. [1, 2, 3]. "
-                        "Hentes fra 'season_numbers' feltet i get_media_details. "
-                        "SKAL vaere et array af integers — kraeves af Seerr API."
+                        "Eksakte saesonnumre fra 'season_numbers' i get_media_details. "
+                        "Kopier listen direkte — tilfoej eller fjern ikke noget. "
+                        "Eksempel: hvis TMDB returnerer [25], send [25]. Ikke [1, 25]."
                     ),
                 },
                 "category": {
