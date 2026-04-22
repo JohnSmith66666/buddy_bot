@@ -20,8 +20,7 @@ async def notify_admin_new_user(update: Update) -> None:
     """
     Send the admin a notification with an approval button when an
     unknown user tries to use Buddy.
-    Uses plain text only — no parse_mode — to avoid Markdown errors
-    from special characters in usernames.
+    Plain text only — no parse_mode — to avoid Markdown errors.
     """
     user = update.effective_user
     if user is None:
@@ -61,6 +60,8 @@ async def handle_approve_callback(update: Update, context: ContextTypes.DEFAULT_
     - Deletes the approval message from the Buddy chat.
     - Sends a confirmation DM to the admin.
     - Sends a plain-text welcome to the new user asking for Plex username.
+    - Registers the new user in _awaiting_plex_username so their first
+      reply is handled correctly without needing a second prompt.
     """
     query = update.callback_query
     await query.answer()
@@ -99,7 +100,6 @@ async def handle_approve_callback(update: Update, context: ContextTypes.DEFAULT_
         logger.error("Could not send admin confirmation: %s", e)
 
     # Welcome the new user — plain text only, no parse_mode
-    # Avoids BadRequest errors from underscores/asterisks in usernames
     welcome = (
         "🎩 Du er nu godkendt!\n\n"
         "For at jeg kan give dig personlige svar, skal jeg kende dit "
@@ -111,6 +111,13 @@ async def handle_approve_callback(update: Update, context: ContextTypes.DEFAULT_
             chat_id=new_user_id,
             text=welcome,
         )
+        # Immediately register the user as awaiting their Plex username.
+        # This prevents _needs_plex_setup() from sending a second prompt
+        # before the user has had a chance to reply to this one.
+        # Import here to avoid circular import at module level.
+        from main import _awaiting_plex_username
+        _awaiting_plex_username.add(new_user_id)
+        logger.info("User %s registered in _awaiting_plex_username", new_user_id)
     except Exception as e:
         logger.error("Could not send welcome to user %s: %s", new_user_id, e)
 
