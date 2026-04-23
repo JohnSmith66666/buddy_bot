@@ -113,17 +113,31 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
     if tool_name == "get_request_status":
         return j(await get_request_status(tool_input["title"], plex_username))
 
-    # Tautulli — populæritet er serverbredt, stats/historik er bruger-scopet
+    # Tautulli
+    # FIX: get_popular_on_plex bruger time_range + stats_count (ikke 'days')
     if tool_name == "get_popular_on_plex":
-        return j(await get_popular_on_plex(days=tool_input.get("days", 7)))
+        return j(await get_popular_on_plex(
+            stats_count=tool_input.get("stats_count", 10),
+            time_range=tool_input.get("time_range", 30),
+        ))
+
+    # FIX: get_user_watch_stats bruger query_days (ikke 'days')
     if tool_name == "get_user_watch_stats":
         if not plex_username:
             return j({"error": "Intet Plex-brugernavn fundet — kan ikke hente personlig statistik."})
-        return j(await get_user_watch_stats(plex_username, days=tool_input.get("days")))
+        return j(await get_user_watch_stats(
+            plex_username,
+            query_days=tool_input.get("query_days", tool_input.get("days", 30)),
+        ))
+
+    # FIX: get_user_history bruger length (ikke 'query')
     if tool_name == "get_user_history":
         if not plex_username:
             return j({"error": "Intet Plex-brugernavn fundet — kan ikke hente historik."})
-        return j(await get_user_history(plex_username, query=tool_input.get("query")))
+        return j(await get_user_history(
+            plex_username,
+            length=tool_input.get("length", tool_input.get("count", 10)),
+        ))
 
     return j({"error": f"Ukendt vaerktoej: {tool_name}"})
 
@@ -144,7 +158,6 @@ async def get_ai_response(
     _histories[telegram_id].append({"role": "user", "content": user_message})
     _trim(telegram_id)
 
-    # Inject plex context into the system prompt if username is known
     system = SYSTEM_PROMPT
     if plex_username:
         system += f"\n\nDen aktuelle bruger hedder '{plex_username}' på Plex."
@@ -163,16 +176,35 @@ async def get_ai_response(
                 _histories[telegram_id].append(
                     {"role": "assistant", "content": response.content}
                 )
+
                 tool_results = []
                 for block in response.content:
                     if block.type == "tool_use":
                         logger.info("Tool call: %s(%s)", block.name, block.input)
-                        result = await _dispatch(block.name, block.input, plex_username)
+                        # FIX: tool_result SKAL altid sendes tilbage — selv ved fejl.
+                        # Hvis _dispatch kaster en exception, fanger vi den her og
+                        # returnerer en fejlbesked som tool_result i stedet for at
+                        # afbryde løkken. Det forhindrer Anthropic 400-fejlen:
+                        # "tool_use ids found without tool_result blocks".
+                        try:
+                            result = await _dispatch(block.name, block.input, plex_username)
+                        except Exception as dispatch_err:
+                            logger.error(
+                                "Tool dispatch error for '%s': %s",
+                                block.name,
+                                dispatch_err,
+                            )
+                            result = json.dumps(
+                                {"error": f"Vaerktoejet '{block.name}' fejlede: {dispatch_err}"},
+                                ensure_ascii=False,
+                            )
+
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
                             "content": result,
                         })
+
                 _histories[telegram_id].append({"role": "user", "content": tool_results})
                 _trim(telegram_id)
                 continue
@@ -187,6 +219,10 @@ async def get_ai_response(
 
     except anthropic.APIError as e:
         logger.error("Anthropic error for user %s: %s", telegram_id, e)
+        # FIX: Ved API-fejl rydder vi den korrupte historik for denne bruger
+        # så næste besked starter med en ren slate frem for at sende en
+        # ugyldig beskedsekvens igen og få samme 400-fejl.
+        _histories.pop(telegram_id, None)
         return "Av, noget gik galt hos mig — prøv igen om lidt! 🔧"
 
 
