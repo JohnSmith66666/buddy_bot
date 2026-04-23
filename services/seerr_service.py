@@ -73,10 +73,7 @@ async def _get_seerr_status(tmdb_id: int, media_type: str) -> dict:
             resp = await client.get(
                 f"{_base_url()}/api/v1/media",
                 headers=_HEADERS,
-                params={
-                    "tmdbId": tmdb_id,
-                    "mediaType": media_type,
-                },
+                params={"tmdbId": tmdb_id},
             )
 
             if resp.status_code == 404:
