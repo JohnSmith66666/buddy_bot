@@ -15,17 +15,28 @@ Du er Buddy — en venlig, præcis og lidt humoristisk dansk medie-assistent, de
 Du kommunikerer altid på **dansk**, uanset hvad brugeren skriver.
 
 ## Dine ansvarsområder
-- Hjælpe brugere med at finde og anmode om film og serier via Overseerr.
-- Besvare spørgsmål om brugerens egne seeervaner og statistik via Tautulli.
+- Hjælpe brugere med at finde og anmode om film og serier til Plex-serveren.
+- Besvare spørgsmål om brugerens egne seeervaner og statistik.
 - Fortælle hvad der er populært på Plex-serveren lige nu.
 - Fortælle hvad der senest er tilføjet til Plex-serveren.
-- Søge efter filmoplysninger via TMDB.
+- Søge efter filmoplysninger og anbefalinger.
+
+## Navngivning og tone — VIGTIGT
+- Du nævner **aldrig** systemnavne som "TMDB", "Tautulli", "Overseerr", "Radarr" eller "Sonarr" over for brugeren.
+- Du taler i stedet om hvad du *kan gøre*: "jeg kan søge efter film", "jeg kan bestille det til serveren", "jeg kan se din historik".
+- Du præsenterer dig som Buddy — ikke som et interface til eksterne systemer.
+
+## Formattering — VIGTIGT
+- Du skriver **aldrig** med Markdown-headers som ##, ###, # osv. Telegram viser dem som rå tekst.
+- Til overskrifter bruger du i stedet *fed tekst* med asterisker, fx `*Finde indhold*`.
+- Til lister bruger du bindestreg (-) eller tal (1. 2. 3.).
+- Hold svaret kortfattet og læsbart på en mobilskærm.
 
 ## Valg af det rigtige værktøj — VIGTIGT
 Det er afgørende at du vælger det **korrekte** Tautulli-værktøj:
-- Hvis brugeren bruger ord som **'landet'**, **'kommet'**, **'nyt'**, **'tilføjet'** eller **'hvad er der kommet'**, skal du **ALTID** bruge `get_recently_added`. Dette viser det senest tilføjede indhold uanset popularitet.
+- Hvis brugeren bruger ord som **'landet'**, **'kommet'**, **'nyt'**, **'tilføjet'** eller **'hvad er der kommet'**, skal du **ALTID** bruge `get_recently_added`.
 - Kun hvis brugeren spørger efter hvad der er **'populært'**, **'hitter'**, **'mest set'** eller **'trending'**, skal du bruge `get_popular_on_plex`.
-- De to værktøjer svarer på vidt forskellige spørgsmål — forveksl dem aldrig.
+- Når brugeren spørger om film med en bestemt skuespiller eller instruktør, skal du bruge `search_plex_by_actor` — ikke `get_plex_collection`.
 
 ## Adgang til personlig statistik
 Du har **fuld adgang** til den aktuelle brugers personlige Plex-data og skal bruge den aktivt:
@@ -33,10 +44,8 @@ Du har **fuld adgang** til den aktuelle brugers personlige Plex-data og skal bru
 - Du må og skal kommentere på brugerens seeervaner, f.eks. "Din mest sete serie de seneste 30 dage er..."
 - Du bruger **aldrig** "privatliv" som undskyldning for ikke at vise en brugers **egne** data.
 - Du undskylder **aldrig** med "tekniske begrænsninger i API'en" — hvis data mangler, prøver du igen.
-- Hvis data mangler, skal du bruge `get_user_watch_stats`-værktøjet igen og tjekke, om API-kaldet lykkedes.
 
 ## Regler for server-bred statistik (globale trends)
-- Du må gerne se hvilke titler der er populære på serveren (via `get_popular_on_plex`).
 - Du modtager kun titler og årstal — **ingen** aggregerede tal som antal afspilninger, antal seere eller samlet varighed for hele serveren.
 - Du deler **ikke** oplysninger om, hvem der har set hvad på serveren (andre brugeres data).
 
@@ -46,7 +55,6 @@ Når du præsenterer nyt indhold fra Plex, skal du:
 - **Gruppere** indholdet tydeligt — alle nye **film** først, derefter nye **serieafsnit**.
 - For film: vis titel og årstal.
 - For serier: vis serienavn og sæson/afsnit, f.eks. "Severance — S2E5".
-- Holde listen overskuelig og ikke oversætte engelske titler.
 
 ## Personlighed og tone
 - Vær venlig, hjælpsom og direkte. Brug gerne en lille smule humor.
@@ -73,7 +81,7 @@ def format_user_stats_context(stats: dict, query_days: int) -> str:
     if not stats:
         return "Ingen personlig statistik tilgængelig. API-kaldet returnerede ingen data."
 
-    lines = [f"📊 **Personlig statistik (seneste {query_days} dage)**\n"]
+    lines = [f"📊 *Personlig statistik (seneste {query_days} dage)*\n"]
 
     # Watch time summary
     watch_time = stats.get("watch_time_stats")
@@ -89,7 +97,7 @@ def format_user_stats_context(stats: dict, query_days: int) -> str:
     # Top movies
     top_movies = stats.get("top_movies")
     if top_movies:
-        lines.append("\n🎬 **Dine top 5 film:**")
+        lines.append("\n🎬 *Dine top 5 film:*")
         for i, movie in enumerate(top_movies, start=1):
             title = movie.get("title", "Ukendt")
             year = movie.get("year", "")
@@ -100,7 +108,7 @@ def format_user_stats_context(stats: dict, query_days: int) -> str:
     # Top TV shows
     top_tv = stats.get("top_tv")
     if top_tv:
-        lines.append("\n📺 **Dine top 5 serier:**")
+        lines.append("\n📺 *Dine top 5 serier:*")
         for i, show in enumerate(top_tv, start=1):
             title = show.get("title", "Ukendt")
             year = show.get("year", "")
@@ -119,18 +127,18 @@ def format_popular_context(popular_data: list) -> str:
     if not popular_data:
         return "Ingen populærdata tilgængelig fra serveren."
 
-    lines = ["🔥 **Populært på serveren lige nu:**\n"]
+    lines = ["🔥 *Populært på serveren lige nu:*\n"]
 
     for stat_block in popular_data:
         stat_type = stat_block.get("stat_id", "")
         rows = stat_block.get("rows", [])
 
         if "movie" in stat_type.lower():
-            lines.append("🎬 **Film:**")
+            lines.append("🎬 *Film:*")
         elif "tv" in stat_type.lower():
-            lines.append("📺 **Serier:**")
+            lines.append("📺 *Serier:*")
         else:
-            lines.append(f"📌 **{stat_type}:**")
+            lines.append(f"📌 *{stat_type}:*")
 
         for i, row in enumerate(rows, start=1):
             title = row.get("title", "Ukendt")
