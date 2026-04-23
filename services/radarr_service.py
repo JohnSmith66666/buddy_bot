@@ -1,215 +1,210 @@
 """
-database.py - PostgreSQL connection pool, table management,
-user whitelist, Plex username storage, onboarding state and interaction logging.
+services/radarr_service.py - Direkte Radarr API integration.
 
-CHANGES vs previous version:
-- Added `onboarding_state` column to `users` table so Railway restarts
-  never lose users mid-onboarding (replaces the in-memory set in main.py).
-- Log pruning now uses a single DELETE with ORDER BY + OFFSET instead of
-  a correlated subquery, which is faster on large tables.
+Erstatter Seerr for film-anmodninger.
+
+Sorteringslogik (rodmapper):
+  - genre indeholder 'Animation' → /mnt/unionfs/Media/Movies/Animation
+  - alt andet                    → /mnt/unionfs/Media/Movies/Film
+
+Tags:
+  - Hver anmodning tildeles automatisk et tag med brugerens Plex-navn.
+  - Tagget oprettes i Radarr hvis det ikke findes.
 """
 
 import logging
-from datetime import datetime, timezone
 
-import asyncpg
+import httpx
 
-from config import DATABASE_URL, LOG_HISTORY_LIMIT
+from config import (
+    RADARR_API_KEY,
+    RADARR_QUALITY_PROFILE_ID,
+    RADARR_URL,
+    ROOT_MOVIE_ANIMATION,
+    ROOT_MOVIE_STANDARD,
+)
 
 logger = logging.getLogger(__name__)
 
-_pool: asyncpg.Pool | None = None
+
+def _base() -> str:
+    return RADARR_URL.rstrip("/")
 
 
-# ── Schema ────────────────────────────────────────────────────────────────────
-
-_CREATE_USERS_TABLE = """
-CREATE TABLE IF NOT EXISTS users (
-    telegram_id      BIGINT PRIMARY KEY,
-    telegram_name    TEXT,
-    plex_username    TEXT,
-    is_whitelisted   BOOLEAN     NOT NULL DEFAULT FALSE,
-    onboarding_state TEXT,                          -- NULL | 'awaiting_plex'
-    added_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-"""
-
-# Migration: add onboarding_state if an older version of the table exists.
-_MIGRATE_ONBOARDING_STATE = """
-ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS onboarding_state TEXT;
-"""
-
-_CREATE_INTERACTION_LOG_TABLE = """
-CREATE TABLE IF NOT EXISTS interaction_log (
-    id           BIGSERIAL PRIMARY KEY,
-    telegram_id  BIGINT      NOT NULL,
-    direction    TEXT        NOT NULL CHECK (direction IN ('incoming', 'outgoing')),
-    message_text TEXT,
-    logged_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-"""
-
-_CREATE_LOG_INDEX = """
-CREATE INDEX IF NOT EXISTS idx_log_telegram_id
-    ON interaction_log (telegram_id, logged_at DESC);
-"""
+def _headers() -> dict:
+    return {"X-Api-Key": RADARR_API_KEY, "Content-Type": "application/json"}
 
 
-# ── Lifecycle ─────────────────────────────────────────────────────────────────
+# ── Tag helpers ───────────────────────────────────────────────────────────────
 
-async def setup_db() -> None:
-    global _pool
-    logger.info("Connecting to PostgreSQL …")
-    _pool = await asyncpg.create_pool(
-        dsn=DATABASE_URL, min_size=2, max_size=10, command_timeout=30,
+async def _get_or_create_tag(label: str) -> int | None:
+    """
+    Find Radarr tag ID by label, or create it if it doesn't exist.
+    Returns the tag ID, or None on error.
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(f"{_base()}/api/v3/tag", headers=_headers())
+            resp.raise_for_status()
+            for tag in resp.json():
+                if tag.get("label", "").lower() == label.lower():
+                    return tag["id"]
+
+            # Tag not found — create it
+            resp = await client.post(
+                f"{_base()}/api/v3/tag",
+                headers=_headers(),
+                json={"label": label},
+            )
+            resp.raise_for_status()
+            tag_id = resp.json().get("id")
+            logger.info("Radarr: created tag '%s' with id=%s", label, tag_id)
+            return tag_id
+        except httpx.HTTPError as e:
+            logger.error("Radarr tag error: %s", e)
+            return None
+
+
+# ── Library check ─────────────────────────────────────────────────────────────
+
+async def check_radarr_library(tmdb_id: int) -> dict:
+    """
+    Check if a movie is already in Radarr (downloaded or monitored).
+    Returns: {"status": "found"|"missing"|"monitored_only", "title": ...}
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(
+                f"{_base()}/api/v3/movie",
+                headers=_headers(),
+                params={"tmdbId": tmdb_id},
+            )
+            resp.raise_for_status()
+            movies = resp.json()
+        except httpx.HTTPError as e:
+            logger.error("Radarr library check error: %s", e)
+            return {"status": "error", "message": str(e)}
+
+    if not movies:
+        return {"status": "missing"}
+
+    movie = movies[0]
+    if movie.get("hasFile"):
+        return {"status": "found", "title": movie.get("title"), "year": movie.get("year")}
+    return {"status": "monitored_only", "title": movie.get("title"), "year": movie.get("year")}
+
+
+# ── Add movie ─────────────────────────────────────────────────────────────────
+
+async def add_movie(
+    tmdb_id: int,
+    title: str,
+    year: int,
+    genres: list[str],
+    plex_username: str | None = None,
+) -> dict:
+    """
+    Add a movie to Radarr.
+
+    Rodmappe-logik:
+      - 'Animation' in genres → ROOT_MOVIE_ANIMATION
+      - else                  → ROOT_MOVIE_STANDARD
+    """
+    # Determine root folder
+    genre_names_lower = [g.lower() for g in genres]
+    if "animation" in genre_names_lower:
+        root_folder = ROOT_MOVIE_ANIMATION
+    else:
+        root_folder = ROOT_MOVIE_STANDARD
+
+    # Resolve tag
+    tag_ids = []
+    if plex_username:
+        tag_id = await _get_or_create_tag(plex_username)
+        if tag_id is not None:
+            tag_ids = [tag_id]
+
+    logger.info(
+        "Radarr: adding movie tmdb_id=%s title='%s' rootFolder=%s tags=%s",
+        tmdb_id, title, root_folder, tag_ids,
     )
-    async with _pool.acquire() as conn:
-        await conn.execute(_CREATE_USERS_TABLE)
-        await conn.execute(_MIGRATE_ONBOARDING_STATE)
-        await conn.execute(_CREATE_INTERACTION_LOG_TABLE)
-        await conn.execute(_CREATE_LOG_INDEX)
-    logger.info("Database ready.")
+
+    payload = {
+        "tmdbId": tmdb_id,
+        "title": title,
+        "year": year,
+        "qualityProfileId": RADARR_QUALITY_PROFILE_ID,
+        "rootFolderPath": root_folder,
+        "monitored": True,
+        "addOptions": {
+            "searchForMovie": True,
+        },
+        "tags": tag_ids,
+    }
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.post(
+                f"{_base()}/api/v3/movie",
+                headers=_headers(),
+                json=payload,
+            )
+
+            if resp.status_code == 201:
+                body = resp.json()
+                logger.info("Radarr: movie added successfully id=%s", body.get("id"))
+                return {
+                    "success": True,
+                    "status": "added",
+                    "radarr_id": body.get("id"),
+                    "title": body.get("title"),
+                    "root_folder": root_folder,
+                    "message": f"Filmen er tilføjet til køen og søges nu! 🎬",
+                }
+
+            if resp.status_code == 400:
+                body = resp.json()
+                # Already exists in Radarr
+                if any("already" in str(e).lower() for e in body):
+                    return {
+                        "success": False,
+                        "status": "already_exists",
+                        "message": "Filmen er allerede i Radarr.",
+                    }
+
+            resp.raise_for_status()
+
+        except httpx.HTTPStatusError as e:
+            logger.error("Radarr HTTP error: %s — body: %s", e, e.response.text)
+            return {
+                "success": False,
+                "status": "error",
+                "message": f"Radarr fejl: HTTP {e.response.status_code}",
+            }
+        except httpx.HTTPError as e:
+            logger.error("Radarr connection error: %s", e)
+            return {
+                "success": False,
+                "status": "connection_error",
+                "message": "Kunne ikke forbinde til Radarr.",
+            }
+
+    return {"success": False, "status": "unknown_error", "message": "Ukendt fejl."}
 
 
-async def close_db() -> None:
-    if _pool:
-        await _pool.close()
+# ── Get queue / history ───────────────────────────────────────────────────────
 
-
-def _pool_ref() -> asyncpg.Pool:
-    if _pool is None:
-        raise RuntimeError("DB pool not initialised — call setup_db() first.")
-    return _pool
-
-
-# ── User helpers ──────────────────────────────────────────────────────────────
-
-async def get_user(telegram_id: int) -> dict | None:
-    """Return the full user row or None if not found."""
-    async with _pool_ref().acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM users WHERE telegram_id = $1", telegram_id
-        )
-    return dict(row) if row else None
-
-
-async def upsert_user(telegram_id: int, telegram_name: str | None = None) -> None:
-    """Insert a new user (not whitelisted) or update their Telegram name."""
-    async with _pool_ref().acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO users (telegram_id, telegram_name)
-            VALUES ($1, $2)
-            ON CONFLICT (telegram_id) DO UPDATE
-                SET telegram_name = COALESCE(EXCLUDED.telegram_name, users.telegram_name)
-            """,
-            telegram_id, telegram_name,
-        )
-
-
-async def is_whitelisted(telegram_id: int) -> bool:
-    async with _pool_ref().acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT is_whitelisted FROM users WHERE telegram_id = $1", telegram_id
-        )
-    return bool(row and row["is_whitelisted"])
-
-
-async def approve_user(telegram_id: int) -> None:
-    """Whitelist an existing user and mark them as awaiting Plex setup."""
-    async with _pool_ref().acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE users
-            SET is_whitelisted   = TRUE,
-                onboarding_state = 'awaiting_plex'
-            WHERE telegram_id = $1
-            """,
-            telegram_id,
-        )
-    logger.info("User %s approved.", telegram_id)
-
-
-async def get_plex_username(telegram_id: int) -> str | None:
-    async with _pool_ref().acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT plex_username FROM users WHERE telegram_id = $1", telegram_id
-        )
-    return row["plex_username"] if row else None
-
-
-async def set_plex_username(telegram_id: int, plex_username: str) -> None:
-    """Save the verified Plex username and clear the onboarding state."""
-    async with _pool_ref().acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE users
-            SET plex_username    = $1,
-                onboarding_state = NULL
-            WHERE telegram_id = $2
-            """,
-            plex_username, telegram_id,
-        )
-    logger.info("plex_username='%s' saved for telegram_id=%s", plex_username, telegram_id)
-
-
-# ── Onboarding state ──────────────────────────────────────────────────────────
-
-async def get_onboarding_state(telegram_id: int) -> str | None:
-    """Return the user's current onboarding_state ('awaiting_plex' or None)."""
-    async with _pool_ref().acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT onboarding_state FROM users WHERE telegram_id = $1", telegram_id
-        )
-    return row["onboarding_state"] if row else None
-
-
-async def set_onboarding_state(telegram_id: int, state: str | None) -> None:
-    """Set or clear the onboarding_state for a user."""
-    async with _pool_ref().acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET onboarding_state = $1 WHERE telegram_id = $2",
-            state, telegram_id,
-        )
-
-
-# ── Interaction log ───────────────────────────────────────────────────────────
-
-async def log_message(
-    telegram_id: int,
-    direction: str,
-    message_text: str,
-) -> None:
-    async with _pool_ref().acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO interaction_log (telegram_id, direction, message_text, logged_at)
-            VALUES ($1, $2, $3, $4)
-            """,
-            telegram_id, direction, message_text, datetime.now(timezone.utc),
-        )
-        # FIX: Pruning rewritten as a single DELETE with ORDER BY + OFFSET.
-        # This avoids the correlated subquery which is slow on large tables.
-        await conn.execute(
-            """
-            DELETE FROM interaction_log
-            WHERE telegram_id = $1
-              AND id NOT IN (
-                  SELECT id FROM interaction_log
-                  WHERE telegram_id = $1
-                  ORDER BY logged_at DESC
-                  LIMIT $2
-              )
-            """,
-            telegram_id, LOG_HISTORY_LIMIT,
-        )
-
-
-async def get_all_whitelisted_users() -> list[dict]:
-    """Return all whitelisted users with their plex_username and telegram_id."""
-    async with _pool_ref().acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT telegram_id, telegram_name, plex_username FROM users WHERE is_whitelisted = TRUE"
-        )
-    return [dict(row) for row in rows]
+async def get_radarr_queue() -> list:
+    """Return current Radarr download queue."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(
+                f"{_base()}/api/v3/queue",
+                headers=_headers(),
+                params={"pageSize": 50},
+            )
+            resp.raise_for_status()
+            return resp.json().get("records", [])
+        except httpx.HTTPError as e:
+            logger.error("Radarr queue error: %s", e)
+            return []
