@@ -1,8 +1,11 @@
 """
 admin_handlers.py - Admin approval logic for Buddy.
 
-Kept in its own file so it can be moved to a dedicated bot later
-without touching main.py or any other module.
+CHANGES vs previous version:
+  - Removed the circular import of `_awaiting_plex_username` from main.py.
+    Onboarding state is now written to the DB via database.approve_user(),
+    which sets onboarding_state = 'awaiting_plex' atomically with the
+    whitelist approval. No in-memory state needed.
 """
 
 import logging
@@ -56,41 +59,38 @@ async def handle_approve_callback(update: Update, context: ContextTypes.DEFAULT_
     """
     Handle the 'Godkend' button press from the admin.
 
-    - Whitelists the user in the database.
+    - Whitelists the user in the database and sets onboarding_state = 'awaiting_plex'.
     - Deletes the approval message from the Buddy chat.
     - Sends a confirmation DM to the admin.
     - Sends a plain-text welcome to the new user asking for Plex username.
-    - Registers the new user in _awaiting_plex_username so their first
-      reply is handled correctly without needing a second prompt.
+
+    No circular imports needed — state is fully DB-driven.
     """
     query = update.callback_query
     await query.answer()
 
-    # Only the admin may approve
     if query.from_user.id != ADMIN_TELEGRAM_ID:
         await query.answer("Du har ikke adgang til at godkende brugere.", show_alert=True)
         return
 
-    # Parse telegram_id from callback_data ("approve_user:123456")
     try:
         new_user_id = int(query.data.split(":")[1])
     except (IndexError, ValueError):
         logger.error("Malformed callback_data: %s", query.data)
         return
 
-    # Approve in DB
+    # approve_user() now sets is_whitelisted=TRUE and onboarding_state='awaiting_plex'
+    # in a single DB call, so no in-memory registration is needed.
     await database.approve_user(new_user_id)
 
     user_row = await database.get_user(new_user_id)
     display = user_row.get("telegram_name") or str(new_user_id) if user_row else str(new_user_id)
 
-    # Delete the approval message from the Buddy chat
     try:
         await query.delete_message()
     except Exception:
         pass
 
-    # Send confirmation directly to admin as a private DM
     try:
         await context.bot.send_message(
             chat_id=ADMIN_TELEGRAM_ID,
@@ -99,7 +99,6 @@ async def handle_approve_callback(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error("Could not send admin confirmation: %s", e)
 
-    # Welcome the new user — plain text only, no parse_mode
     welcome = (
         "🎩 Du er nu godkendt!\n\n"
         "For at jeg kan give dig personlige svar, skal jeg kende dit "
@@ -111,13 +110,6 @@ async def handle_approve_callback(update: Update, context: ContextTypes.DEFAULT_
             chat_id=new_user_id,
             text=welcome,
         )
-        # Immediately register the user as awaiting their Plex username.
-        # This prevents _needs_plex_setup() from sending a second prompt
-        # before the user has had a chance to reply to this one.
-        # Import here to avoid circular import at module level.
-        from main import _awaiting_plex_username
-        _awaiting_plex_username.add(new_user_id)
-        logger.info("User %s registered in _awaiting_plex_username", new_user_id)
     except Exception as e:
         logger.error("Could not send welcome to user %s: %s", new_user_id, e)
 

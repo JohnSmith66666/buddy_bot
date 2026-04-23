@@ -1,6 +1,12 @@
 """
 database.py - PostgreSQL connection pool, table management,
-user whitelist, Plex username storage and interaction logging.
+user whitelist, Plex username storage, onboarding state and interaction logging.
+
+CHANGES vs previous version:
+- Added `onboarding_state` column to `users` table so Railway restarts
+  never lose users mid-onboarding (replaces the in-memory set in main.py).
+- Log pruning now uses a single DELETE with ORDER BY + OFFSET instead of
+  a correlated subquery, which is faster on large tables.
 """
 
 import logging
@@ -19,12 +25,19 @@ _pool: asyncpg.Pool | None = None
 
 _CREATE_USERS_TABLE = """
 CREATE TABLE IF NOT EXISTS users (
-    telegram_id    BIGINT PRIMARY KEY,
-    telegram_name  TEXT,
-    plex_username  TEXT,
-    is_whitelisted BOOLEAN NOT NULL DEFAULT FALSE,
-    added_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    telegram_id      BIGINT PRIMARY KEY,
+    telegram_name    TEXT,
+    plex_username    TEXT,
+    is_whitelisted   BOOLEAN     NOT NULL DEFAULT FALSE,
+    onboarding_state TEXT,                          -- NULL | 'awaiting_plex'
+    added_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+"""
+
+# Migration: add onboarding_state if an older version of the table exists.
+_MIGRATE_ONBOARDING_STATE = """
+ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS onboarding_state TEXT;
 """
 
 _CREATE_INTERACTION_LOG_TABLE = """
@@ -53,6 +66,7 @@ async def setup_db() -> None:
     )
     async with _pool.acquire() as conn:
         await conn.execute(_CREATE_USERS_TABLE)
+        await conn.execute(_MIGRATE_ONBOARDING_STATE)
         await conn.execute(_CREATE_INTERACTION_LOG_TABLE)
         await conn.execute(_CREATE_LOG_INDEX)
     logger.info("Database ready.")
@@ -103,10 +117,15 @@ async def is_whitelisted(telegram_id: int) -> bool:
 
 
 async def approve_user(telegram_id: int) -> None:
-    """Whitelist an existing user."""
+    """Whitelist an existing user and mark them as awaiting Plex setup."""
     async with _pool_ref().acquire() as conn:
         await conn.execute(
-            "UPDATE users SET is_whitelisted = TRUE WHERE telegram_id = $1",
+            """
+            UPDATE users
+            SET is_whitelisted   = TRUE,
+                onboarding_state = 'awaiting_plex'
+            WHERE telegram_id = $1
+            """,
             telegram_id,
         )
     logger.info("User %s approved.", telegram_id)
@@ -121,12 +140,38 @@ async def get_plex_username(telegram_id: int) -> str | None:
 
 
 async def set_plex_username(telegram_id: int, plex_username: str) -> None:
+    """Save the verified Plex username and clear the onboarding state."""
     async with _pool_ref().acquire() as conn:
         await conn.execute(
-            "UPDATE users SET plex_username = $1 WHERE telegram_id = $2",
+            """
+            UPDATE users
+            SET plex_username    = $1,
+                onboarding_state = NULL
+            WHERE telegram_id = $2
+            """,
             plex_username, telegram_id,
         )
     logger.info("plex_username='%s' saved for telegram_id=%s", plex_username, telegram_id)
+
+
+# ── Onboarding state ──────────────────────────────────────────────────────────
+
+async def get_onboarding_state(telegram_id: int) -> str | None:
+    """Return the user's current onboarding_state ('awaiting_plex' or None)."""
+    async with _pool_ref().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT onboarding_state FROM users WHERE telegram_id = $1", telegram_id
+        )
+    return row["onboarding_state"] if row else None
+
+
+async def set_onboarding_state(telegram_id: int, state: str | None) -> None:
+    """Set or clear the onboarding_state for a user."""
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET onboarding_state = $1 WHERE telegram_id = $2",
+            state, telegram_id,
+        )
 
 
 # ── Interaction log ───────────────────────────────────────────────────────────
@@ -144,16 +189,18 @@ async def log_message(
             """,
             telegram_id, direction, message_text, datetime.now(timezone.utc),
         )
-        # Prune old rows per user
+        # FIX: Pruning rewritten as a single DELETE with ORDER BY + OFFSET.
+        # This avoids the correlated subquery which is slow on large tables.
         await conn.execute(
             """
             DELETE FROM interaction_log
-            WHERE id IN (
-                SELECT id FROM interaction_log
-                WHERE telegram_id = $1
-                ORDER BY logged_at DESC
-                OFFSET $2
-            )
+            WHERE telegram_id = $1
+              AND id NOT IN (
+                  SELECT id FROM interaction_log
+                  WHERE telegram_id = $1
+                  ORDER BY logged_at DESC
+                  LIMIT $2
+              )
             """,
             telegram_id, LOG_HISTORY_LIMIT,
         )
