@@ -69,76 +69,6 @@ def _slim(item) -> dict:
     }
 
 
-# ── Genre alias mapping ───────────────────────────────────────────────────────
-
-# Mapper brugerinput (dansk/engelsk/slang) til alle kendte Plex-genre-varianter.
-# Plex bruger typisk engelske genrenavne som "Science Fiction", "Sci-Fi" osv.
-# Når brugeren skriver "rummet", "sci-fi" eller "scifi" skal vi matche dem alle.
-_GENRE_ALIASES: dict[str, list[str]] = {
-    # Science Fiction
-    "science fiction": ["science fiction", "sci fi", "scifi", "sci-fi", "sf"],
-    "sci fi":          ["science fiction", "sci fi", "scifi", "sci-fi", "sf"],
-    "scifi":           ["science fiction", "sci fi", "scifi", "sci-fi", "sf"],
-    "rummet":          ["science fiction", "sci fi", "scifi", "space", "sf"],
-    "space":           ["science fiction", "sci fi", "scifi", "space", "sf"],
-    # Action
-    "action":          ["action", "actionfilm", "action adventure"],
-    # Komedie
-    "komedie":         ["comedy", "komedie", "com"],
-    "comedy":          ["comedy", "komedie"],
-    # Thriller
-    "thriller":        ["thriller", "suspense"],
-    "gyser":           ["horror", "gyser", "skrack"],
-    "horror":          ["horror", "gyser", "skrack"],
-    # Drama
-    "drama":           ["drama"],
-    # Romantik
-    "romantik":        ["romance", "romantic", "romantik"],
-    "romance":         ["romance", "romantic", "romantik"],
-    # Animation
-    "animation":       ["animation", "animated", "anime", "cartoon"],
-    "anime":           ["animation", "anime"],
-    # Dokumentar
-    "dokumentar":      ["documentary", "dokumentar"],
-    "documentary":     ["documentary", "dokumentar"],
-    # Krimi
-    "krimi":           ["crime", "krimi", "criminal", "kriminalitet"],
-    "crime":           ["crime", "krimi"],
-    # Eventyr
-    "eventyr":         ["adventure", "eventyr"],
-    "adventure":       ["adventure", "eventyr"],
-    # Familie
-    "familie":         ["family", "familie"],
-    "family":          ["family", "familie"],
-    # Fantasy
-    "fantasy":         ["fantasy"],
-    # Western
-    "western":         ["western"],
-    # Krig
-    "krig":            ["war", "krig"],
-    "war":             ["war", "krig"],
-    # Historie
-    "historie":        ["history", "historical", "historie"],
-    "historical":      ["history", "historical", "historie"],
-    # Musik
-    "musik":           ["music", "musical", "musik"],
-    "musical":         ["music", "musical", "musik"],
-    # Mystery
-    "mysterium":       ["mystery", "mysterium"],
-    "mystery":         ["mystery", "mysterium"],
-}
-
-
-def _resolve_genre_aliases(genre: str) -> list[str]:
-    """
-    Returnerer alle kendte Plex-genre-varianter for et bruger-input.
-    Fx 'rummet' → ['science fiction', 'sci fi', 'scifi', 'space', 'sf']
-    Hvis ingen alias findes, returneres det normaliserede input som-er.
-    """
-    norm = _normalise(genre)
-    return _GENRE_ALIASES.get(norm, [norm])
-
-
 # ── Title normalisation ───────────────────────────────────────────────────────
 
 def _normalise(title: str) -> str:
@@ -433,6 +363,24 @@ async def get_missing_from_collection(
         return {"status": STATUS_ERROR, "message": str(e)}
 
 
+async def search_by_actor(
+    actor_name: str,
+    media_type: str = "movie",
+    plex_username: str | None = None,
+) -> dict:
+    """
+    Find titles in the Plex library featuring a specific actor or director.
+    Uses PlexAPI's actor filter — NOT title search.
+    """
+    try:
+        return await asyncio.to_thread(
+            partial(_actor_sync, actor_name=actor_name, media_type=media_type, plex_username=plex_username)
+        )
+    except Exception as e:
+        logger.error("search_by_actor error: %s", e)
+        return {"status": STATUS_ERROR, "message": str(e)}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SYNC IMPLEMENTATIONS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -560,9 +508,7 @@ def _unwatched_sync(
         return plex
 
     unwatched = []
-    # FIX: Brug genre-alias system så "rummet", "sci-fi", "scifi" alle
-    # matcher Plex's "Science Fiction". Uden aliases finder Buddy ingen film.
-    genre_aliases = _resolve_genre_aliases(genre) if genre else None
+    norm_genre = _normalise(genre) if genre else None
 
     for section in _sections(plex, plex_type):
         try:
@@ -577,14 +523,9 @@ def _unwatched_sync(
         for item in results:
             if getattr(item, "viewCount", 0) > 0:
                 continue
-            if genre_aliases:
+            if norm_genre:
                 item_genres = [_normalise(g.tag) for g in getattr(item, "genres", [])]
-                # Match hvis ét af brugerens aliases findes i én af filmens genres
-                if not any(
-                    alias in item_genre
-                    for alias in genre_aliases
-                    for item_genre in item_genres
-                ):
+                if not any(norm_genre in g for g in item_genres):
                     continue
             unwatched.append(_slim(item))
 
@@ -724,6 +665,62 @@ def _missing_sync(collection_name: str, plex_username: str | None = None) -> dic
         "found_in_plex":     found_in_plex[:_MAX_RESULTS],
         "missing_from_plex": missing_from_plex[:_MAX_RESULTS],
         "total_checked": len(relevant),
+    }
+
+
+def _actor_sync(
+    actor_name: str,
+    media_type: str = "movie",
+    plex_username: str | None = None,
+) -> dict:
+    """
+    search_by_actor — find titles in Plex featuring a specific actor.
+
+    Bruger PlexAPI's section.search(actor=...) filter som søger i metadata,
+    ikke i titler. Det er den korrekte måde at finde film med en bestemt skuespiller.
+    """
+    plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
+    plex = _connect(plex_username)
+    if isinstance(plex, dict):
+        return plex
+
+    matches = []
+    norm_actor = _normalise(actor_name)
+
+    for section in _sections(plex, plex_type):
+        try:
+            # Primær metode: brug PlexAPI's indbyggede actor-filter
+            results = section.search(actor=actor_name)
+            for item in results:
+                matches.append(_slim(item))
+        except Exception:
+            # Fallback: manuel scanning af rollebesætning
+            try:
+                for item in section.search():
+                    roles = getattr(item, "roles", []) or []
+                    for role in roles:
+                        role_name = _normalise(getattr(role, "tag", "") or "")
+                        if norm_actor in role_name or role_name in norm_actor:
+                            matches.append(_slim(item))
+                            break
+            except Exception as e:
+                logger.warning("Actor fallback search error in '%s': %s", section.title, e)
+
+    matches.sort(key=lambda x: x.get("year") or 0, reverse=True)
+    capped = matches[:_MAX_RESULTS]
+
+    if not capped:
+        return {
+            "status": "not_found",
+            "message": f"Ingen titler med '{actor_name}' fundet i Plex-biblioteket.",
+            "actor": actor_name,
+        }
+
+    return {
+        "status": "ok",
+        "actor": actor_name,
+        "found": capped,
+        "count": len(capped),
     }
 
 

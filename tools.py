@@ -222,6 +222,29 @@ TOOLS = [
             "required": ["collection_name"],
         },
     },
+    {
+        "name": "search_plex_by_actor",
+        "description": (
+            "Find film eller serier i Plex-biblioteket med en bestemt skuespiller eller instruktør. "
+            "Brug dette når brugeren spørger 'hvilke film har jeg med X' eller 'har vi noget med Y'. "
+            "Søger i metadata — ikke i titler. Langt mere præcis end get_plex_collection til personnavne."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "actor_name": {
+                    "type": "string",
+                    "description": "Skuespillerens eller instruktørens fulde navn, f.eks. 'Kate Winslet'.",
+                },
+                "media_type": {
+                    "type": "string",
+                    "enum": ["movie", "tv"],
+                    "description": "Søg i film eller serier. Standard er 'movie'.",
+                },
+            },
+            "required": ["actor_name"],
+        },
+    },
 
     # ── Seerr ─────────────────────────────────────────────────────────────────
     {
@@ -337,23 +360,6 @@ TOOLS = [
                 "query": {
                     "type": "string",
                     "description": "Valgfri titel eller søgeord at lede efter i historikken.",
-                },
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "get_recently_added",
-        "description": (
-            "Hent en liste over det nyeste indhold (film og serieafsnit) der er tilføjet til Plex-serveren. "
-            "Brug dette når brugeren spørger 'hvad er nyt', 'hvad er lige kommet til' eller 'hvad er tilføjet for nylig'."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "count": {
-                    "type": "integer",
-                    "description": "Antal elementer der skal hentes. Standard er 10.",
                 },
             },
             "required": [],
