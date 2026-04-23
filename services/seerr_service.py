@@ -238,8 +238,8 @@ async def request_tv(
         "rootFolder": root_folder,
         "serverId": 0,
         "profileId": 7,
+        "languageProfileId": 1,
         "is4k": False,
-        "isDefault": False,
     })
 
     if result.get("status") == "requested":
