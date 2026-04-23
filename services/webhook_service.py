@@ -97,7 +97,7 @@ async def _notify_users(
     """
     all_users = await database.get_all_whitelisted_users()
 
-    if not tags and send_to_all_on_empty:
+    if (not tags or tags == ["test-tag"]) and send_to_all_on_empty:
         logger.info("Webhook: ingen tags — sender til alle %d whitelisted brugere", len(all_users))
         recipients = all_users
     else:
