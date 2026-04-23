@@ -226,7 +226,6 @@ async def get_ai_response(
                 system=system_with_cache,
                 tools=tools_with_cache,
                 messages=_histories[telegram_id],
-                betas=["prompt-caching-2024-07-31"],
             )
 
             # Log cache-effektivitet
