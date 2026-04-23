@@ -97,10 +97,12 @@ async def _post_request(payload: dict) -> dict:
             )
 
             if resp.status_code in (201, 202):
+                body = resp.json()
+                logger.info("Seerr POST response body: %s", body)
                 return {
                     "success": True,
                     "status": "requested",
-                    "request_id": resp.json().get("id"),
+                    "request_id": body.get("id"),
                 }
 
             if resp.status_code == 409:
