@@ -128,22 +128,18 @@ async def get_popular_on_plex(days: int = 7) -> dict:
         if stat_id == "popular_movies" and not top_movies:
             sorted_rows = sorted(rows, key=lambda r: r.get("users_watched", 0), reverse=True)
             for item in sorted_rows[:_MAX_ITEMS]:
+                # Kun titel og år — ingen tal af hensyn til privatlivet.
                 top_movies.append({
-                    "title":         item.get("title") or item.get("grandparent_title") or "Ukendt",
-                    "year":          item.get("year"),
-                    "users_watched": item.get("users_watched", 0),
-                    "total_plays":   item.get("total_plays", 0),
-                    "media_type":    "movie",
+                    "title": item.get("title") or item.get("grandparent_title") or "Ukendt",
+                    "year":  item.get("year"),
                 })
 
         elif stat_id == "popular_tv" and not top_tv:
             sorted_rows = sorted(rows, key=lambda r: r.get("users_watched", 0), reverse=True)
             for item in sorted_rows[:_MAX_ITEMS]:
+                # Kun titel — serier har sjældent year på dette niveau.
                 top_tv.append({
-                    "title":         item.get("grandparent_title") or item.get("title") or "Ukendt",
-                    "users_watched": item.get("users_watched", 0),
-                    "total_plays":   item.get("total_plays", 0),
-                    "media_type":    "tv",
+                    "title": item.get("grandparent_title") or item.get("title") or "Ukendt",
                 })
 
     if not top_movies and not top_tv:

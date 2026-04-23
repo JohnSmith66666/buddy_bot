@@ -292,9 +292,10 @@ TOOLS = [
     {
         "name": "get_popular_on_plex",
         "description": (
-            "Hent de mest populære film og serier på Plex-serveren. "
+            "Hent de mest populære film og serier på Plex-serveren som en prioriteret topliste. "
             "Brug dette når brugeren spørger 'hvad ser andre' eller 'hvad er mest populært'. "
-            "Returnerer KUN de top 10 mest sete film og top 10 mest sete serier."
+            "Returnerer top 10 film og top 10 serier sorteret efter popularitet — "
+            "KUN titler og årstal, ingen bruger- eller afspilningstal."
         ),
         "input_schema": {
             "type": "object",
