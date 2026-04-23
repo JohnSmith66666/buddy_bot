@@ -5,8 +5,9 @@ Handles all communication with the Tautulli API.
 
 Korrekte parametre (bekræftet via debug-logs 2026-04-23):
 - get_user_watch_time_stats : bruger `query_days` + user_id
-- get_user_stats            : bruger `days` + user_id + stat_id + count
-- get_home_stats            : bruger `time_range` + stats_count
+- get_home_stats med user_id : bruger `time_range` + user_id + stats_count (personlige toplister)
+- get_home_stats uden user_id: bruger `time_range` + stats_count (server-wide trends)
+- Tid returneres i SEKUNDER — skal divideres med 3600 for timer, 60 for minutter.
 """
 
 import logging
@@ -76,14 +77,14 @@ async def get_tautulli_user_id(plex_username: str) -> int | None:
 async def get_user_watch_stats(plex_username: str, query_days: int = 365) -> dict | None:
     """
     Returns a combined personal statistics payload for a single user:
-      - watch_time_stats : total duration (i minutter) og play counts
+      - watch_time_stats : total seertid i timer/minutter + antal afspilninger
       - top_movies       : top 5 film set af denne bruger
       - top_tv           : top 5 serier set af denne bruger
 
-    VIGTIGE parameter-regler (bekræftet via HTTP 400-logs 2026-04-23):
+    VIGTIGE parameter-regler (bekræftet via logs):
       - get_user_watch_time_stats → bruger `query_days`
-      - get_user_stats            → bruger `days` (hverken query_days eller time_range!)
-      - Tautulli returnerer tid i SEKUNDER — vi konverterer til minutter før retur.
+      - get_home_stats med user_id → bruger `time_range` (dage) for personlige toplister
+      - Tautulli returnerer tid i SEKUNDER — konverteres til timer/minutter her.
     """
     user_id = await get_tautulli_user_id(plex_username)
     if user_id is None:
@@ -91,7 +92,7 @@ async def get_user_watch_stats(plex_username: str, query_days: int = 365) -> dic
         return None
 
     # --- 1. Watch time og play count totals ---
-    # Bruger query_days — korrekt for denne kommando
+    # get_user_watch_time_stats bruger query_days — korrekt for denne kommando
     watch_time_raw = await _tautulli_get({
         "cmd": "get_user_watch_time_stats",
         "user_id": user_id,
@@ -99,51 +100,78 @@ async def get_user_watch_stats(plex_username: str, query_days: int = 365) -> dic
     })
 
     # FIX: Tautulli returnerer total_time i SEKUNDER.
-    # Konverter til minutter så Buddy ikke tror brugeren har set
-    # Plex non-stop i 937 dage.
+    # Konverter til timer og minutter så Buddy ikke siger 1.349.175 minutter.
     watch_time_data = None
     if watch_time_raw:
         watch_time_data = []
         for entry in watch_time_raw:
             total_seconds = entry.get("total_time", 0) or 0
-            total_minutes = total_seconds // 60
-            hours = total_minutes // 60
-            minutes = total_minutes % 60
+            hours = total_seconds // 3600
+            minutes = (total_seconds % 3600) // 60
             watch_time_data.append({
                 **entry,
-                "total_time_seconds": total_seconds,
-                "total_time_minutes": total_minutes,
                 "total_time_hours": hours,
-                "total_time_remainder_minutes": minutes,
-                # Fjern det rå sekund-felt så Buddy ikke misforstår det
-                "total_time": total_minutes,
+                "total_time_minutes": minutes,
+                # Overskriver det rå sekund-felt med timer så Buddy ikke misforstår
+                "total_time": hours,
             })
 
     # --- 2. Top 5 film for denne bruger ---
-    # FIX: get_user_stats bruger `days` — hverken query_days eller time_range!
-    top_movies_data = await _tautulli_get({
-        "cmd": "get_user_stats",
+    # FIX: Bruger get_home_stats med user_id — understøtter personlige toplister.
+    # get_user_stats understøtter ikke query_days/days korrekt og giver 400.
+    top_movies_raw = await _tautulli_get({
+        "cmd": "get_home_stats",
         "user_id": user_id,
+        "time_range": query_days,
+        "stats_count": 5,
         "stat_id": "top_movies",
-        "days": query_days,
-        "count": 5,
     })
 
+    # Udtræk rows fra det første stat_block der matcher top_movies
+    top_movies_data = _extract_rows(top_movies_raw, "top_movies")
+
     # --- 3. Top 5 serier for denne bruger ---
-    # FIX: samme regel — `days` er det korrekte parameternavn
-    top_tv_data = await _tautulli_get({
-        "cmd": "get_user_stats",
+    top_tv_raw = await _tautulli_get({
+        "cmd": "get_home_stats",
         "user_id": user_id,
+        "time_range": query_days,
+        "stats_count": 5,
         "stat_id": "top_tv",
-        "days": query_days,
-        "count": 5,
     })
+
+    top_tv_data = _extract_rows(top_tv_raw, "top_tv")
 
     return {
         "watch_time_stats": watch_time_data,
         "top_movies": top_movies_data,
         "top_tv": top_tv_data,
     }
+
+
+def _extract_rows(data, stat_id: str) -> list | None:
+    """
+    Udtræk rows fra get_home_stats response.
+    Returnerer listen af rækker hvis fundet, ellers None.
+    """
+    if not data:
+        return None
+
+    # get_home_stats returnerer en liste af stat_blocks
+    if isinstance(data, list):
+        for block in data:
+            if stat_id in (block.get("stat_id") or ""):
+                return block.get("rows") or []
+        # Hvis kun ét block returneres (ved filtreret kald), brug det direkte
+        if len(data) > 0:
+            rows = data[0].get("rows")
+            if rows is not None:
+                return rows
+
+    # Hvis data er et enkelt dict
+    if isinstance(data, dict):
+        return data.get("rows") or []
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +182,7 @@ async def get_popular_on_plex(stats_count: int = 10, time_range: int = 365) -> d
     """
     Returns the most popular content on the Plex server globally.
     Strips users_watched, total_plays og total_duration før data sendes til AI.
-    NOTE: get_home_stats bruger time_range — korrekt for denne kommando.
+    NOTE: get_home_stats uden user_id giver server-wide trends.
     """
     data = await _tautulli_get({
         "cmd": "get_home_stats",
