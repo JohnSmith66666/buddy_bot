@@ -2,9 +2,11 @@
 ai_handler.py - Agentic loop for Buddy.
 
 CHANGES vs previous version:
-  - Fjernet add_movie og add_series tool handlers.
-  - Claude returnerer nu SHOW_SEARCH_RESULTS:<query>:<media_type> når bestilling ønskes.
-  - main.py fanger dette signal og kalder confirmation_service.
+  - Prompt caching aktiveret: system prompt og tools caches hos Anthropic.
+    Reducerer input-tokens med ~90% for gentagne kald (kun charged for cache misses).
+  - _MAX_HISTORY reduceret fra 20 til 10.
+  - Tool-resultater trimmes til max 2000 chars før de sendes til Claude.
+    Forhindrer enorme Tautulli/Plex JSON-payloads i at spise tokens.
 """
 
 import json
@@ -49,7 +51,8 @@ logger = logging.getLogger(__name__)
 _client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 _histories: dict[int, list[dict]] = defaultdict(list)
-_MAX_HISTORY = 20
+_MAX_HISTORY = 10          # Reduceret fra 20
+_MAX_TOOL_RESULT_CHARS = 2000  # Max tegn per tool-result til Claude
 
 # Signal som Claude returnerer for at trigge bestillingsflow
 SEARCH_SIGNAL = "SHOW_SEARCH_RESULTS:"
@@ -59,6 +62,49 @@ def _trim(telegram_id: int) -> None:
     h = _histories[telegram_id]
     if len(h) > _MAX_HISTORY:
         _histories[telegram_id] = h[-_MAX_HISTORY:]
+
+
+def _slim_data(data, max_list_items: int = 10):
+    """
+    Rekursivt trim data-strukturen FØR JSON-serialisering.
+    Lister cappes til max_list_items — aldrig hård string-truncation.
+    Garanterer altid gyldig JSON output.
+    """
+    if isinstance(data, list):
+        trimmed = data[:max_list_items]
+        result = [_slim_data(item, max_list_items) for item in trimmed]
+        if len(data) > max_list_items:
+            result.append({"_truncated": f"{len(data) - max_list_items} flere elementer udeladt"})
+        return result
+    if isinstance(data, dict):
+        return {k: _slim_data(v, max_list_items) for k, v in data.items()}
+    # Trim lange strenge (fx oversigter)
+    if isinstance(data, str) and len(data) > 300:
+        return data[:297] + "..."
+    return data
+
+
+def _trim_tool_result(result: str) -> str:
+    """
+    Trim tool result til gyldig, kompakt JSON.
+    Bruger strukturel trimming (ikke hård string-truncation) så JSON altid er valid.
+    """
+    if len(result) <= _MAX_TOOL_RESULT_CHARS:
+        return result
+
+    logger.debug("Trimming tool result from %d chars", len(result))
+    try:
+        data = json.loads(result)
+        slimmed = _slim_data(data)
+        compact = json.dumps(slimmed, ensure_ascii=False, separators=(",", ":"))
+        if len(compact) <= _MAX_TOOL_RESULT_CHARS:
+            return compact
+        # Andet pas: aggressiv trimming til 5 items
+        slimmed2 = _slim_data(data, max_list_items=5)
+        return json.dumps(slimmed2, ensure_ascii=False, separators=(",", ":"))
+    except (json.JSONDecodeError, Exception) as e:
+        logger.warning("Could not parse tool result as JSON, returning as-is: %s", e)
+        return result
 
 
 async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None) -> str:
@@ -141,25 +187,63 @@ async def get_ai_response(
     """
     Run the full agentic loop and return Buddy's reply.
 
-    If Claude returns a SHOW_SEARCH_RESULTS signal, main.py intercepts
-    it and calls confirmation_service instead of sending it to the user.
+    Prompt caching:
+      - system prompt caches med cache_control: {"type": "ephemeral"}
+      - tools-listen caches ligeledes
+      Anthropic cacher disse i 5 minutter. Ved cache hit betales kun 10% af
+      normal input-pris. Cache miss koster 25% ekstra men betales kun én gang.
     """
     _histories[telegram_id].append({"role": "user", "content": user_message})
     _trim(telegram_id)
 
-    system = SYSTEM_PROMPT
+    system_text = SYSTEM_PROMPT
     if plex_username:
-        system += f"\n\nDen aktuelle bruger hedder '{plex_username}' på Plex."
+        system_text += f"\n\nDen aktuelle bruger hedder '{plex_username}' på Plex."
+
+    # ── Prompt caching: system prompt ────────────────────────────────────────
+    system_with_cache = [
+        {
+            "type": "text",
+            "text": system_text,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+    # ── Prompt caching: tools ────────────────────────────────────────────────
+    # Tilføj cache_control til det sidste tool i listen
+    tools_with_cache = [dict(t) for t in TOOLS]
+    if tools_with_cache:
+        tools_with_cache[-1] = {
+            **tools_with_cache[-1],
+            "cache_control": {"type": "ephemeral"},
+        }
 
     try:
         while True:
             response = await _client.messages.create(
                 model=ANTHROPIC_MODEL,
                 max_tokens=1024,
-                system=system,
-                tools=TOOLS,
+                system=system_with_cache,
+                tools=tools_with_cache,
                 messages=_histories[telegram_id],
+                betas=["prompt-caching-2024-07-31"],
             )
+
+            # Log cache-effektivitet
+            usage = response.usage
+            if hasattr(usage, "cache_read_input_tokens") and usage.cache_read_input_tokens:
+                logger.info(
+                    "Cache HIT: %d cached, %d uncached, %d output tokens",
+                    usage.cache_read_input_tokens,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                )
+            else:
+                logger.info(
+                    "Cache MISS: %d input, %d output tokens",
+                    usage.input_tokens,
+                    usage.output_tokens,
+                )
 
             if response.stop_reason == "tool_use":
                 _histories[telegram_id].append(
@@ -170,7 +254,8 @@ async def get_ai_response(
                     if block.type == "tool_use":
                         logger.info("Tool call: %s(%s)", block.name, block.input)
                         try:
-                            result = await _dispatch(block.name, block.input, plex_username)
+                            raw_result = await _dispatch(block.name, block.input, plex_username)
+                            result = _trim_tool_result(raw_result)
                         except Exception as e:
                             logger.error("Tool dispatch error '%s': %s", block.name, e)
                             result = json.dumps({"error": str(e)}, ensure_ascii=False)
