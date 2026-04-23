@@ -174,6 +174,8 @@ async def request_movie(tmdb_id: int, category: str = "standard") -> dict:
         "mediaType": "movie",
         "mediaId": tmdb_id,
         "rootFolder": root_folder,
+        "serverId": 0,
+        "profileId": 0,
         "is4k": False,
         "isDefault": False,
     })
@@ -197,6 +199,10 @@ async def request_tv(
         tmdb_id:        The TMDB ID of the series.
         season_numbers: Exact season numbers from TMDB's seasons list.
         category:       "tv_program" or "standard".
+
+    Rodmappe-logik:
+        tv_program → /mnt/unionfs/Media/TV/TV   (reality, talkshow, nyheder, dokumentar)
+        standard   → /mnt/unionfs/Media/TV/Serier (fiktion, drama, krimi)
     """
     status = await _get_seerr_status(tmdb_id, "tv")
 
@@ -214,7 +220,12 @@ async def request_tv(
             "message": "Serien er allerede tilgængelig via Seerr.",
         }
 
-    root_folder = _TV_ROOTS.get(category, ROOT_TV_STANDARD)
+    # Rodmappe bestemmes af category — tv_program går i /TV, alt andet i /Serier
+    if category == "tv_program":
+        root_folder = ROOT_TV_PROGRAMMER   # /mnt/unionfs/Media/TV/TV
+    else:
+        root_folder = ROOT_TV_STANDARD     # /mnt/unionfs/Media/TV/Serier
+
     seasons_payload = [int(s) for s in season_numbers]
 
     logger.info("Requesting TV tmdb_id=%s seasons=%s category=%s rootFolder=%s",
@@ -225,6 +236,8 @@ async def request_tv(
         "mediaId": tmdb_id,
         "seasons": seasons_payload,
         "rootFolder": root_folder,
+        "serverId": 0,
+        "profileId": 7,
         "is4k": False,
         "isDefault": False,
     })
