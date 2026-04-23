@@ -1,18 +1,14 @@
 """
 services/seerr_service.py - Overseerr/Jellyseerr API integration.
 
-Handles media requests routed to the correct Radarr/Sonarr root folder
-based on content category (animation, dansk, standard, tv_program).
+CHANGES vs previous version:
+  - _get_seerr_status() now uses GET /api/v1/media?tmdbId=X instead of
+    the incorrect externalId/externalIdType parameters that returned 400.
 
 Flow for every request:
   1. GET /api/v1/media?tmdbId=X  → check current Seerr status
   2. If already requested/processing → return early with clear status
   3. Otherwise → POST /api/v1/request
-
-Per the Seerr API spec:
-- Movies: seasons key can be omitted
-- TV Shows: seasons MUST be an array of integers (actual season numbers)
-Both 201 Created and 202 Accepted are treated as success.
 """
 
 import logging
@@ -51,8 +47,8 @@ _TV_ROOTS: dict[str, str] = {
 
 # Seerr mediaStatus codes
 # 1 = Unknown, 2 = Pending, 3 = Processing, 4 = Partially Available, 5 = Available
-_STATUS_QUEUED     = {2, 3}   # Requested / downloading
-_STATUS_AVAILABLE  = {4, 5}   # Already on Plex (partially or fully)
+_STATUS_QUEUED    = {2, 3}
+_STATUS_AVAILABLE = {4, 5}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -65,22 +61,22 @@ async def _get_seerr_status(tmdb_id: int, media_type: str) -> dict:
     """
     Check the current status of a title in Seerr.
 
+    FIX: Uses GET /api/v1/media?tmdbId=X which is the correct endpoint.
+    The previous version used externalId/externalIdType which returned 400.
+
     Returns a dict with:
       seerr_status  → "queued" | "available" | "not_found" | "error"
       media_status  → raw Seerr mediaStatus integer (if found)
     """
-    params = {
-        "externalId": tmdb_id,
-        "externalIdType": "tmdb",
-        "type": media_type,
-    }
-
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             resp = await client.get(
                 f"{_base_url()}/api/v1/media",
                 headers=_HEADERS,
-                params=params,
+                params={
+                    "tmdbId": tmdb_id,
+                    "mediaType": media_type,
+                },
             )
 
             if resp.status_code == 404:
@@ -89,7 +85,6 @@ async def _get_seerr_status(tmdb_id: int, media_type: str) -> dict:
             resp.raise_for_status()
             data = resp.json()
 
-            # The endpoint returns a paginated list — grab the first result.
             results = data.get("results", [])
             if not results:
                 return {"seerr_status": "not_found"}
@@ -169,7 +164,6 @@ async def request_movie(tmdb_id: int, category: str = "standard") -> dict:
         tmdb_id:  The TMDB ID of the film.
         category: "animation", "dansk", or "standard".
     """
-    # Step 1: Check current Seerr status.
     status = await _get_seerr_status(tmdb_id, "movie")
 
     if status["seerr_status"] == "queued":
@@ -186,7 +180,6 @@ async def request_movie(tmdb_id: int, category: str = "standard") -> dict:
             "message": "Filmen er allerede tilgængelig via Seerr.",
         }
 
-    # Step 2: Not in queue — send the request.
     root_folder = _MOVIE_ROOTS.get(category, ROOT_MOVIE_STANDARD)
 
     logger.info("Requesting movie tmdb_id=%s category=%s rootFolder=%s",
@@ -220,7 +213,6 @@ async def request_tv(
         season_numbers: Exact season numbers from TMDB's seasons list.
         category:       "tv_program" or "standard".
     """
-    # Step 1: Check current Seerr status.
     status = await _get_seerr_status(tmdb_id, "tv")
 
     if status["seerr_status"] == "queued":
@@ -237,7 +229,6 @@ async def request_tv(
             "message": "Serien er allerede tilgængelig via Seerr.",
         }
 
-    # Step 2: Not in queue — send the request.
     root_folder = _TV_ROOTS.get(category, ROOT_TV_STANDARD)
     seasons_payload = [int(s) for s in season_numbers]
 
@@ -266,10 +257,7 @@ async def request_tv(
 
 
 async def _get_seerr_user_id(plex_username: str) -> int | None:
-    """
-    Look up a Seerr user ID by matching their Plex username.
-    Returns None if not found.
-    """
+    """Look up a Seerr user ID by matching their Plex username."""
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             resp = await client.get(
@@ -284,26 +272,19 @@ async def _get_seerr_user_id(plex_username: str) -> int | None:
             return None
 
     norm = plex_username.strip().lower()
-
     for user in users:
         plex_name = (user.get("plexUsername") or "").lower()
         display   = (user.get("displayName") or "").lower()
         email     = (user.get("email") or "").lower()
         if norm in {plex_name, display, email}:
-            logger.debug("Seerr match: id=%s for plex_username=%r", user.get("id"), plex_username)
             return user.get("id")
 
     logger.warning("No Seerr user found for plex_username=%r", plex_username)
     return None
 
-async def get_all_requests(plex_username: str | None = None) -> dict:
-    """
-    Fetch media requests from Seerr.
 
-    If plex_username is provided, only returns requests made by that user.
-    Otherwise returns all requests (admin view).
-    """
-    # Resolve Seerr user ID if we have a Plex username
+async def get_all_requests(plex_username: str | None = None) -> dict:
+    """Fetch media requests from Seerr, optionally filtered by user."""
     seerr_user_id: int | None = None
     if plex_username:
         seerr_user_id = await _get_seerr_user_id(plex_username)
@@ -327,11 +308,10 @@ async def get_all_requests(plex_username: str | None = None) -> dict:
 
     requests_list = []
     for item in data.get("results", []):
-        media     = item.get("media", {}) or {}
-        req_type  = item.get("type", "unknown")
-        status    = media.get("status", 1)
+        media    = item.get("media", {}) or {}
+        req_type = item.get("type", "unknown")
+        status   = media.get("status", 1)
 
-        # Map numeric status to human-friendly label
         status_label = {
             1: "afventer",
             2: "bestilt",
@@ -347,11 +327,11 @@ async def get_all_requests(plex_username: str | None = None) -> dict:
         )
 
         requests_list.append({
-            "title":      title,
-            "type":       req_type,
-            "status":     status_label,
-            "requested":  item.get("createdAt", "")[:10],
-            "tmdb_id":    media.get("tmdbId"),
+            "title":     title,
+            "type":      req_type,
+            "status":    status_label,
+            "requested": item.get("createdAt", "")[:10],
+            "tmdb_id":   media.get("tmdbId"),
         })
 
     return {
@@ -362,11 +342,7 @@ async def get_all_requests(plex_username: str | None = None) -> dict:
 
 
 async def get_request_status(title: str, plex_username: str | None = None) -> dict:
-    """
-    Look up the Seerr status for a specific title by name.
-
-    Searches all requests and returns the best match.
-    """
+    """Look up the Seerr status for a specific title by name."""
     result = await get_all_requests(plex_username=plex_username)
     if not result.get("success"):
         return result
