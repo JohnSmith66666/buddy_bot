@@ -255,13 +255,24 @@ async def get_recently_added(count: int = 10) -> dict | None:
         except Exception:
             pass
 
+        # FIX: Udtræk det rigtige TMDB ID fra guids-listen.
+        # Plex's rating_key er IKKE et TMDB ID — brug aldrig rating_key til TMDB-opslag.
+        tmdb_id = None
+        for guid in item.get("guids", []):
+            if isinstance(guid, str) and guid.startswith("tmdb://"):
+                try:
+                    tmdb_id = int(guid.replace("tmdb://", ""))
+                except ValueError:
+                    pass
+                break
+
         base = {
             "title":             item.get("title") or item.get("full_title") or "Ukendt",
             "year":              item.get("year"),
             "added_at":          added_at_iso,
             "added_at_readable": added_at_readable,
             "days_ago":          days_ago,
-            "rating_key":        item.get("rating_key"),
+            "tmdb_id":           tmdb_id,   # Korrekt TMDB ID — brug dette til get_media_details
             "media_type":        media_type,
         }
 
