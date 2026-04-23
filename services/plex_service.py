@@ -5,6 +5,14 @@ Dynamically scans all library sections on the server — no hardcoded names.
 Uses fuzzy title matching to handle variations like 'Olsen-banden' vs 'Olsen Banden'.
 PlexAPI calls are synchronous so we run them in a thread pool to avoid
 blocking the async event loop.
+
+TOKEN OPTIMISATION (data-diæt):
+  - All list results are capped at 25 items maximum.
+  - Every Plex item is serialised through _slim() before being returned to
+    the AI. _slim() keeps only: title, year, rating, genres (max 3), summary.
+  - File paths, codecs, bitrates and other heavy metadata are stripped from
+    all list responses. Technical specs are only returned by get_plex_metadata(),
+    which is called explicitly when the user asks for them.
 """
 
 import asyncio
@@ -28,11 +36,37 @@ STATUS_FOUND   = "found"
 STATUS_MISSING = "missing"
 STATUS_ERROR   = "error"
 
-_MOVIE_TYPE = "movie"
-_TV_TYPE    = "show"
+_MOVIE_TYPE  = "movie"
+_TV_TYPE     = "show"
+_MAX_RESULTS = 25      # Hard cap on all list responses sent to the AI.
 
-_TMDB_BASE  = "https://api.themoviedb.org/3"
-_TMDB_LANG  = "da-DK"
+_TMDB_BASE = "https://api.themoviedb.org/3"
+_TMDB_LANG = "da-DK"
+
+
+# ── Lightweight item serialiser ───────────────────────────────────────────────
+
+def _slim(item) -> dict:
+    """
+    Convert a PlexAPI media object to a minimal dict for the AI.
+
+    Keeps ONLY: title, year, rating, genres (max 3), summary.
+    Everything else — file paths, codecs, artwork URLs, GUIDs — is dropped.
+    This is the single choke-point for token reduction in Plex responses.
+    """
+    genres = [g.tag for g in getattr(item, "genres", [])][:3]
+    summary = (getattr(item, "summary", "") or "").strip()
+    # Truncate long summaries — the AI doesn't need the full synopsis.
+    if len(summary) > 200:
+        summary = summary[:197] + "…"
+
+    return {
+        "title":   getattr(item, "title", "Ukendt"),
+        "year":    getattr(item, "year", None),
+        "rating":  getattr(item, "audienceRating", None),
+        "genres":  genres,
+        "summary": summary or None,
+    }
 
 
 # ── Title normalisation ───────────────────────────────────────────────────────
@@ -97,7 +131,6 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
             return admin_plex
 
         # ── 2. Shared friend (has own Plex account) ───────────────────────────
-        # account.users() returns friends/shared users with their own accounts.
         for user in account.users():
             user_names = {
                 (getattr(user, "username", "") or "").lower(),
@@ -106,7 +139,6 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
             }
             if norm in user_names:
                 try:
-                    # get_token() returns a server-specific token for this user
                     user_token = account.user(user.username).get_token(
                         admin_plex.machineIdentifier
                     )
@@ -117,10 +149,8 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
                         "get_token() failed for shared user '%s': %s — trying switchHomeUser",
                         plex_username, e,
                     )
-                    # Fall through to managed user attempt below
 
         # ── 3. Managed home user (no own Plex account) ───────────────────────
-        # account.homeUsers() returns managed users under Plex Home.
         try:
             home_users = account.homeUsers()
         except Exception:
@@ -174,12 +204,13 @@ def _safe_search(section, title: str) -> list:
         return []
 
 
-# ── Media info helpers ────────────────────────────────────────────────────────
+# ── Technical specs helper (only used by get_plex_metadata) ──────────────────
 
 def _stream_info(media_item) -> dict:
     """
     Extract technical specs from a Plex media item.
     NEVER returns raw file paths or directory names.
+    Only called by _metadata_sync — never included in list responses.
     """
     info = {
         "resolution": None,
@@ -197,10 +228,13 @@ def _stream_info(media_item) -> dict:
         if not media:
             return info
 
-        info["resolution"]    = getattr(media, "videoResolution", None)
-        info["bitrate_kbps"]  = getattr(media, "bitrate", None)
-        info["container"]     = getattr(media, "container", None)
-        info["duration_minutes"] = round(getattr(media_item, "duration", 0) / 60000) if getattr(media_item, "duration", None) else None
+        info["resolution"]       = getattr(media, "videoResolution", None)
+        info["bitrate_kbps"]     = getattr(media, "bitrate", None)
+        info["container"]        = getattr(media, "container", None)
+        info["duration_minutes"] = (
+            round(getattr(media_item, "duration", 0) / 60000)
+            if getattr(media_item, "duration", None) else None
+        )
 
         part = media.parts[0] if media.parts else None
         if part:
@@ -210,7 +244,11 @@ def _stream_info(media_item) -> dict:
                     info["video_codec"] = getattr(stream, "codec", None)
                     color_trc = getattr(stream, "colorTrc", "") or ""
                     dv = getattr(stream, "DOVIPresent", False)
-                    info["hdr"] = bool(dv or "smpte2084" in color_trc.lower() or "arib-std-b67" in color_trc.lower())
+                    info["hdr"] = bool(
+                        dv
+                        or "smpte2084" in color_trc.lower()
+                        or "arib-std-b67" in color_trc.lower()
+                    )
                 elif stype == 2 and not info["audio_codec"]:  # first audio track
                     info["audio_codec"]    = getattr(stream, "codec", None)
                     info["audio_channels"] = getattr(stream, "channels", None)
@@ -224,7 +262,12 @@ def _stream_info(media_item) -> dict:
 # PUBLIC ASYNC FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def check_library(title: str, year: int | None, media_type: str, plex_username: str | None = None) -> dict:
+async def check_library(
+    title: str,
+    year: int | None,
+    media_type: str,
+    plex_username: str | None = None,
+) -> dict:
     """Check whether a specific title exists in Plex."""
     try:
         return await asyncio.to_thread(
@@ -235,8 +278,12 @@ async def check_library(title: str, year: int | None, media_type: str, plex_user
         return {"status": STATUS_ERROR, "message": str(e)}
 
 
-async def get_collection(keyword: str, media_type: str, plex_username: str | None = None) -> dict:
-    """Search Plex for ALL titles matching a keyword."""
+async def get_collection(
+    keyword: str,
+    media_type: str,
+    plex_username: str | None = None,
+) -> dict:
+    """Search Plex for all titles matching a keyword. Capped at 25 results."""
     try:
         return await asyncio.to_thread(
             partial(_collection_sync, keyword=keyword, media_type=media_type, plex_username=plex_username)
@@ -255,7 +302,11 @@ async def get_on_deck(plex_username: str | None = None) -> dict:
         return {"status": STATUS_ERROR, "message": str(e)}
 
 
-async def get_plex_metadata(title: str, year: int | None, plex_username: str | None = None) -> dict:
+async def get_plex_metadata(
+    title: str,
+    year: int | None,
+    plex_username: str | None = None,
+) -> dict:
     """Return technical specs for a title — never raw file paths."""
     try:
         return await asyncio.to_thread(
@@ -266,7 +317,11 @@ async def get_plex_metadata(title: str, year: int | None, plex_username: str | N
         return {"status": STATUS_ERROR, "message": str(e)}
 
 
-async def find_unwatched(media_type: str, genre: str | None = None, plex_username: str | None = None) -> dict:
+async def find_unwatched(
+    media_type: str,
+    genre: str | None = None,
+    plex_username: str | None = None,
+) -> dict:
     """Return up to 6 random unwatched titles, optionally filtered by genre."""
     try:
         return await asyncio.to_thread(
@@ -277,7 +332,10 @@ async def find_unwatched(media_type: str, genre: str | None = None, plex_usernam
         return {"status": STATUS_ERROR, "message": str(e)}
 
 
-async def get_similar_in_library(title: str, plex_username: str | None = None) -> dict:
+async def get_similar_in_library(
+    title: str,
+    plex_username: str | None = None,
+) -> dict:
     """Find titles in the Plex library similar to the given title."""
     try:
         return await asyncio.to_thread(
@@ -288,7 +346,10 @@ async def get_similar_in_library(title: str, plex_username: str | None = None) -
         return {"status": STATUS_ERROR, "message": str(e)}
 
 
-async def get_missing_from_collection(collection_name: str, plex_username: str | None = None) -> dict:
+async def get_missing_from_collection(
+    collection_name: str,
+    plex_username: str | None = None,
+) -> dict:
     """
     Compare a Plex collection against TMDB to find missing titles.
     Uses TMDB search to find the collection, then checks each title against Plex.
@@ -306,7 +367,13 @@ async def get_missing_from_collection(collection_name: str, plex_username: str |
 # SYNC IMPLEMENTATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _check_sync(title: str, year: int | None, media_type: str, plex_username: str | None = None) -> dict:
+def _check_sync(
+    title: str,
+    year: int | None,
+    media_type: str,
+    plex_username: str | None = None,
+) -> dict:
+    """check_library — returns minimal match info, no heavy metadata."""
     plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
     plex = _connect(plex_username)
     if isinstance(plex, dict):
@@ -321,12 +388,18 @@ def _check_sync(title: str, year: int | None, media_type: str, plex_username: st
             if year and item_year and abs(item_year - year) > 1:
                 continue
             logger.info("Plex HIT: '%s' (%s) in '%s'", item_title, item_year, section.title)
-            return {"status": STATUS_FOUND, "title": item_title, "year": item_year, "library": section.title}
+            # Return only what the AI needs to confirm the title exists.
+            return {"status": STATUS_FOUND, "title": item_title, "year": item_year}
 
     return {"status": STATUS_MISSING}
 
 
-def _collection_sync(keyword: str, media_type: str, plex_username: str | None = None) -> dict:
+def _collection_sync(
+    keyword: str,
+    media_type: str,
+    plex_username: str | None = None,
+) -> dict:
+    """get_collection — returns slim items, capped at _MAX_RESULTS."""
     plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
     plex = _connect(plex_username)
     if isinstance(plex, dict):
@@ -339,18 +412,15 @@ def _collection_sync(keyword: str, media_type: str, plex_username: str | None = 
         for item in _safe_search(section, keyword):
             item_title = getattr(item, "title", "") or ""
             if norm_keyword.split()[0] in _normalise(item_title):
-                matches.append({
-                    "title": item_title,
-                    "year": getattr(item, "year", None),
-                    "library": section.title,
-                })
+                matches.append(_slim(item))
 
     matches.sort(key=lambda x: x.get("year") or 0)
-    return {"status": "ok", "found": matches, "count": len(matches)}
+    capped = matches[:_MAX_RESULTS]
+    return {"status": "ok", "found": capped, "count": len(capped)}
 
 
 def _on_deck_sync(plex_username: str | None = None) -> dict:
-    """Fetch Continue Watching items from Plex."""
+    """get_on_deck — slim items only, episodes get show/season/episode fields."""
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
@@ -363,28 +433,31 @@ def _on_deck_sync(plex_username: str | None = None) -> dict:
 
     items = []
     for item in on_deck:
-        entry = {
-            "title": getattr(item, "title", "Ukendt"),
-            "type": getattr(item, "type", "unknown"),
-            "year": getattr(item, "year", None),
-        }
+        entry = _slim(item)
+        entry["type"] = getattr(item, "type", "unknown")
         if item.type == "episode":
-            entry["show"] = getattr(item, "grandparentTitle", None)
-            entry["season"] = getattr(item, "parentIndex", None)
-            entry["episode"] = getattr(item, "index", None)
+            entry["show"]          = getattr(item, "grandparentTitle", None)
+            entry["season"]        = getattr(item, "parentIndex", None)
+            entry["episode"]       = getattr(item, "index", None)
             entry["episode_title"] = getattr(item, "title", None)
         items.append(entry)
 
     return {"status": "ok", "on_deck": items, "count": len(items)}
 
 
-def _metadata_sync(title: str, year: int | None, plex_username: str | None = None) -> dict:
-    """Return technical specs — never file paths."""
+def _metadata_sync(
+    title: str,
+    year: int | None,
+    plex_username: str | None = None,
+) -> dict:
+    """
+    get_plex_metadata — the ONE function that returns technical specs.
+    Never called as part of list responses.
+    """
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
-    # Search both movie and TV sections
     for plex_type in (_MOVIE_TYPE, _TV_TYPE):
         for section in _sections(plex, plex_type):
             for item in _safe_search(section, title):
@@ -394,21 +467,23 @@ def _metadata_sync(title: str, year: int | None, plex_username: str | None = Non
                     continue
                 if year and item_year and abs(item_year - year) > 1:
                     continue
-
-                specs = _stream_info(item)
                 return {
                     "status": STATUS_FOUND,
-                    "title": item_title,
-                    "year": item_year,
-                    "type": plex_type,
-                    "specs": specs,
+                    "title":  item_title,
+                    "year":   item_year,
+                    "type":   plex_type,
+                    "specs":  _stream_info(item),
                 }
 
     return {"status": STATUS_MISSING, "message": f"'{title}' ikke fundet i Plex."}
 
 
-def _unwatched_sync(media_type: str, genre: str | None, plex_username: str | None = None) -> dict:
-    """Return up to 6 random unwatched titles."""
+def _unwatched_sync(
+    media_type: str,
+    genre: str | None,
+    plex_username: str | None = None,
+) -> dict:
+    """find_unwatched — slim items, capped at 6 random picks."""
     plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
     plex = _connect(plex_username)
     if isinstance(plex, dict):
@@ -419,8 +494,7 @@ def _unwatched_sync(media_type: str, genre: str | None, plex_username: str | Non
 
     for section in _sections(plex, plex_type):
         try:
-            filters = {"unwatched": True}
-            results = section.search(**filters)
+            results = section.search(unwatched=True)
         except Exception:
             try:
                 results = section.search()
@@ -429,45 +503,33 @@ def _unwatched_sync(media_type: str, genre: str | None, plex_username: str | Non
                 continue
 
         for item in results:
-            # Filter by watched status manually if filter didn't work
             if getattr(item, "viewCount", 0) > 0:
                 continue
-
-            # Genre filter
             if norm_genre:
                 item_genres = [_normalise(g.tag) for g in getattr(item, "genres", [])]
                 if not any(norm_genre in g for g in item_genres):
                     continue
-
-            unwatched.append({
-                "title": getattr(item, "title", "Ukendt"),
-                "year": getattr(item, "year", None),
-                "rating": getattr(item, "audienceRating", None),
-                "library": section.title,
-            })
+            unwatched.append(_slim(item))
 
     random.shuffle(unwatched)
-    return {
-        "status": "ok",
-        "suggestions": unwatched[:6],
-        "total_unwatched": len(unwatched),
-    }
+    suggestions = unwatched[:6]
+    return {"status": "ok", "suggestions": suggestions, "total_unwatched": len(unwatched)}
 
 
 def _similar_sync(title: str, plex_username: str | None = None) -> dict:
-    """Find titles in Plex similar to the given title."""
+    """get_similar_in_library — slim items, capped at _MAX_RESULTS."""
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
-    # First find the source item
-    source_item = None
+    source_item    = None
     source_section = None
+
     for plex_type in (_MOVIE_TYPE, _TV_TYPE):
         for section in _sections(plex, plex_type):
             for item in _safe_search(section, title):
                 if _titles_match(getattr(item, "title", ""), title):
-                    source_item = item
+                    source_item    = item
                     source_section = section
                     break
             if source_item:
@@ -480,45 +542,37 @@ def _similar_sync(title: str, plex_username: str | None = None) -> dict:
 
     similar = []
     try:
-        # Use Plex's built-in similar items
         related = source_item.related()
         for hub in related:
             for item in getattr(hub, "items", [])[:10]:
-                item_title = getattr(item, "title", "") or ""
-                if _normalise(item_title) == _normalise(title):
+                if _normalise(getattr(item, "title", "")) == _normalise(title):
                     continue
-                similar.append({
-                    "title": item_title,
-                    "year": getattr(item, "year", None),
-                    "rating": getattr(item, "audienceRating", None),
-                })
+                similar.append(_slim(item))
         if similar:
-            return {"status": "ok", "source": getattr(source_item, "title", title), "similar": similar[:8]}
+            return {
+                "status": "ok",
+                "source": getattr(source_item, "title", title),
+                "similar": similar[:_MAX_RESULTS],
+            }
     except Exception as e:
         logger.warning("Plex related() failed, falling back to genre match: %s", e)
 
-    # Fallback: find items with overlapping genres in the same section
+    # Fallback: genre overlap within the same section.
     source_genres = {_normalise(g.tag) for g in getattr(source_item, "genres", [])}
     if not source_genres:
         return {"status": "ok", "source": getattr(source_item, "title", title), "similar": []}
 
     candidates = []
     try:
-        all_items = source_section.search()
-        for item in all_items:
-            item_title = getattr(item, "title", "") or ""
-            if _normalise(item_title) == _normalise(title):
+        for item in source_section.search():
+            if _normalise(getattr(item, "title", "")) == _normalise(title):
                 continue
             item_genres = {_normalise(g.tag) for g in getattr(item, "genres", [])}
             overlap = len(source_genres & item_genres)
             if overlap > 0:
-                candidates.append((overlap, {
-                    "title": item_title,
-                    "year": getattr(item, "year", None),
-                    "rating": getattr(item, "audienceRating", None),
-                }))
+                candidates.append((overlap, _slim(item)))
         candidates.sort(key=lambda x: x[0], reverse=True)
-        similar = [c[1] for c in candidates[:8]]
+        similar = [c[1] for c in candidates[:_MAX_RESULTS]]
     except Exception as e:
         logger.warning("Genre fallback error: %s", e)
 
@@ -527,12 +581,11 @@ def _similar_sync(title: str, plex_username: str | None = None) -> dict:
 
 def _missing_sync(collection_name: str, plex_username: str | None = None) -> dict:
     """
-    Find TMDB titles for a search query, then check which are missing from Plex.
-    Uses TMDB search + Plex lookup to identify gaps.
+    get_missing_from_collection — find gaps between TMDB and Plex.
+    Returns only title/year/tmdb_id — no heavy metadata.
     """
     import httpx as _httpx
 
-    # Search TMDB for movies matching the collection name
     try:
         resp = _httpx.get(
             f"{_TMDB_BASE}/search/movie",
@@ -548,7 +601,6 @@ def _missing_sync(collection_name: str, plex_username: str | None = None) -> dic
     if not tmdb_results:
         return {"status": "ok", "found_in_plex": [], "missing_from_plex": [], "total": 0}
 
-    # Filter results to those whose title contains the collection keyword
     norm_kw = _normalise(collection_name).split()[0]
     relevant = [
         r for r in tmdb_results
@@ -557,19 +609,17 @@ def _missing_sync(collection_name: str, plex_username: str | None = None) -> dic
     if not relevant:
         relevant = tmdb_results[:15]
 
-    # Connect Plex once
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
-    found_in_plex   = []
+    found_in_plex     = []
     missing_from_plex = []
 
     for movie in relevant:
         tmdb_title = movie.get("title") or movie.get("original_title") or ""
         tmdb_year  = int((movie.get("release_date") or "0")[:4] or 0) or None
 
-        # Check all movie sections
         in_plex = False
         for section in _sections(plex, _MOVIE_TYPE):
             for item in _safe_search(section, tmdb_title):
@@ -584,6 +634,7 @@ def _missing_sync(collection_name: str, plex_username: str | None = None) -> dic
             if in_plex:
                 break
 
+        # Only title/year/tmdb_id — the AI doesn't need anything else.
         entry = {"title": tmdb_title, "year": tmdb_year, "tmdb_id": movie.get("id")}
         if in_plex:
             found_in_plex.append(entry)
@@ -593,47 +644,33 @@ def _missing_sync(collection_name: str, plex_username: str | None = None) -> dic
     return {
         "status": "ok",
         "collection": collection_name,
-        "found_in_plex": found_in_plex,
-        "missing_from_plex": missing_from_plex,
+        "found_in_plex":     found_in_plex[:_MAX_RESULTS],
+        "missing_from_plex": missing_from_plex[:_MAX_RESULTS],
         "total_checked": len(relevant),
     }
+
 
 # ── Plex user validation ──────────────────────────────────────────────────────
 
 async def validate_plex_user(plex_username: str) -> dict:
     """
     Check whether a Plex username exists as a shared user on this server.
-
     Works for both the server owner and managed/shared users.
-
-    Returns:
-        dict with:
-          valid    → True if found
-          username → matched display name
-          is_owner → True if this is the server owner account
     """
     try:
-        result = await asyncio.to_thread(
+        return await asyncio.to_thread(
             partial(_validate_user_sync, plex_username=plex_username)
         )
-        return result
     except Exception as e:
         logger.error("validate_plex_user error: %s", e)
         return {"valid": False, "message": str(e)}
 
 
 def _validate_user_sync(plex_username: str) -> dict:
-    """
-    Synchronous Plex user validation — runs in thread pool.
-
-    Checks in order:
-      1. Server owner
-      2. Shared friends (own Plex account)
-      3. Managed home users (no own account)
-    """
+    """Synchronous Plex user validation — runs in thread pool."""
     try:
         admin_plex = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=15)
-        account = admin_plex.myPlexAccount()
+        account    = admin_plex.myPlexAccount()
     except Exception as e:
         return {"valid": False, "message": f"Forbindelsesfejl: {e}"}
 
@@ -647,10 +684,9 @@ def _validate_user_sync(plex_username: str) -> dict:
     }
     if norm in owner_names:
         display = account.title or account.username or plex_username
-        logger.info("Validated as owner: %s", display)
         return {"valid": True, "username": display, "user_type": "owner"}
 
-    # 2. Shared friends (own Plex account)
+    # 2. Shared friends
     try:
         for user in account.users():
             user_names = {
@@ -659,18 +695,16 @@ def _validate_user_sync(plex_username: str) -> dict:
                 (getattr(user, "title", "") or "").lower(),
             }
             if norm in user_names:
-                # Use actual Plex username (matches Seerr plexUsername field)
-                actual_username = (
+                actual = (
                     getattr(user, "username", None)
                     or getattr(user, "title", None)
                     or plex_username
                 )
-                logger.info("Validated as shared friend: %s", actual_username)
-                return {"valid": True, "username": actual_username, "user_type": "friend"}
+                return {"valid": True, "username": actual, "user_type": "friend"}
     except Exception as e:
         logger.warning("Could not check shared users: %s", e)
 
-    # 3. Managed home users (no own Plex account)
+    # 3. Managed home users
     try:
         for user in account.homeUsers():
             user_names = {
@@ -679,14 +713,12 @@ def _validate_user_sync(plex_username: str) -> dict:
                 (getattr(user, "title", "") or "").lower(),
             }
             if norm in user_names:
-                # Use actual Plex username (matches Seerr plexUsername field)
-                actual_username = (
+                actual = (
                     getattr(user, "username", None)
                     or getattr(user, "title", None)
                     or plex_username
                 )
-                logger.info("Validated as managed home user: %s", actual_username)
-                return {"valid": True, "username": actual_username, "user_type": "managed"}
+                return {"valid": True, "username": actual, "user_type": "managed"}
     except Exception as e:
         logger.warning("Could not check home users: %s", e)
 
@@ -695,14 +727,9 @@ def _validate_user_sync(plex_username: str) -> dict:
         "message": f"Brugernavnet '{plex_username}' blev ikke fundet — hverken som ven eller hjembruger.",
     }
 
-async def get_plex_for_user(plex_username: str):
-    """
-    Return a PlexServer instance scoped to a specific user.
 
-    For the server owner, returns the normal server connection.
-    For shared users, switches to their account context so library
-    access and watch history reflects their permissions.
-    """
+async def get_plex_for_user(plex_username: str):
+    """Return a PlexServer instance scoped to a specific user."""
     try:
         return await asyncio.to_thread(
             partial(_get_user_server_sync, plex_username=plex_username)
@@ -719,10 +746,9 @@ def _get_user_server_sync(plex_username: str):
         return None
 
     try:
-        account = plex.myPlexAccount()
+        account    = plex.myPlexAccount()
         norm_input = plex_username.strip().lower()
 
-        # Owner gets the standard server connection
         owner_names = {
             (account.username or "").lower(),
             (account.email or "").lower(),
@@ -731,7 +757,6 @@ def _get_user_server_sync(plex_username: str):
         if norm_input in owner_names:
             return plex
 
-        # Shared users get a switched connection
         for user in account.users():
             user_names = {
                 (getattr(user, "username", "") or "").lower(),
