@@ -1,304 +1,210 @@
 """
-services/tautulli_service.py - Tautulli API integration.
+services/tautulli_service.py
 
-Provides three public functions:
-  - get_popular_on_plex()      → top 10 film + top 10 serier målt på unikke brugere
-  - get_user_watch_stats()     → personlig statistik for en specifik Plex-bruger
-  - get_user_history()         → afspilningshistorik for en specifik Plex-bruger
+Handles all communication with the Tautulli API.
 
-Alle requests er async via httpx.
-Brugernavn → Tautulli user_id opslag sker automatisk inden bruger-specifikke kald.
-
-TOKEN-DIÆT:
-  Kun de felter AI'en har brug for returneres.
-  Kunstnere, thumbnails, filstier og andre tunge felter strippes.
+Key rules (from TAUTULLI_API_RULES.md):
+- Use `query_days` for time filtering on get_user_stats and get_user_watch_time_stats.
+- Use `time_range` ONLY for get_home_stats (the one exception).
+- Never use `time_range` for get_user_stats → causes 400 Bad Request.
+- Personal stats are fully accessible; server-wide aggregates must be stripped before sending to AI.
 """
 
-import asyncio
 import logging
-
 import httpx
-
-from config import TAUTULLI_API_KEY, TAUTULLI_URL
+from config import config
 
 logger = logging.getLogger(__name__)
 
-_MAX_ITEMS = 10   # Hård grænse på alle lister sendt til AI'en.
+TAUTULLI_BASE = config.TAUTULLI_URL.rstrip("/")
+API_KEY = config.TAUTULLI_API_KEY
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
-
-def _base() -> str:
-    return TAUTULLI_URL.rstrip("/") + "/api/v2"
-
-
-def _params(cmd: str, **kwargs) -> dict:
-    """Build a Tautulli API parameter dict."""
-    return {"apikey": TAUTULLI_API_KEY, "cmd": cmd, **kwargs}
-
-
-async def _get(cmd: str, **kwargs) -> dict | None:
+async def _tautulli_get(params: dict) -> dict | None:
     """
-    Execute a GET request against the Tautulli API.
-    Returns the parsed 'data' payload or None on error.
+    Internal helper: performs a GET request to the Tautulli API.
+    Always injects the API key. Returns the 'data' payload or None on error.
     """
-    async with httpx.AsyncClient(timeout=10) as client:
+    params["apikey"] = API_KEY
+    params["output_format"] = "json"
+
+    async with httpx.AsyncClient(timeout=15) as client:
         try:
-            resp = await client.get(_base(), params=_params(cmd, **kwargs))
-            resp.raise_for_status()
-            body = resp.json()
+            response = await client.get(f"{TAUTULLI_BASE}/api/v2", params=params)
+            response.raise_for_status()
+            body = response.json()
 
-            if body.get("response", {}).get("result") != "success":
-                logger.error("Tautulli API error for cmd=%s: %s", cmd, body)
+            # Tautulli wraps everything in {"response": {"result": "success", "data": ...}}
+            result = body.get("response", {})
+            if result.get("result") != "success":
+                logger.error("Tautulli returned non-success: %s", result)
                 return None
 
-            return body["response"]["data"]
+            return result.get("data")
 
-        except httpx.HTTPError as e:
-            logger.error("Tautulli HTTP error (cmd=%s): %s", cmd, e)
+        except httpx.HTTPStatusError as e:
+            logger.error("Tautulli HTTP error %s: %s", e.response.status_code, e)
+            return None
+        except Exception as e:
+            logger.error("Tautulli unexpected error: %s", e)
             return None
 
 
-async def _resolve_user_id(plex_username: str) -> int | None:
-    """
-    Look up the Tautulli user_id for a given Plex username.
+# ---------------------------------------------------------------------------
+# User resolution
+# ---------------------------------------------------------------------------
 
-    Matches against friendly_name, username and email (case-insensitive).
-    Returns None if the user is not found.
+async def get_tautulli_user_id(plex_username: str) -> int | None:
     """
-    data = await _get("get_users")
+    Resolves a Plex username to a Tautulli user_id.
+    Must be called before any personal-stats endpoints.
+    """
+    data = await _tautulli_get({"cmd": "get_users"})
     if not data:
         return None
 
-    norm = plex_username.strip().lower()
-
     for user in data:
-        candidates = {
-            (user.get("friendly_name") or "").lower(),
-            (user.get("username") or "").lower(),
-            (user.get("email") or "").lower(),
-        }
-        if norm in candidates:
-            uid = user.get("user_id")
-            logger.debug("Tautulli user_id=%s for plex_username=%r", uid, plex_username)
-            return uid
+        if user.get("username", "").lower() == plex_username.lower():
+            return user.get("user_id")
 
-    logger.warning("No Tautulli user found for plex_username=%r", plex_username)
+    logger.warning("Plex username '%s' not found in Tautulli user list.", plex_username)
     return None
 
 
-def _minutes_to_human(minutes: int) -> str:
-    """Convert a minute count to a readable Danish string."""
-    if minutes < 60:
-        return f"{minutes} min"
-    hours = minutes // 60
-    mins  = minutes % 60
-    if mins == 0:
-        return f"{hours} t"
-    return f"{hours} t {mins} min"
+# ---------------------------------------------------------------------------
+# Personal statistics
+# ---------------------------------------------------------------------------
 
-
-# ── Public functions ──────────────────────────────────────────────────────────
-
-async def get_popular_on_plex(days: int = 7) -> dict:
+async def get_user_watch_stats(plex_username: str, query_days: int = 30) -> dict | None:
     """
-    Hent de mest populære film og serier på Plex-serveren.
-
-    Popularitet måles på 'users_watched' (antal UNIKKE brugere) —
-    IKKE total_plays, så en person der binge-watcher ikke forvrænger listen.
+    Returns a combined personal statistics payload for a single user:
+      - watch_time_stats : total duration and play counts (from get_user_watch_time_stats)
+      - top_movies       : top 5 movies watched by this user (from get_user_stats)
+      - top_tv           : top 5 TV shows watched by this user (from get_user_stats)
 
     Args:
-        days: Antal dage der kigges tilbage (standard: 7).
+        plex_username : The user's Plex username stored in the bot database.
+        query_days    : Number of days to look back (default 30).
 
     Returns:
-        dict med 'top_10_movies' og 'top_10_tv' — aldrig blandet.
+        A dict with keys watch_time_stats, top_movies, top_tv — or None if user not found.
+
+    NOTE: Uses `query_days` (NOT `time_range`) for all calls except get_home_stats.
     """
-    data = await _get("get_home_stats", time_range=days, stats_count=30)
+    user_id = await get_tautulli_user_id(plex_username)
+    if user_id is None:
+        logger.error("Cannot fetch stats: user_id not resolved for '%s'.", plex_username)
+        return None
+
+    # --- 1. Watch time and play count totals ---
+    # Command: get_user_watch_time_stats → requires query_days + user_id
+    watch_time_data = await _tautulli_get({
+        "cmd": "get_user_watch_time_stats",
+        "user_id": user_id,
+        "query_days": query_days,
+    })
+
+    # --- 2. Top 5 movies for this user ---
+    # Command: get_user_stats → requires query_days (NOT time_range!) + stat_id + count
+    top_movies_data = await _tautulli_get({
+        "cmd": "get_user_stats",
+        "user_id": user_id,
+        "stat_id": "top_movies",
+        "query_days": query_days,
+        "count": 5,
+    })
+
+    # --- 3. Top 5 TV shows for this user ---
+    # Command: get_user_stats → same rules as above, different stat_id
+    top_tv_data = await _tautulli_get({
+        "cmd": "get_user_stats",
+        "user_id": user_id,
+        "stat_id": "top_tv",
+        "query_days": query_days,
+        "count": 5,
+    })
+
+    return {
+        "watch_time_stats": watch_time_data,
+        "top_movies": top_movies_data,
+        "top_tv": top_tv_data,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Server-wide / global trends
+# ---------------------------------------------------------------------------
+
+async def get_popular_on_plex(stats_count: int = 10, time_range: int = 30) -> dict | None:
+    """
+    Returns the most popular content on the Plex server globally.
+
+    Privacy rule: strips users_watched, total_plays, and total_duration
+    before returning, so Claude only receives ordered titles + years.
+
+    NOTE: get_home_stats is the ONE command that correctly uses `time_range`.
+    """
+    data = await _tautulli_get({
+        "cmd": "get_home_stats",
+        "time_range": time_range,   # <-- Correct for THIS command only
+        "stats_count": stats_count,
+    })
+
     if not data:
-        return {"error": "Kunne ikke hente statistik fra Tautulli."}
+        return None
 
-    top_movies: list[dict] = []
-    top_tv:     list[dict] = []
+    # Strip aggregate fields to protect other users' privacy
+    _STRIP_FIELDS = {"users_watched", "total_plays", "total_duration"}
 
+    def _clean_rows(rows: list) -> list:
+        cleaned = []
+        for row in rows:
+            cleaned.append({k: v for k, v in row.items() if k not in _STRIP_FIELDS})
+        return cleaned
+
+    cleaned_stats = []
     for stat_block in data:
-        stat_id = stat_block.get("stat_id", "")
-        rows    = stat_block.get("rows", [])
+        rows = stat_block.get("rows", [])
+        stat_block["rows"] = _clean_rows(rows)
+        cleaned_stats.append(stat_block)
 
-        # Tautulli returns multiple stat blocks — we only want 'popular_movies'
-        # and 'popular_tv'. Sort each by users_watched descending.
-        if stat_id == "popular_movies" and not top_movies:
-            sorted_rows = sorted(rows, key=lambda r: r.get("users_watched", 0), reverse=True)
-            for item in sorted_rows[:_MAX_ITEMS]:
-                # Kun titel og år — ingen tal af hensyn til privatlivet.
-                top_movies.append({
-                    "title": item.get("title") or item.get("grandparent_title") or "Ukendt",
-                    "year":  item.get("year"),
-                })
-
-        elif stat_id == "popular_tv" and not top_tv:
-            sorted_rows = sorted(rows, key=lambda r: r.get("users_watched", 0), reverse=True)
-            for item in sorted_rows[:_MAX_ITEMS]:
-                # Kun titel — serier har sjældent year på dette niveau.
-                top_tv.append({
-                    "title": item.get("grandparent_title") or item.get("title") or "Ukendt",
-                })
-
-    if not top_movies and not top_tv:
-        logger.warning(
-            "get_home_stats returned no popular_movies/popular_tv blocks. "
-            "Available stat_ids: %s",
-            [b.get("stat_id") for b in data],
-        )
-
-    return {
-        "period_days":   days,
-        "top_10_movies": top_movies,
-        "top_10_tv":     top_tv,
-    }
+    return cleaned_stats
 
 
-async def get_user_watch_stats(
-    plex_username: str,
-    days: int | None = None,
-) -> dict:
+# ---------------------------------------------------------------------------
+# Currently playing (live activity)
+# ---------------------------------------------------------------------------
+
+async def get_activity() -> dict | None:
     """
-    Hent personlig Plex-statistik for en specifik bruger.
+    Returns the current playback activity on the Plex server.
+    Useful for answering 'Is anyone watching something right now?'
+    """
+    return await _tautulli_get({"cmd": "get_activity"})
+
+
+# ---------------------------------------------------------------------------
+# Recent history for a user
+# ---------------------------------------------------------------------------
+
+async def get_user_history(plex_username: str, length: int = 10) -> list | None:
+    """
+    Returns the most recent watch history entries for a user.
 
     Args:
-        plex_username: Brugerens Plex-brugernavn.
-        days:          Antal dage der kigges tilbage.
-                       Udelad (None) for all-time statistik.
-
-    Returns:
-        dict med total spilletid, antal afspilninger og mest sete genre.
+        plex_username : Plex username.
+        length        : Number of history entries to return (default 10).
     """
-    user_id = await _resolve_user_id(plex_username)
+    user_id = await get_tautulli_user_id(plex_username)
     if user_id is None:
-        return {"error": f"Brugeren '{plex_username}' blev ikke fundet i Tautulli."}
+        return None
 
-    # ── Fetch all data in parallel — three API calls simultaneously ───────────
-    time_params: dict = {"user_id": user_id}
-    if days is not None:
-        time_params["query_days"] = days
+    data = await _tautulli_get({
+        "cmd": "get_history",
+        "user_id": user_id,
+        "length": length,
+    })
 
-    top_params: dict = {"user_id": user_id, "count": 5}
-    if days is not None:
-        top_params["time_range"] = days
-
-    time_data, movies_data, tv_data = await asyncio.gather(
-        _get("get_user_watch_time_stats", **time_params),
-        _get("get_user_stats", stat_id="top_movies", **top_params),
-        _get("get_user_stats", stat_id="top_tv",     **top_params),
-    )
-
-    if not time_data:
-        return {"error": "Kunne ikke hente brugerstatistik fra Tautulli."}
-
-    # ── Total time + plays ────────────────────────────────────────────────────
-    stats = time_data[0] if isinstance(time_data, list) and time_data else time_data
-
-    total_minutes = int(stats.get("total_time", 0)) // 60
-    total_plays   = int(stats.get("total_plays", 0))
-
-    result: dict = {
-        "plex_username": plex_username,
-        "period":        f"sidste {days} dage" if days else "all time",
-        "total_time":    _minutes_to_human(total_minutes),
-        "total_plays":   total_plays,
-    }
-
-    # ── Personal top movies ───────────────────────────────────────────────────
-    # get_user_stats returns a list of rows — each row has title + plays.
-    # We expose only titles (no play counts) to respect privacy consistency.
-    if movies_data and isinstance(movies_data, list):
-        result["top_movies"] = [
-            {
-                "title": row.get("title") or row.get("grandparent_title") or "Ukendt",
-                "year":  row.get("year"),
-            }
-            for row in movies_data[:5]
-            if row.get("title") or row.get("grandparent_title")
-        ]
-
-    # ── Personal top TV shows ─────────────────────────────────────────────────
-    if tv_data and isinstance(tv_data, list):
-        result["top_tv"] = [
-            {
-                "title": row.get("grandparent_title") or row.get("title") or "Ukendt",
-            }
-            for row in tv_data[:5]
-            if row.get("grandparent_title") or row.get("title")
-        ]
-
-    return result
-
-
-async def get_user_history(
-    plex_username: str,
-    query: str | None = None,
-) -> dict:
-    """
-    Søg i en brugers afspilningshistorik.
-
-    Args:
-        plex_username: Brugerens Plex-brugernavn.
-        query:         Valgfri titelsøgning. Udelad for de seneste afspilninger.
-
-    Returns:
-        dict med en liste af seneste afspilninger (maks 20).
-    """
-    user_id = await _resolve_user_id(plex_username)
-    if user_id is None:
-        return {"error": f"Brugeren '{plex_username}' blev ikke fundet i Tautulli."}
-
-    params: dict = {
-        "user_id":  user_id,
-        "length":   20,
-        "order_column": "date",
-        "order_dir":    "desc",
-    }
-    if query:
-        params["search"] = query
-
-    data = await _get("get_history", **params)
-    if not data:
-        return {"error": "Kunne ikke hente historik fra Tautulli."}
-
-    raw_items = data.get("data", []) if isinstance(data, dict) else []
-
-    items = []
-    for item in raw_items[:20]:
-        media_type = item.get("media_type", "unknown")
-
-        entry: dict = {
-            "date":       item.get("date", ""),          # Unix timestamp as string
-            "title":      _resolve_title(item),
-            "media_type": media_type,
-            "duration":   _minutes_to_human(int(item.get("duration", 0)) // 60),
-            "percent_complete": item.get("percent_complete", 0),
-        }
-
-        # For episodes, add show context.
-        if media_type == "episode":
-            entry["show"]    = item.get("grandparent_title")
-            entry["season"]  = item.get("parent_media_index")
-            entry["episode"] = item.get("media_index")
-
-        items.append(entry)
-
-    return {
-        "plex_username": plex_username,
-        "query":         query or None,
-        "count":         len(items),
-        "history":       items,
-    }
-
-
-# ── Private helpers ───────────────────────────────────────────────────────────
-
-def _resolve_title(item: dict) -> str:
-    """Pick the best human-readable title from a Tautulli history item."""
-    # For episodes the item title is the episode name — use grandparent instead.
-    if item.get("media_type") == "episode":
-        return item.get("grandparent_title") or item.get("title") or "Ukendt"
-    return item.get("title") or item.get("grandparent_title") or "Ukendt"
+    if data and isinstance(data, dict):
+        return data.get("data", [])
+    return data
