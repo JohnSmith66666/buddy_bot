@@ -69,6 +69,76 @@ def _slim(item) -> dict:
     }
 
 
+# ── Genre alias mapping ───────────────────────────────────────────────────────
+
+# Mapper brugerinput (dansk/engelsk/slang) til alle kendte Plex-genre-varianter.
+# Plex bruger typisk engelske genrenavne som "Science Fiction", "Sci-Fi" osv.
+# Når brugeren skriver "rummet", "sci-fi" eller "scifi" skal vi matche dem alle.
+_GENRE_ALIASES: dict[str, list[str]] = {
+    # Science Fiction
+    "science fiction": ["science fiction", "sci fi", "scifi", "sci-fi", "sf"],
+    "sci fi":          ["science fiction", "sci fi", "scifi", "sci-fi", "sf"],
+    "scifi":           ["science fiction", "sci fi", "scifi", "sci-fi", "sf"],
+    "rummet":          ["science fiction", "sci fi", "scifi", "space", "sf"],
+    "space":           ["science fiction", "sci fi", "scifi", "space", "sf"],
+    # Action
+    "action":          ["action", "actionfilm", "action adventure"],
+    # Komedie
+    "komedie":         ["comedy", "komedie", "com"],
+    "comedy":          ["comedy", "komedie"],
+    # Thriller
+    "thriller":        ["thriller", "suspense"],
+    "gyser":           ["horror", "gyser", "skrack"],
+    "horror":          ["horror", "gyser", "skrack"],
+    # Drama
+    "drama":           ["drama"],
+    # Romantik
+    "romantik":        ["romance", "romantic", "romantik"],
+    "romance":         ["romance", "romantic", "romantik"],
+    # Animation
+    "animation":       ["animation", "animated", "anime", "cartoon"],
+    "anime":           ["animation", "anime"],
+    # Dokumentar
+    "dokumentar":      ["documentary", "dokumentar"],
+    "documentary":     ["documentary", "dokumentar"],
+    # Krimi
+    "krimi":           ["crime", "krimi", "criminal", "kriminalitet"],
+    "crime":           ["crime", "krimi"],
+    # Eventyr
+    "eventyr":         ["adventure", "eventyr"],
+    "adventure":       ["adventure", "eventyr"],
+    # Familie
+    "familie":         ["family", "familie"],
+    "family":          ["family", "familie"],
+    # Fantasy
+    "fantasy":         ["fantasy"],
+    # Western
+    "western":         ["western"],
+    # Krig
+    "krig":            ["war", "krig"],
+    "war":             ["war", "krig"],
+    # Historie
+    "historie":        ["history", "historical", "historie"],
+    "historical":      ["history", "historical", "historie"],
+    # Musik
+    "musik":           ["music", "musical", "musik"],
+    "musical":         ["music", "musical", "musik"],
+    # Mystery
+    "mysterium":       ["mystery", "mysterium"],
+    "mystery":         ["mystery", "mysterium"],
+}
+
+
+def _resolve_genre_aliases(genre: str) -> list[str]:
+    """
+    Returnerer alle kendte Plex-genre-varianter for et bruger-input.
+    Fx 'rummet' → ['science fiction', 'sci fi', 'scifi', 'space', 'sf']
+    Hvis ingen alias findes, returneres det normaliserede input som-er.
+    """
+    norm = _normalise(genre)
+    return _GENRE_ALIASES.get(norm, [norm])
+
+
 # ── Title normalisation ───────────────────────────────────────────────────────
 
 def _normalise(title: str) -> str:
@@ -490,7 +560,9 @@ def _unwatched_sync(
         return plex
 
     unwatched = []
-    norm_genre = _normalise(genre) if genre else None
+    # FIX: Brug genre-alias system så "rummet", "sci-fi", "scifi" alle
+    # matcher Plex's "Science Fiction". Uden aliases finder Buddy ingen film.
+    genre_aliases = _resolve_genre_aliases(genre) if genre else None
 
     for section in _sections(plex, plex_type):
         try:
@@ -505,9 +577,14 @@ def _unwatched_sync(
         for item in results:
             if getattr(item, "viewCount", 0) > 0:
                 continue
-            if norm_genre:
+            if genre_aliases:
                 item_genres = [_normalise(g.tag) for g in getattr(item, "genres", [])]
-                if not any(norm_genre in g for g in item_genres):
+                # Match hvis ét af brugerens aliases findes i én af filmens genres
+                if not any(
+                    alias in item_genre
+                    for alias in genre_aliases
+                    for item_genre in item_genres
+                ):
                     continue
             unwatched.append(_slim(item))
 
