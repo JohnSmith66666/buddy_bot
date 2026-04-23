@@ -75,7 +75,7 @@ async def get_tautulli_user_id(plex_username: str) -> int | None:
 # Personal statistics
 # ---------------------------------------------------------------------------
 
-async def get_user_watch_stats(plex_username: str, query_days: int = 30) -> dict | None:
+async def get_user_watch_stats(plex_username: str, query_days: int = 365) -> dict | None:
     """
     Returns a combined personal statistics payload for a single user:
       - watch_time_stats : total duration and play counts (from get_user_watch_time_stats)
@@ -84,7 +84,7 @@ async def get_user_watch_stats(plex_username: str, query_days: int = 30) -> dict
 
     Args:
         plex_username : The user's Plex username stored in the bot database.
-        query_days    : Number of days to look back (default 30).
+        query_days    : Number of days to look back (default 365).
 
     Returns:
         A dict with keys watch_time_stats, top_movies, top_tv — or None if user not found.

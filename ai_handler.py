@@ -114,23 +114,24 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
         return j(await get_request_status(tool_input["title"], plex_username))
 
     # Tautulli
-    # FIX: get_popular_on_plex bruger time_range + stats_count (ikke 'days')
+    # get_popular_on_plex bruger time_range + stats_count (ikke 'days')
     if tool_name == "get_popular_on_plex":
         return j(await get_popular_on_plex(
             stats_count=tool_input.get("stats_count", 10),
             time_range=tool_input.get("time_range", 30),
         ))
 
-    # FIX: get_user_watch_stats bruger query_days (ikke 'days')
+    # FIX: Default query_days hævet til 365 så Buddy finder data selv når
+    # Claude sender et lavt tal eller ingen dage overhovedet.
     if tool_name == "get_user_watch_stats":
         if not plex_username:
             return j({"error": "Intet Plex-brugernavn fundet — kan ikke hente personlig statistik."})
         return j(await get_user_watch_stats(
             plex_username,
-            query_days=tool_input.get("query_days", tool_input.get("days", 30)),
+            query_days=tool_input.get("query_days", tool_input.get("days", 365)),
         ))
 
-    # FIX: get_user_history bruger length (ikke 'query')
+    # get_user_history bruger length (ikke 'query')
     if tool_name == "get_user_history":
         if not plex_username:
             return j({"error": "Intet Plex-brugernavn fundet — kan ikke hente historik."})
@@ -181,7 +182,7 @@ async def get_ai_response(
                 for block in response.content:
                     if block.type == "tool_use":
                         logger.info("Tool call: %s(%s)", block.name, block.input)
-                        # FIX: tool_result SKAL altid sendes tilbage — selv ved fejl.
+                        # tool_result SKAL altid sendes tilbage — selv ved fejl.
                         # Hvis _dispatch kaster en exception, fanger vi den her og
                         # returnerer en fejlbesked som tool_result i stedet for at
                         # afbryde løkken. Det forhindrer Anthropic 400-fejlen:
@@ -219,7 +220,7 @@ async def get_ai_response(
 
     except anthropic.APIError as e:
         logger.error("Anthropic error for user %s: %s", telegram_id, e)
-        # FIX: Ved API-fejl rydder vi den korrupte historik for denne bruger
+        # Ved API-fejl rydder vi den korrupte historik for denne bruger
         # så næste besked starter med en ren slate frem for at sende en
         # ugyldig beskedsekvens igen og få samme 400-fejl.
         _histories.pop(telegram_id, None)
