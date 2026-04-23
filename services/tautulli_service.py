@@ -14,6 +14,7 @@ TOKEN-DIÆT:
   Kunstnere, thumbnails, filstier og andre tunge felter strippes.
 """
 
+import asyncio
 import logging
 
 import httpx
@@ -175,41 +176,59 @@ async def get_user_watch_stats(
     if user_id is None:
         return {"error": f"Brugeren '{plex_username}' blev ikke fundet i Tautulli."}
 
-    params: dict = {"user_id": user_id}
+    # ── Fetch all data in parallel — three API calls simultaneously ───────────
+    time_params: dict = {"user_id": user_id}
     if days is not None:
-        params["query_days"] = days
+        time_params["query_days"] = days
 
-    data = await _get("get_user_watch_time_stats", **params)
-    if not data:
+    top_params: dict = {"user_id": user_id, "count": 5}
+    if days is not None:
+        top_params["time_range"] = days
+
+    time_data, movies_data, tv_data = await asyncio.gather(
+        _get("get_user_watch_time_stats", **time_params),
+        _get("get_user_stats", stat_id="top_movies", **top_params),
+        _get("get_user_stats", stat_id="top_tv",     **top_params),
+    )
+
+    if not time_data:
         return {"error": "Kunne ikke hente brugerstatistik fra Tautulli."}
 
-    # get_user_watch_time_stats returns a list of rows per query_days bucket.
-    # We pick the first (and usually only) bucket that matches our request.
-    stats = data[0] if isinstance(data, list) and data else data
+    # ── Total time + plays ────────────────────────────────────────────────────
+    stats = time_data[0] if isinstance(time_data, list) and time_data else time_data
 
     total_minutes = int(stats.get("total_time", 0)) // 60
     total_plays   = int(stats.get("total_plays", 0))
 
     result: dict = {
-        "plex_username":   plex_username,
-        "period":          f"sidste {days} dage" if days else "all time",
-        "total_time":      _minutes_to_human(total_minutes),
-        "total_plays":     total_plays,
+        "plex_username": plex_username,
+        "period":        f"sidste {days} dage" if days else "all time",
+        "total_time":    _minutes_to_human(total_minutes),
+        "total_plays":   total_plays,
     }
 
-    # Fetch platform breakdown as a nice bonus — slim version only.
-    platform_data = await _get("get_plays_by_source_resolution",
-                               user_id=user_id,
-                               **({"time_range": days} if days else {}))
-    if platform_data and isinstance(platform_data, dict):
-        categories = platform_data.get("categories", [])
-        series     = platform_data.get("series", [])
-        if categories and series:
-            result["top_platforms"] = [
-                {"platform": cat, "plays": s.get("data", [0])[0]}
-                for cat, s in zip(categories[:3], series[:3])
-                if s.get("data")
-            ]
+    # ── Personal top movies ───────────────────────────────────────────────────
+    # get_user_stats returns a list of rows — each row has title + plays.
+    # We expose only titles (no play counts) to respect privacy consistency.
+    if movies_data and isinstance(movies_data, list):
+        result["top_movies"] = [
+            {
+                "title": row.get("title") or row.get("grandparent_title") or "Ukendt",
+                "year":  row.get("year"),
+            }
+            for row in movies_data[:5]
+            if row.get("title") or row.get("grandparent_title")
+        ]
+
+    # ── Personal top TV shows ─────────────────────────────────────────────────
+    if tv_data and isinstance(tv_data, list):
+        result["top_tv"] = [
+            {
+                "title": row.get("grandparent_title") or row.get("title") or "Ukendt",
+            }
+            for row in tv_data[:5]
+            if row.get("grandparent_title") or row.get("title")
+        ]
 
     return result
 
