@@ -7,6 +7,7 @@ Korrekte parametre (bekræftet via debug-logs 2026-04-23):
 - get_user_watch_time_stats : bruger `query_days` + user_id
 - get_home_stats med user_id : bruger `time_range` + user_id + stats_count (personlige toplister)
 - get_home_stats uden user_id: bruger `time_range` + stats_count (server-wide trends)
+- get_recently_added        : bruger `count`
 - Tid returneres i SEKUNDER — skal divideres med 3600 for timer, 60 for minutter.
 """
 
@@ -83,7 +84,7 @@ async def get_user_watch_stats(plex_username: str, query_days: int = 365) -> dic
 
     VIGTIGE parameter-regler (bekræftet via logs):
       - get_user_watch_time_stats → bruger `query_days`
-      - get_home_stats med user_id → bruger `time_range` (dage) for personlige toplister
+      - get_home_stats med user_id → bruger `time_range` for personlige toplister
       - Tautulli returnerer tid i SEKUNDER — konverteres til timer/minutter her.
     """
     user_id = await get_tautulli_user_id(plex_username)
@@ -112,13 +113,11 @@ async def get_user_watch_stats(plex_username: str, query_days: int = 365) -> dic
                 **entry,
                 "total_time_hours": hours,
                 "total_time_minutes": minutes,
-                # Overskriver det rå sekund-felt med timer så Buddy ikke misforstår
-                "total_time": hours,
+                "total_time": hours,  # Overskriver rå sekunder så Buddy ikke misforstår
             })
 
     # --- 2. Top 5 film for denne bruger ---
-    # FIX: Bruger get_home_stats med user_id — understøtter personlige toplister.
-    # get_user_stats understøtter ikke query_days/days korrekt og giver 400.
+    # FIX: get_home_stats med user_id giver personlige toplister uden 400-fejl
     top_movies_raw = await _tautulli_get({
         "cmd": "get_home_stats",
         "user_id": user_id,
@@ -126,8 +125,6 @@ async def get_user_watch_stats(plex_username: str, query_days: int = 365) -> dic
         "stats_count": 5,
         "stat_id": "top_movies",
     })
-
-    # Udtræk rows fra det første stat_block der matcher top_movies
     top_movies_data = _extract_rows(top_movies_raw, "top_movies")
 
     # --- 3. Top 5 serier for denne bruger ---
@@ -138,7 +135,6 @@ async def get_user_watch_stats(plex_username: str, query_days: int = 365) -> dic
         "stats_count": 5,
         "stat_id": "top_tv",
     })
-
     top_tv_data = _extract_rows(top_tv_raw, "top_tv")
 
     return {
@@ -156,18 +152,16 @@ def _extract_rows(data, stat_id: str) -> list | None:
     if not data:
         return None
 
-    # get_home_stats returnerer en liste af stat_blocks
     if isinstance(data, list):
         for block in data:
             if stat_id in (block.get("stat_id") or ""):
                 return block.get("rows") or []
-        # Hvis kun ét block returneres (ved filtreret kald), brug det direkte
+        # Fallback: brug første block hvis kun ét returneres
         if len(data) > 0:
             rows = data[0].get("rows")
             if rows is not None:
                 return rows
 
-    # Hvis data er et enkelt dict
     if isinstance(data, dict):
         return data.get("rows") or []
 
@@ -182,7 +176,6 @@ async def get_popular_on_plex(stats_count: int = 10, time_range: int = 365) -> d
     """
     Returns the most popular content on the Plex server globally.
     Strips users_watched, total_plays og total_duration før data sendes til AI.
-    NOTE: get_home_stats uden user_id giver server-wide trends.
     """
     data = await _tautulli_get({
         "cmd": "get_home_stats",
@@ -204,6 +197,72 @@ async def get_popular_on_plex(stats_count: int = 10, time_range: int = 365) -> d
         cleaned_stats.append(stat_block)
 
     return cleaned_stats
+
+
+# ---------------------------------------------------------------------------
+# Recently added
+# ---------------------------------------------------------------------------
+
+async def get_recently_added(count: int = 10) -> dict | None:
+    """
+    Returns the most recently added content on the Plex server.
+    Adskiller film og serier i to separate lister for nem præsentation.
+
+    Returnerer:
+        {
+            "movies":  [ { title, year, added_at, rating_key, thumb, media_type } ],
+            "episodes": [ { title, grandparent_title, season, episode, added_at, rating_key, thumb, media_type } ],
+        }
+    """
+    data = await _tautulli_get({
+        "cmd": "get_recently_added",
+        "count": count,
+    })
+
+    if not data:
+        return None
+
+    # Tautulli returnerer enten data direkte eller i et 'recently_added' felt
+    items = []
+    if isinstance(data, dict):
+        items = data.get("recently_added", [])
+    elif isinstance(data, list):
+        items = data
+
+    movies = []
+    episodes = []
+
+    for item in items:
+        media_type = item.get("media_type", "")
+        base = {
+            "title":      item.get("title") or item.get("full_title") or "Ukendt",
+            "year":       item.get("year"),
+            "added_at":   item.get("added_at"),
+            "rating_key": item.get("rating_key"),
+            "thumb":      item.get("thumb"),
+            "media_type": media_type,
+        }
+
+        if media_type == "movie":
+            movies.append(base)
+        elif media_type in ("episode", "show"):
+            base["grandparent_title"] = item.get("grandparent_title") or item.get("title")
+            base["season"]  = item.get("parent_media_index") or item.get("season")
+            base["episode"] = item.get("media_index") or item.get("episode")
+            episodes.append(base)
+        else:
+            # Ukendt type — læg i den mest sandsynlige liste baseret på felter
+            if item.get("grandparent_title"):
+                base["grandparent_title"] = item.get("grandparent_title")
+                episodes.append(base)
+            else:
+                movies.append(base)
+
+    return {
+        "movies":   movies[:count],
+        "episodes": episodes[:count],
+        "total":    len(movies) + len(episodes),
+    }
 
 
 # ---------------------------------------------------------------------------

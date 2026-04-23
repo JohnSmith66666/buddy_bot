@@ -41,6 +41,7 @@ from services.tmdb_service import (
 )
 from services.tautulli_service import (
     get_popular_on_plex,
+    get_recently_added,
     get_user_history,
     get_user_watch_stats,
 )
@@ -48,7 +49,6 @@ from tools import TOOLS
 
 logger = logging.getLogger(__name__)
 
-# AsyncAnthropic ensures messages.create() is awaited — never blocks the event loop.
 _client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 _histories: dict[int, list[dict]] = defaultdict(list)
@@ -103,7 +103,7 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
     if tool_name == "get_missing_from_collection":
         return j(await get_missing_from_collection(tool_input["collection_name"], plex_username))
 
-    # Seerr — user-scoped for reads, admin for writes
+    # Seerr
     if tool_name == "request_movie":
         return j(await request_movie(tool_input["tmdb_id"], tool_input.get("category", "standard")))
     if tool_name == "request_tv":
@@ -114,15 +114,12 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
         return j(await get_request_status(tool_input["title"], plex_username))
 
     # Tautulli
-    # get_popular_on_plex bruger time_range + stats_count (ikke 'days')
     if tool_name == "get_popular_on_plex":
         return j(await get_popular_on_plex(
             stats_count=tool_input.get("stats_count", 10),
             time_range=tool_input.get("time_range", 30),
         ))
 
-    # FIX: Default query_days hævet til 365 så Buddy finder data selv når
-    # Claude sender et lavt tal eller ingen dage overhovedet.
     if tool_name == "get_user_watch_stats":
         if not plex_username:
             return j({"error": "Intet Plex-brugernavn fundet — kan ikke hente personlig statistik."})
@@ -131,13 +128,17 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
             query_days=tool_input.get("query_days", tool_input.get("days", 365)),
         ))
 
-    # get_user_history bruger length (ikke 'query')
     if tool_name == "get_user_history":
         if not plex_username:
             return j({"error": "Intet Plex-brugernavn fundet — kan ikke hente historik."})
         return j(await get_user_history(
             plex_username,
             length=tool_input.get("length", tool_input.get("count", 10)),
+        ))
+
+    if tool_name == "get_recently_added":
+        return j(await get_recently_added(
+            count=tool_input.get("count", 10),
         ))
 
     return j({"error": f"Ukendt vaerktoej: {tool_name}"})
@@ -152,9 +153,7 @@ async def get_ai_response(
 ) -> str:
     """
     Run the full agentic loop and return Buddy's reply.
-
-    plex_username is threaded through to every Plex and Seerr call
-    so all data is scoped to the individual user.
+    plex_username is threaded through to every Plex and Seerr call.
     """
     _histories[telegram_id].append({"role": "user", "content": user_message})
     _trim(telegram_id)
@@ -182,11 +181,6 @@ async def get_ai_response(
                 for block in response.content:
                     if block.type == "tool_use":
                         logger.info("Tool call: %s(%s)", block.name, block.input)
-                        # tool_result SKAL altid sendes tilbage — selv ved fejl.
-                        # Hvis _dispatch kaster en exception, fanger vi den her og
-                        # returnerer en fejlbesked som tool_result i stedet for at
-                        # afbryde løkken. Det forhindrer Anthropic 400-fejlen:
-                        # "tool_use ids found without tool_result blocks".
                         try:
                             result = await _dispatch(block.name, block.input, plex_username)
                         except Exception as dispatch_err:
@@ -220,9 +214,6 @@ async def get_ai_response(
 
     except anthropic.APIError as e:
         logger.error("Anthropic error for user %s: %s", telegram_id, e)
-        # Ved API-fejl rydder vi den korrupte historik for denne bruger
-        # så næste besked starter med en ren slate frem for at sende en
-        # ugyldig beskedsekvens igen og få samme 400-fejl.
         _histories.pop(telegram_id, None)
         return "Av, noget gik galt hos mig — prøv igen om lidt! 🔧"
 
