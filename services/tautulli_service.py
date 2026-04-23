@@ -11,8 +11,8 @@ Key rules (from TAUTULLI_API_RULES.md):
 """
 
 import logging
+import config  # Direct module import — avoids 'cannot import name config' error
 import httpx
-from config import config
 
 logger = logging.getLogger(__name__)
 
