@@ -3,9 +3,9 @@ services/tautulli_service.py
 
 Handles all communication with the Tautulli API.
 
-Korrekte parametre (bekræftet via debug-logs):
+Korrekte parametre (bekræftet via debug-logs 2026-04-23):
 - get_user_watch_time_stats : bruger `query_days` + user_id
-- get_user_stats            : bruger `time_range` + user_id + stat_id + count
+- get_user_stats            : bruger `days` + user_id + stat_id + count
 - get_home_stats            : bruger `time_range` + stats_count
 """
 
@@ -76,47 +76,66 @@ async def get_tautulli_user_id(plex_username: str) -> int | None:
 async def get_user_watch_stats(plex_username: str, query_days: int = 365) -> dict | None:
     """
     Returns a combined personal statistics payload for a single user:
-      - watch_time_stats : total duration and play counts
-      - top_movies       : top 5 movies watched by this user
-      - top_tv           : top 5 TV shows watched by this user
+      - watch_time_stats : total duration (i minutter) og play counts
+      - top_movies       : top 5 film set af denne bruger
+      - top_tv           : top 5 serier set af denne bruger
 
-    VIGTIGE parameter-regler (bekræftet via HTTP 400-logs):
+    VIGTIGE parameter-regler (bekræftet via HTTP 400-logs 2026-04-23):
       - get_user_watch_time_stats → bruger `query_days`
-      - get_user_stats            → bruger `time_range` (IKKE query_days!)
+      - get_user_stats            → bruger `days` (hverken query_days eller time_range!)
+      - Tautulli returnerer tid i SEKUNDER — vi konverterer til minutter før retur.
     """
     user_id = await get_tautulli_user_id(plex_username)
     if user_id is None:
         logger.error("Cannot fetch stats: user_id not resolved for '%s'.", plex_username)
         return None
 
-    # Konverter query_days til time_range for get_user_stats
-    time_range = query_days
-
     # --- 1. Watch time og play count totals ---
-    # Denne kommando bruger query_days — korrekt
-    watch_time_data = await _tautulli_get({
+    # Bruger query_days — korrekt for denne kommando
+    watch_time_raw = await _tautulli_get({
         "cmd": "get_user_watch_time_stats",
         "user_id": user_id,
         "query_days": query_days,
     })
 
+    # FIX: Tautulli returnerer total_time i SEKUNDER.
+    # Konverter til minutter så Buddy ikke tror brugeren har set
+    # Plex non-stop i 937 dage.
+    watch_time_data = None
+    if watch_time_raw:
+        watch_time_data = []
+        for entry in watch_time_raw:
+            total_seconds = entry.get("total_time", 0) or 0
+            total_minutes = total_seconds // 60
+            hours = total_minutes // 60
+            minutes = total_minutes % 60
+            watch_time_data.append({
+                **entry,
+                "total_time_seconds": total_seconds,
+                "total_time_minutes": total_minutes,
+                "total_time_hours": hours,
+                "total_time_remainder_minutes": minutes,
+                # Fjern det rå sekund-felt så Buddy ikke misforstår det
+                "total_time": total_minutes,
+            })
+
     # --- 2. Top 5 film for denne bruger ---
-    # VIGTIGT: get_user_stats bruger time_range, IKKE query_days
+    # FIX: get_user_stats bruger `days` — hverken query_days eller time_range!
     top_movies_data = await _tautulli_get({
         "cmd": "get_user_stats",
         "user_id": user_id,
         "stat_id": "top_movies",
-        "time_range": time_range,
+        "days": query_days,
         "count": 5,
     })
 
     # --- 3. Top 5 serier for denne bruger ---
-    # VIGTIGT: get_user_stats bruger time_range, IKKE query_days
+    # FIX: samme regel — `days` er det korrekte parameternavn
     top_tv_data = await _tautulli_get({
         "cmd": "get_user_stats",
         "user_id": user_id,
         "stat_id": "top_tv",
-        "time_range": time_range,
+        "days": query_days,
         "count": 5,
     })
 
