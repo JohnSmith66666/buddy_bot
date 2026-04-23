@@ -1,15 +1,10 @@
 """
 ai_handler.py - Agentic loop for Buddy.
 
-Each call receives the user's plex_username so all Plex and Seerr
-tool calls are automatically scoped to that user.
-
 CHANGES vs previous version:
-  - Model string now read from config.ANTHROPIC_MODEL (no more hardcoded value).
-  - get_user_history() dispatcher now passes the `query` parameter through
-    to the service layer (was silently dropped before).
-  - Dead code removed: format_user_stats_context / format_popular_context
-    from prompts.py were never called — removed the dead import too.
+  - Fjernet alle Seerr imports og tool handlers.
+  - Tilføjet direkte Radarr (add_movie) og Sonarr (add_series) tool handlers.
+  - plex_username sendes til Radarr/Sonarr for automatisk tag-tildeling.
 """
 
 import json
@@ -30,12 +25,8 @@ from services.plex_service import (
     get_similar_in_library,
     search_by_actor,
 )
-from services.seerr_service import (
-    get_all_requests,
-    get_request_status,
-    request_movie,
-    request_tv,
-)
+from services.radarr_service import add_movie, check_radarr_library
+from services.sonarr_service import add_series, check_sonarr_library
 from services.tmdb_service import (
     get_media_details,
     get_now_playing,
@@ -117,15 +108,26 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
             plex_username,
         ))
 
-    # Seerr
-    if tool_name == "request_movie":
-        return j(await request_movie(tool_input["tmdb_id"], tool_input.get("category", "standard")))
-    if tool_name == "request_tv":
-        return j(await request_tv(tool_input["tmdb_id"], tool_input["season_numbers"], tool_input.get("category", "standard")))
-    if tool_name == "get_all_requests":
-        return j(await get_all_requests(plex_username))
-    if tool_name == "get_request_status":
-        return j(await get_request_status(tool_input["title"], plex_username))
+    # Radarr — direkte film-tilføjelse
+    if tool_name == "add_movie":
+        return j(await add_movie(
+            tmdb_id=tool_input["tmdb_id"],
+            title=tool_input["title"],
+            year=tool_input["year"],
+            genres=tool_input.get("genres", []),
+            plex_username=plex_username,
+        ))
+
+    # Sonarr — direkte serie-tilføjelse
+    if tool_name == "add_series":
+        return j(await add_series(
+            tvdb_id=tool_input["tvdb_id"],
+            title=tool_input["title"],
+            year=tool_input["year"],
+            original_language=tool_input.get("original_language", "en"),
+            season_numbers=tool_input["season_numbers"],
+            plex_username=plex_username,
+        ))
 
     # Tautulli
     if tool_name == "get_popular_on_plex":
@@ -145,7 +147,6 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
     if tool_name == "get_user_history":
         if not plex_username:
             return j({"error": "Intet Plex-brugernavn fundet — kan ikke hente historik."})
-        # FIX: `query` parameter is now passed through to the service layer.
         return j(await get_user_history(
             plex_username,
             length=tool_input.get("length", tool_input.get("count", 10)),
@@ -172,10 +173,7 @@ async def get_ai_response(
     user_message: str,
     plex_username: str | None = None,
 ) -> str:
-    """
-    Run the full agentic loop and return Buddy's reply.
-    plex_username is threaded through to every Plex and Seerr call.
-    """
+    """Run the full agentic loop and return Buddy's reply."""
     _histories[telegram_id].append({"role": "user", "content": user_message})
     _trim(telegram_id)
 
@@ -186,7 +184,7 @@ async def get_ai_response(
     try:
         while True:
             response = await _client.messages.create(
-                model=ANTHROPIC_MODEL,   # FIX: from config, not hardcoded
+                model=ANTHROPIC_MODEL,
                 max_tokens=1024,
                 system=system,
                 tools=TOOLS,
@@ -207,8 +205,7 @@ async def get_ai_response(
                         except Exception as dispatch_err:
                             logger.error(
                                 "Tool dispatch error for '%s': %s",
-                                block.name,
-                                dispatch_err,
+                                block.name, dispatch_err,
                             )
                             result = json.dumps(
                                 {"error": f"Vaerktoejet '{block.name}' fejlede: {dispatch_err}"},

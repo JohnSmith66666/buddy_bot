@@ -28,28 +28,30 @@ DATABASE_URL: str = _require("DATABASE_URL")
 
 # ── Anthropic ─────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY: str = _require("ANTHROPIC_API_KEY")
-
-# FIX: Model string moved here so it can be changed without touching ai_handler.py.
-# Switch to "claude-sonnet-4-5" for smarter (but slower/pricier) responses.
-ANTHROPIC_MODEL: str = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+ANTHROPIC_MODEL: str   = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
 # ── TMDB ──────────────────────────────────────────────────────────────────────
 TMDB_API_KEY: str = _require("TMDB_API_KEY")
-
-# ── Seerr ─────────────────────────────────────────────────────────────────────
-SEERR_API_KEY: str = _require("SEERR_API")
-SEERR_URL: str     = _require("SEERR_URL")
 
 # ── Plex ──────────────────────────────────────────────────────────────────────
 PLEX_URL: str   = _require("PLEX_URL")
 PLEX_TOKEN: str = _require("PLEX_TOKEN")
 
+# ── Radarr ────────────────────────────────────────────────────────────────────
+RADARR_URL: str               = _require("RADARR_URL")
+RADARR_API_KEY: str           = _require("RADARR_API_KEY")
+RADARR_QUALITY_PROFILE_ID:int = int(os.getenv("RADARR_QUALITY_PROFILE_ID", "1"))
+
+# ── Sonarr ────────────────────────────────────────────────────────────────────
+SONARR_URL: str               = _require("SONARR_URL")
+SONARR_API_KEY: str           = _require("SONARR_API_KEY")
+SONARR_QUALITY_PROFILE_ID:int = int(os.getenv("SONARR_QUALITY_PROFILE_ID", "1"))
+
 # ── Media root folders ────────────────────────────────────────────────────────
 ROOT_MOVIE_ANIMATION: str = "/mnt/unionfs/Media/Movies/Animation"
-ROOT_MOVIE_DANSK: str     = "/mnt/unionfs/Media/Movies/Dansk"
 ROOT_MOVIE_STANDARD: str  = "/mnt/unionfs/Media/Movies/Film"
+ROOT_TV_DANSK: str        = "/mnt/unionfs/Media/TV/TV"
 ROOT_TV_STANDARD: str     = "/mnt/unionfs/Media/TV/Serier"
-ROOT_TV_PROGRAMMER: str   = "/mnt/unionfs/Media/TV/TV"
 
 # ── Tautulli ──────────────────────────────────────────────────────────────────
 TAUTULLI_URL:     str = _require("TAUTULLI_URL")
