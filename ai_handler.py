@@ -2,9 +2,9 @@
 ai_handler.py - Agentic loop for Buddy.
 
 CHANGES vs previous version:
-  - Fjernet alle Seerr imports og tool handlers.
-  - Tilføjet direkte Radarr (add_movie) og Sonarr (add_series) tool handlers.
-  - plex_username sendes til Radarr/Sonarr for automatisk tag-tildeling.
+  - Fjernet add_movie og add_series tool handlers.
+  - Claude returnerer nu SHOW_SEARCH_RESULTS:<query>:<media_type> når bestilling ønskes.
+  - main.py fanger dette signal og kalder confirmation_service.
 """
 
 import json
@@ -25,8 +25,6 @@ from services.plex_service import (
     get_similar_in_library,
     search_by_actor,
 )
-from services.radarr_service import add_movie, check_radarr_library
-from services.sonarr_service import add_series, check_sonarr_library
 from services.tmdb_service import (
     get_media_details,
     get_now_playing,
@@ -53,6 +51,9 @@ _client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 _histories: dict[int, list[dict]] = defaultdict(list)
 _MAX_HISTORY = 20
 
+# Signal som Claude returnerer for at trigge bestillingsflow
+SEARCH_SIGNAL = "SHOW_SEARCH_RESULTS:"
+
 
 def _trim(telegram_id: int) -> None:
     h = _histories[telegram_id]
@@ -60,10 +61,7 @@ def _trim(telegram_id: int) -> None:
         _histories[telegram_id] = h[-_MAX_HISTORY:]
 
 
-# ── Tool dispatcher ───────────────────────────────────────────────────────────
-
 async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None) -> str:
-    """Route a tool call to the correct service function."""
     j = lambda x: json.dumps(x, ensure_ascii=False)
 
     # TMDB
@@ -108,72 +106,44 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
             plex_username,
         ))
 
-    # Radarr — direkte film-tilføjelse
-    if tool_name == "add_movie":
-        return j(await add_movie(
-            tmdb_id=tool_input["tmdb_id"],
-            title=tool_input["title"],
-            year=tool_input["year"],
-            genres=tool_input.get("genres", []),
-            plex_username=plex_username,
-        ))
-
-    # Sonarr — direkte serie-tilføjelse
-    if tool_name == "add_series":
-        return j(await add_series(
-            tvdb_id=tool_input["tvdb_id"],
-            title=tool_input["title"],
-            year=tool_input["year"],
-            original_language=tool_input.get("original_language", "en"),
-            season_numbers=tool_input["season_numbers"],
-            plex_username=plex_username,
-        ))
-
     # Tautulli
     if tool_name == "get_popular_on_plex":
         return j(await get_popular_on_plex(
             stats_count=tool_input.get("stats_count", 10),
-            time_range=tool_input.get("days", tool_input.get("time_range", 30)),
+            time_range=tool_input.get("days", 30),
         ))
-
     if tool_name == "get_user_watch_stats":
         if not plex_username:
-            return j({"error": "Intet Plex-brugernavn fundet — kan ikke hente personlig statistik."})
+            return j({"error": "Intet Plex-brugernavn fundet."})
         return j(await get_user_watch_stats(
             plex_username,
-            query_days=tool_input.get("query_days", tool_input.get("days", 365)),
+            query_days=tool_input.get("days", 365),
         ))
-
     if tool_name == "get_user_history":
         if not plex_username:
-            return j({"error": "Intet Plex-brugernavn fundet — kan ikke hente historik."})
+            return j({"error": "Intet Plex-brugernavn fundet."})
         return j(await get_user_history(
             plex_username,
-            length=tool_input.get("length", tool_input.get("count", 10)),
+            length=tool_input.get("length", 10),
             query=tool_input.get("query"),
         ))
-
     if tool_name == "get_recently_added":
-        raw = await get_recently_added(count=tool_input.get("count", 10))
-        logger.info(
-            "get_recently_added RESULT: type=%s, keys=%s, sample=%s",
-            type(raw).__name__,
-            list(raw.keys()) if isinstance(raw, dict) else f"list[{len(raw)}]" if isinstance(raw, list) else "None",
-            str(raw)[:400] if raw else "None/empty",
-        )
-        return j(raw)
+        return j(await get_recently_added(count=tool_input.get("count", 10)))
 
     return j({"error": f"Ukendt vaerktoej: {tool_name}"})
 
-
-# ── Public API ────────────────────────────────────────────────────────────────
 
 async def get_ai_response(
     telegram_id: int,
     user_message: str,
     plex_username: str | None = None,
 ) -> str:
-    """Run the full agentic loop and return Buddy's reply."""
+    """
+    Run the full agentic loop and return Buddy's reply.
+
+    If Claude returns a SHOW_SEARCH_RESULTS signal, main.py intercepts
+    it and calls confirmation_service instead of sending it to the user.
+    """
     _histories[telegram_id].append({"role": "user", "content": user_message})
     _trim(telegram_id)
 
@@ -195,29 +165,20 @@ async def get_ai_response(
                 _histories[telegram_id].append(
                     {"role": "assistant", "content": response.content}
                 )
-
                 tool_results = []
                 for block in response.content:
                     if block.type == "tool_use":
                         logger.info("Tool call: %s(%s)", block.name, block.input)
                         try:
                             result = await _dispatch(block.name, block.input, plex_username)
-                        except Exception as dispatch_err:
-                            logger.error(
-                                "Tool dispatch error for '%s': %s",
-                                block.name, dispatch_err,
-                            )
-                            result = json.dumps(
-                                {"error": f"Vaerktoejet '{block.name}' fejlede: {dispatch_err}"},
-                                ensure_ascii=False,
-                            )
-
+                        except Exception as e:
+                            logger.error("Tool dispatch error '%s': %s", block.name, e)
+                            result = json.dumps({"error": str(e)}, ensure_ascii=False)
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
                             "content": result,
                         })
-
                 _histories[telegram_id].append({"role": "user", "content": tool_results})
                 _trim(telegram_id)
                 continue

@@ -213,3 +213,92 @@ async def get_all_whitelisted_users() -> list[dict]:
             "SELECT telegram_id, telegram_name, plex_username FROM users WHERE is_whitelisted = TRUE"
         )
     return [dict(row) for row in rows]
+
+
+# ── Pending requests (til Inline Keyboard bekræftelse) ────────────────────────
+
+_CREATE_PENDING_REQUESTS_TABLE = """
+CREATE TABLE IF NOT EXISTS pending_requests (
+    token        TEXT        PRIMARY KEY,
+    telegram_id  BIGINT      NOT NULL,
+    media_type   TEXT        NOT NULL,
+    tmdb_id      INTEGER     NOT NULL,
+    tvdb_id      INTEGER,
+    title        TEXT        NOT NULL,
+    year         INTEGER,
+    genres       JSONB,
+    original_language TEXT,
+    season_numbers    JSONB,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+_CREATE_PENDING_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_pending_telegram_id
+    ON pending_requests (telegram_id, created_at DESC);
+"""
+
+
+async def setup_pending_requests() -> None:
+    """Create pending_requests table if it doesn't exist."""
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(_CREATE_PENDING_REQUESTS_TABLE)
+        await conn.execute(_CREATE_PENDING_INDEX)
+
+
+async def save_pending_request(token: str, telegram_id: int, data: dict) -> None:
+    """Save media details for a pending confirmation."""
+    import json
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO pending_requests
+                (token, telegram_id, media_type, tmdb_id, tvdb_id, title, year,
+                 genres, original_language, season_numbers)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            ON CONFLICT (token) DO UPDATE SET
+                telegram_id=EXCLUDED.telegram_id,
+                media_type=EXCLUDED.media_type,
+                tmdb_id=EXCLUDED.tmdb_id,
+                tvdb_id=EXCLUDED.tvdb_id,
+                title=EXCLUDED.title,
+                year=EXCLUDED.year,
+                genres=EXCLUDED.genres,
+                original_language=EXCLUDED.original_language,
+                season_numbers=EXCLUDED.season_numbers,
+                created_at=NOW()
+            """,
+            token,
+            telegram_id,
+            data.get("media_type"),
+            data.get("tmdb_id"),
+            data.get("tvdb_id"),
+            data.get("title"),
+            data.get("year"),
+            json.dumps(data.get("genres", [])),
+            data.get("original_language", "en"),
+            json.dumps(data.get("season_numbers", [])),
+        )
+
+
+async def get_pending_request(token: str) -> dict | None:
+    """Retrieve and delete a pending request by token."""
+    import json
+    async with _pool_ref().acquire() as conn:
+        row = await conn.fetchrow(
+            "DELETE FROM pending_requests WHERE token=$1 RETURNING *", token
+        )
+    if not row:
+        return None
+    d = dict(row)
+    d["genres"]         = json.loads(d["genres"])         if d["genres"]         else []
+    d["season_numbers"] = json.loads(d["season_numbers"]) if d["season_numbers"] else []
+    return d
+
+
+async def delete_pending_requests_for_user(telegram_id: int) -> None:
+    """Clean up all pending requests for a user (e.g. on cancel)."""
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(
+            "DELETE FROM pending_requests WHERE telegram_id=$1", telegram_id
+        )
