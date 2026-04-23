@@ -287,4 +287,58 @@ TOOLS = [
             "required": ["title"],
         },
     },
+
+    # ── Tautulli ──────────────────────────────────────────────────────────────
+    {
+        "name": "get_popular_on_plex",
+        "description": (
+            "Hent de mest populære film og serier på Plex-serveren. "
+            "Brug dette når brugeren spørger 'hvad ser andre' eller 'hvad er mest populært'. "
+            "Returnerer KUN de top 10 mest sete film og top 10 mest sete serier."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "Antal dage der skal kigges tilbage. Standard er 7, medmindre brugeren beder om andet (f.eks. 28 eller 30).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_user_watch_stats",
+        "description": (
+            "Hent brugerens personlige Plex-statistik (hvor meget tid de har brugt, mest sete osv.). "
+            "Brug dette når brugeren spørger ind til deres egne vaner, f.eks. 'hvor meget har jeg set i år'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "Antal dage der skal kigges tilbage (f.eks. 30, 365). Undlad hvis der ønskes 'all time'.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_user_history",
+        "description": (
+            "Søg i brugerens egen afspilningshistorik. "
+            "Brug dette når brugeren spørger 'hvad var det jeg så i tirsdags?' eller 'hvornår så jeg X?'"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Valgfri titel eller søgeord at lede efter i historikken.",
+                },
+            },
+            "required": [],
+        },
+    },
 ]

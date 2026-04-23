@@ -47,6 +47,10 @@ ROOT_MOVIE_STANDARD: str  = "/mnt/unionfs/Media/Movies/Film"
 ROOT_TV_STANDARD: str     = "/mnt/unionfs/Media/TV/Serier"
 ROOT_TV_PROGRAMMER: str   = "/mnt/unionfs/Media/TV/TV"
 
+# ── Tautulli ──────────────────────────────────────────────────────────────────
+TAUTULLI_URL:     str = _require("TAUTULLI_URL")       # e.g. http://192.168.1.10:8181
+TAUTULLI_API_KEY: str = _require("TAUTULLI_API_KEY")
+
 # ── Optional / runtime settings ───────────────────────────────────────────────
 ENVIRONMENT: str       = os.getenv("ENVIRONMENT", "dev")
 LOG_HISTORY_LIMIT: int = int(os.getenv("LOG_HISTORY_LIMIT", "500"))
