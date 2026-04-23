@@ -1,13 +1,15 @@
 """
 prompts.py
 
-Contains all system prompts and prompt-building utilities for Buddy.
+Contains all system prompts for Buddy.
 Prompts are written in Danish (user-facing) with English code/structure.
-"""
 
-# ---------------------------------------------------------------------------
-# Core system prompt
-# ---------------------------------------------------------------------------
+CHANGES vs previous version:
+  - Removed format_user_stats_context() and format_popular_context().
+    These were never called anywhere in the codebase (dead code).
+    Tool results go directly from the service layer into the agentic loop
+    as JSON — Claude formats them itself based on the system prompt rules.
+"""
 
 SYSTEM_PROMPT = """
 Du er Buddy — en venlig, præcis og lidt humoristisk dansk medie-assistent, der hjælper brugere på en privat Plex-server.
@@ -68,83 +70,3 @@ Når du præsenterer nyt indhold fra Plex, skal du:
 - Du anmoder **aldrig** om indhold uden brugerens eksplicitte bekræftelse.
 - Du afslører **aldrig** andre brugeres aktivitet eller data.
 """
-
-
-# ---------------------------------------------------------------------------
-# Tool result formatters (injected into messages before Claude responds)
-# ---------------------------------------------------------------------------
-
-def format_user_stats_context(stats: dict, query_days: int) -> str:
-    """
-    Formats the result from get_user_watch_stats into a readable context block
-    that is injected as a tool_result message to Claude.
-    """
-    if not stats:
-        return "Ingen personlig statistik tilgængelig. API-kaldet returnerede ingen data."
-
-    lines = [f"📊 *Personlig statistik (seneste {query_days} dage)*\n"]
-
-    # Watch time summary
-    watch_time = stats.get("watch_time_stats")
-    if watch_time:
-        for entry in watch_time:
-            total_duration = entry.get("total_duration", 0)
-            total_plays = entry.get("total_plays", 0)
-            hours = total_duration // 3600
-            minutes = (total_duration % 3600) // 60
-            lines.append(f"- Samlet seertid: {hours} timer og {minutes} minutter")
-            lines.append(f"- Antal afspilninger: {total_plays}")
-
-    # Top movies
-    top_movies = stats.get("top_movies")
-    if top_movies:
-        lines.append("\n🎬 *Dine top 5 film:*")
-        for i, movie in enumerate(top_movies, start=1):
-            title = movie.get("title", "Ukendt")
-            year = movie.get("year", "")
-            lines.append(f"  {i}. {title} ({year})")
-    else:
-        lines.append("\n🎬 Ingen filmdata fundet for perioden.")
-
-    # Top TV shows
-    top_tv = stats.get("top_tv")
-    if top_tv:
-        lines.append("\n📺 *Dine top 5 serier:*")
-        for i, show in enumerate(top_tv, start=1):
-            title = show.get("title", "Ukendt")
-            year = show.get("year", "")
-            lines.append(f"  {i}. {title} ({year})")
-    else:
-        lines.append("\n📺 Ingen seriedata fundet for perioden.")
-
-    return "\n".join(lines)
-
-
-def format_popular_context(popular_data: list) -> str:
-    """
-    Formats the result from get_popular_on_plex into a context block.
-    Only titles and years are included — no aggregate server numbers.
-    """
-    if not popular_data:
-        return "Ingen populærdata tilgængelig fra serveren."
-
-    lines = ["🔥 *Populært på serveren lige nu:*\n"]
-
-    for stat_block in popular_data:
-        stat_type = stat_block.get("stat_id", "")
-        rows = stat_block.get("rows", [])
-
-        if "movie" in stat_type.lower():
-            lines.append("🎬 *Film:*")
-        elif "tv" in stat_type.lower():
-            lines.append("📺 *Serier:*")
-        else:
-            lines.append(f"📌 *{stat_type}:*")
-
-        for i, row in enumerate(rows, start=1):
-            title = row.get("title", "Ukendt")
-            year = row.get("year", "")
-            lines.append(f"  {i}. {title} ({year})")
-        lines.append("")
-
-    return "\n".join(lines)

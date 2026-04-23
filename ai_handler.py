@@ -127,7 +127,6 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
     if tool_name == "get_request_status":
         return j(await get_request_status(tool_input["title"], plex_username))
 
-<<<<<<< HEAD
     # Tautulli
     if tool_name == "get_popular_on_plex":
         return j(await get_popular_on_plex(
@@ -163,43 +162,6 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
         )
         return j(raw)
 
-=======
-    # Tautulli
-    # FIX: læser 'days' fra tool_input og sender som time_range — fx 7 for 'denne uge'
-    if tool_name == "get_popular_on_plex":
-        return j(await get_popular_on_plex(
-            stats_count=tool_input.get("stats_count", 10),
-            time_range=tool_input.get("days", tool_input.get("time_range", 30)),
-        ))
-
-    if tool_name == "get_user_watch_stats":
-        if not plex_username:
-            return j({"error": "Intet Plex-brugernavn fundet — kan ikke hente personlig statistik."})
-        return j(await get_user_watch_stats(
-            plex_username,
-            query_days=tool_input.get("query_days", tool_input.get("days", 365)),
-        ))
-
-    if tool_name == "get_user_history":
-        if not plex_username:
-            return j({"error": "Intet Plex-brugernavn fundet — kan ikke hente historik."})
-        return j(await get_user_history(
-            plex_username,
-            length=tool_input.get("length", tool_input.get("count", 10)),
-        ))
-
-    if tool_name == "get_recently_added":
-        raw = await get_recently_added(count=tool_input.get("count", 10))
-        # DEBUG: Log hvad vi faktisk får tilbage fra tautulli_service
-        logger.info(
-            "get_recently_added RESULT: type=%s, keys=%s, sample=%s",
-            type(raw).__name__,
-            list(raw.keys()) if isinstance(raw, dict) else f"list[{len(raw)}]" if isinstance(raw, list) else "None",
-            str(raw)[:400] if raw else "None/empty",
-        )
-        return j(raw)
-
->>>>>>> b6089dcf2804e487730e79b280a4439225f6dc89
     return j({"error": f"Ukendt vaerktoej: {tool_name}"})
 
 
@@ -223,13 +185,8 @@ async def get_ai_response(
 
     try:
         while True:
-<<<<<<< HEAD
             response = await _client.messages.create(
                 model=ANTHROPIC_MODEL,   # FIX: from config, not hardcoded
-=======
-            response = await _client.messages.create(
-                model="claude-haiku-4-5-20251001",
->>>>>>> b6089dcf2804e487730e79b280a4439225f6dc89
                 max_tokens=1024,
                 system=system,
                 tools=TOOLS,

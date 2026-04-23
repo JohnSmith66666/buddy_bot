@@ -219,20 +219,10 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Starting polling …")
-<<<<<<< HEAD
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
     )
-=======
-    # FIX: drop_pending_updates=True sikrer at ventende opdateringer fra en
-    # tidligere instans droppes ved opstart. Det forhindrer 409 Conflict-fejlen
-    # når Railway starter en ny container mens den gamle stadig er aktiv.
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
->>>>>>> b6089dcf2804e487730e79b280a4439225f6dc89
 
 
 if __name__ == "__main__":
