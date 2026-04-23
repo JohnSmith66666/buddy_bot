@@ -114,10 +114,12 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
         return j(await get_request_status(tool_input["title"], plex_username))
 
     # Tautulli
+    # FIX: Læser 'days' fra tool_input (som tools.py definerer) og sender
+    # det som time_range til tautulli_service — fx 7 for 'denne uge'.
     if tool_name == "get_popular_on_plex":
         return j(await get_popular_on_plex(
             stats_count=tool_input.get("stats_count", 10),
-            time_range=tool_input.get("time_range", 30),
+            time_range=tool_input.get("days", tool_input.get("time_range", 30)),
         ))
 
     if tool_name == "get_user_watch_stats":

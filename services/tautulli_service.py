@@ -81,11 +81,6 @@ async def get_user_watch_stats(plex_username: str, query_days: int = 365) -> dic
       - watch_time_stats : total seertid i timer/minutter + antal afspilninger
       - top_movies       : top 5 film set af denne bruger
       - top_tv           : top 5 serier set af denne bruger
-
-    VIGTIGE parameter-regler (bekræftet via logs):
-      - get_user_watch_time_stats → bruger `query_days`
-      - get_home_stats med user_id → bruger `time_range` for personlige toplister
-      - Tautulli returnerer tid i SEKUNDER — konverteres til timer/minutter her.
     """
     user_id = await get_tautulli_user_id(plex_username)
     if user_id is None:
@@ -93,15 +88,13 @@ async def get_user_watch_stats(plex_username: str, query_days: int = 365) -> dic
         return None
 
     # --- 1. Watch time og play count totals ---
-    # get_user_watch_time_stats bruger query_days — korrekt for denne kommando
     watch_time_raw = await _tautulli_get({
         "cmd": "get_user_watch_time_stats",
         "user_id": user_id,
         "query_days": query_days,
     })
 
-    # FIX: Tautulli returnerer total_time i SEKUNDER.
-    # Konverter til timer og minutter så Buddy ikke siger 1.349.175 minutter.
+    # FIX: Tautulli returnerer total_time i SEKUNDER → konverter til timer/minutter
     watch_time_data = None
     if watch_time_raw:
         watch_time_data = []
@@ -113,11 +106,10 @@ async def get_user_watch_stats(plex_username: str, query_days: int = 365) -> dic
                 **entry,
                 "total_time_hours": hours,
                 "total_time_minutes": minutes,
-                "total_time": hours,  # Overskriver rå sekunder så Buddy ikke misforstår
+                "total_time": hours,
             })
 
     # --- 2. Top 5 film for denne bruger ---
-    # FIX: get_home_stats med user_id giver personlige toplister uden 400-fejl
     top_movies_raw = await _tautulli_get({
         "cmd": "get_home_stats",
         "user_id": user_id,
@@ -145,10 +137,7 @@ async def get_user_watch_stats(plex_username: str, query_days: int = 365) -> dic
 
 
 def _extract_rows(data, stat_id: str) -> list | None:
-    """
-    Udtræk rows fra get_home_stats response.
-    Returnerer listen af rækker hvis fundet, ellers None.
-    """
+    """Udtræk rows fra get_home_stats response."""
     if not data:
         return None
 
@@ -156,7 +145,6 @@ def _extract_rows(data, stat_id: str) -> list | None:
         for block in data:
             if stat_id in (block.get("stat_id") or ""):
                 return block.get("rows") or []
-        # Fallback: brug første block hvis kun ét returneres
         if len(data) > 0:
             rows = data[0].get("rows")
             if rows is not None:
@@ -172,14 +160,19 @@ def _extract_rows(data, stat_id: str) -> list | None:
 # Server-wide / global trends
 # ---------------------------------------------------------------------------
 
-async def get_popular_on_plex(stats_count: int = 10, time_range: int = 365) -> dict | None:
+async def get_popular_on_plex(stats_count: int = 10, time_range: int = 30) -> dict | None:
     """
     Returns the most popular content on the Plex server globally.
     Strips users_watched, total_plays og total_duration før data sendes til AI.
+
+    Args:
+        stats_count : Antal resultater per kategori (default 10).
+        time_range  : Antal dage der kigges tilbage (default 30).
+                      Videregives direkte fra Buddy — fx 7 for 'denne uge'.
     """
     data = await _tautulli_get({
         "cmd": "get_home_stats",
-        "time_range": time_range,
+        "time_range": time_range,   # Bruger den faktiske værdi fra Buddy — ikke hardcoded!
         "stats_count": stats_count,
     })
 
@@ -207,12 +200,6 @@ async def get_recently_added(count: int = 10) -> dict | None:
     """
     Returns the most recently added content on the Plex server.
     Adskiller film og serier i to separate lister for nem præsentation.
-
-    Returnerer:
-        {
-            "movies":  [ { title, year, added_at, rating_key, thumb, media_type } ],
-            "episodes": [ { title, grandparent_title, season, episode, added_at, rating_key, thumb, media_type } ],
-        }
     """
     data = await _tautulli_get({
         "cmd": "get_recently_added",
@@ -222,7 +209,6 @@ async def get_recently_added(count: int = 10) -> dict | None:
     if not data:
         return None
 
-    # Tautulli returnerer enten data direkte eller i et 'recently_added' felt
     items = []
     if isinstance(data, dict):
         items = data.get("recently_added", [])
@@ -251,7 +237,6 @@ async def get_recently_added(count: int = 10) -> dict | None:
             base["episode"] = item.get("media_index") or item.get("episode")
             episodes.append(base)
         else:
-            # Ukendt type — læg i den mest sandsynlige liste baseret på felter
             if item.get("grandparent_title"):
                 base["grandparent_title"] = item.get("grandparent_title")
                 episodes.append(base)
@@ -279,9 +264,7 @@ async def get_activity() -> dict | None:
 # ---------------------------------------------------------------------------
 
 async def get_user_history(plex_username: str, length: int = 10) -> list | None:
-    """
-    Returns the most recent watch history entries for a user.
-    """
+    """Returns the most recent watch history entries for a user."""
     user_id = await get_tautulli_user_id(plex_username)
     if user_id is None:
         return None
