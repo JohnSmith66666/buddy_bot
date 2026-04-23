@@ -59,45 +59,31 @@ def _base_url() -> str:
 
 async def _get_seerr_status(tmdb_id: int, media_type: str) -> dict:
     """
-    Check the current status of a title in Seerr.
-
-    FIX: Uses GET /api/v1/media?tmdbId=X which is the correct endpoint.
-    The previous version used externalId/externalIdType which returned 400.
-
-    Returns a dict with:
-      seerr_status  → "queued" | "available" | "not_found" | "error"
-      media_status  → raw Seerr mediaStatus integer (if found)
+    Check status via /api/v1/request — /api/v1/media returnerer 400.
     """
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             resp = await client.get(
-                f"{_base_url()}/api/v1/media",
+                f"{_base_url()}/api/v1/request",
                 headers=_HEADERS,
-                params={"tmdbId": tmdb_id},
+                params={"take": 100, "skip": 0, "filter": "all"},
             )
-
-            if resp.status_code == 404:
-                return {"seerr_status": "not_found"}
-
             resp.raise_for_status()
             data = resp.json()
-
-            results = data.get("results", [])
-            if not results:
-                return {"seerr_status": "not_found"}
-
-            media_status = results[0].get("mediaInfo", {}).get("status", 1)
-
-            if media_status in _STATUS_AVAILABLE:
-                return {"seerr_status": "available", "media_status": media_status}
-            if media_status in _STATUS_QUEUED:
-                return {"seerr_status": "queued", "media_status": media_status}
-
-            return {"seerr_status": "not_found", "media_status": media_status}
-
         except httpx.HTTPError as e:
             logger.error("Seerr status check error (tmdb=%s): %s", tmdb_id, e)
-            return {"seerr_status": "error", "message": str(e)}
+            return {"seerr_status": "not_found"}
+
+    for item in data.get("results", []):
+        media = item.get("media", {}) or {}
+        if media.get("tmdbId") == tmdb_id:
+            status = media.get("status", 1)
+            if status in _STATUS_AVAILABLE:
+                return {"seerr_status": "available", "media_status": status}
+            if status in _STATUS_QUEUED:
+                return {"seerr_status": "queued", "media_status": status}
+
+    return {"seerr_status": "not_found"}
 
 
 async def _post_request(payload: dict) -> dict:
