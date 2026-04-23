@@ -1,16 +1,20 @@
 """
 services/seerr_service.py - Overseerr/Jellyseerr API integration.
 
-CHANGES vs previous version:
-  - _get_seerr_status() now uses GET /api/v1/media?tmdbId=X instead of
-    the incorrect externalId/externalIdType parameters that returned 400.
-
 Flow for every request:
-  1. GET /api/v1/media?tmdbId=X  → check current Seerr status
+  1. GET /api/v1/request → check current Seerr status via request list
   2. If already requested/processing → return early with clear status
   3. Otherwise → POST /api/v1/request
+
+TV payload krav (bekræftet via Seerr API):
+  - serverId: 0
+  - profileId: 7
+  - languageProfileId: 1
+  - rootFolder: tv_program → /mnt/unionfs/Media/TV/TV
+               standard   → /mnt/unionfs/Media/TV/Serier
 """
 
+import asyncio
 import logging
 
 import httpx
@@ -40,11 +44,6 @@ _MOVIE_ROOTS: dict[str, str] = {
     "standard":  ROOT_MOVIE_STANDARD,
 }
 
-_TV_ROOTS: dict[str, str] = {
-    "tv_program": ROOT_TV_PROGRAMMER,
-    "standard":   ROOT_TV_STANDARD,
-}
-
 # Seerr mediaStatus codes
 # 1 = Unknown, 2 = Pending, 3 = Processing, 4 = Partially Available, 5 = Available
 _STATUS_QUEUED    = {2, 3}
@@ -60,6 +59,10 @@ def _base_url() -> str:
 async def _get_seerr_status(tmdb_id: int, media_type: str) -> dict:
     """
     Check status via /api/v1/request — /api/v1/media returnerer 400.
+    Finder alle requests og tjekker om tmdb_id allerede er bestilt/tilgængelig.
+
+    Returns a dict with:
+      seerr_status  → "queued" | "available" | "not_found"
     """
     async with httpx.AsyncClient(timeout=10) as client:
         try:
@@ -177,7 +180,6 @@ async def request_movie(tmdb_id: int, category: str = "standard") -> dict:
         "serverId": 0,
         "profileId": 0,
         "is4k": False,
-        "isDefault": False,
     })
 
     if result.get("status") == "requested":
@@ -201,8 +203,11 @@ async def request_tv(
         category:       "tv_program" or "standard".
 
     Rodmappe-logik:
-        tv_program → /mnt/unionfs/Media/TV/TV   (reality, talkshow, nyheder, dokumentar)
-        standard   → /mnt/unionfs/Media/TV/Serier (fiktion, drama, krimi)
+        tv_program → /mnt/unionfs/Media/TV/TV      (reality, talkshow, nyheder, dokumentar)
+        standard   → /mnt/unionfs/Media/TV/Serier  (fiktion, drama, krimi)
+
+    Bekræftede Seerr API-parametre:
+        serverId: 0, profileId: 7, languageProfileId: 1
     """
     status = await _get_seerr_status(tmdb_id, "tv")
 
@@ -220,7 +225,7 @@ async def request_tv(
             "message": "Serien er allerede tilgængelig via Seerr.",
         }
 
-    # Rodmappe bestemmes af category — tv_program går i /TV, alt andet i /Serier
+    # Rodmappe bestemmes af category
     if category == "tv_program":
         root_folder = ROOT_TV_PROGRAMMER   # /mnt/unionfs/Media/TV/TV
     else:
@@ -230,6 +235,9 @@ async def request_tv(
 
     logger.info("Requesting TV tmdb_id=%s seasons=%s category=%s rootFolder=%s",
                 tmdb_id, seasons_payload, category, root_folder)
+
+    # Lille pause så Seerr når at indeksere mediet før POST
+    await asyncio.sleep(1)
 
     result = await _post_request({
         "mediaType": "tv",
