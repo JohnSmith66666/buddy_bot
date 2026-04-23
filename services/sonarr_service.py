@@ -1,7 +1,10 @@
 """
 services/sonarr_service.py - Direkte Sonarr API integration.
 
-Erstatter Seerr for serie-anmodninger.
+CHANGES vs previous version:
+  - add_series() har nu fallback til Sonarr titelsøgning hvis tvdb_id mangler.
+  - lookup_series() er udvidet til at søge på titel hvis tvdb_id er None/0.
+  - Brugeren får klar besked hvis hverken TMDB eller Sonarr kan finde serien.
 
 Sorteringslogik (rodmapper):
   - original_language == 'da' → /mnt/unionfs/Media/TV/TV   (dansk indhold)
@@ -9,7 +12,6 @@ Sorteringslogik (rodmapper):
 
 Tags:
   - Hver anmodning tildeles automatisk et tag med brugerens Plex-navn.
-  - Tagget oprettes i Sonarr hvis det ikke findes.
 """
 
 import logging
@@ -38,10 +40,7 @@ def _headers() -> dict:
 # ── Tag helpers ───────────────────────────────────────────────────────────────
 
 async def _get_or_create_tag(label: str) -> int | None:
-    """
-    Find Sonarr tag ID by label, or create it if it doesn't exist.
-    Returns the tag ID, or None on error.
-    """
+    """Find or create a Sonarr tag by label. Returns tag ID or None."""
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             resp = await client.get(f"{_base()}/api/v3/tag", headers=_headers())
@@ -49,8 +48,6 @@ async def _get_or_create_tag(label: str) -> int | None:
             for tag in resp.json():
                 if tag.get("label", "").lower() == label.lower():
                     return tag["id"]
-
-            # Tag not found — create it
             resp = await client.post(
                 f"{_base()}/api/v3/tag",
                 headers=_headers(),
@@ -68,10 +65,7 @@ async def _get_or_create_tag(label: str) -> int | None:
 # ── Library check ─────────────────────────────────────────────────────────────
 
 async def check_sonarr_library(tvdb_id: int) -> dict:
-    """
-    Check if a series is already in Sonarr.
-    Returns: {"status": "found"|"missing"|"monitored_only", "title": ...}
-    """
+    """Check if a series is already in Sonarr."""
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             resp = await client.get(
@@ -87,7 +81,6 @@ async def check_sonarr_library(tvdb_id: int) -> dict:
 
     if not series_list:
         return {"status": "missing"}
-
     series = series_list[0]
     stats = series.get("statistics", {})
     if stats.get("episodeFileCount", 0) > 0:
@@ -95,10 +88,10 @@ async def check_sonarr_library(tvdb_id: int) -> dict:
     return {"status": "monitored_only", "title": series.get("title"), "year": series.get("year")}
 
 
-# ── TVDB ID lookup ────────────────────────────────────────────────────────────
+# ── Lookup helpers ────────────────────────────────────────────────────────────
 
 async def lookup_series(tvdb_id: int) -> dict | None:
-    """Look up a series in Sonarr's lookup endpoint by TVDB ID."""
+    """Look up a series in Sonarr by TVDB ID."""
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             resp = await client.get(
@@ -110,14 +103,58 @@ async def lookup_series(tvdb_id: int) -> dict | None:
             results = resp.json()
             return results[0] if results else None
         except httpx.HTTPError as e:
-            logger.error("Sonarr lookup error: %s", e)
+            logger.error("Sonarr lookup error (tvdb_id=%s): %s", tvdb_id, e)
             return None
+
+
+async def _lookup_series_by_title(title: str) -> dict | None:
+    """
+    Fallback: søg Sonarr efter seriens titel og returner første match.
+    Sonarr bruger SkyHook som kilde og finder ofte serier som TMDB mangler TVDB ID på.
+    """
+    logger.info("Sonarr: TVDB ID missing, attempting title search fallback for '%s'", title)
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(
+                f"{_base()}/api/v3/series/lookup",
+                headers=_headers(),
+                params={"term": title},
+            )
+            resp.raise_for_status()
+            results = resp.json()
+        except httpx.HTTPError as e:
+            logger.error("Sonarr title lookup error for '%s': %s", title, e)
+            return None
+
+    if not results:
+        logger.warning("Sonarr title search returned 0 results for '%s'", title)
+        return None
+
+    # Forsøg præcist match først
+    title_lower = title.lower()
+    for result in results:
+        sonarr_title = (result.get("title") or "").lower()
+        if sonarr_title == title_lower:
+            tvdb_id = result.get("tvdbId")
+            logger.info(
+                "Sonarr title search exact match: '%s' → tvdb_id=%s",
+                result.get("title"), tvdb_id,
+            )
+            return result
+
+    # Ellers tag første resultat
+    first = results[0]
+    logger.info(
+        "Sonarr title search best match: '%s' → tvdb_id=%s",
+        first.get("title"), first.get("tvdbId"),
+    )
+    return first
 
 
 # ── Add series ────────────────────────────────────────────────────────────────
 
 async def add_series(
-    tvdb_id: int,
+    tvdb_id: int | None,
     title: str,
     year: int,
     original_language: str,
@@ -130,61 +167,70 @@ async def add_series(
     Rodmappe-logik:
       - original_language == 'da' → ROOT_TV_DANSK    (/mnt/unionfs/Media/TV/TV)
       - else                      → ROOT_TV_STANDARD (/mnt/unionfs/Media/TV/Serier)
+
+    TVDB ID fallback:
+      1. Brug tvdb_id fra TMDB hvis tilgængeligt.
+      2. Hvis mangler: søg Sonarr på titel (SkyHook-kilde).
+      3. Hvis stadig ingen match: returner brugervenlig fejl.
     """
-    # Determine root folder
+    # ── Trin 1: Hent lookup-data fra Sonarr ──────────────────────────────────
+    lookup = None
+
+    if tvdb_id:
+        lookup = await lookup_series(tvdb_id)
+        if lookup:
+            logger.info("Sonarr: found series via tvdb_id=%s", tvdb_id)
+
+    # ── Trin 2: Fallback til titelsøgning ────────────────────────────────────
+    if not lookup:
+        lookup = await _lookup_series_by_title(title)
+
+    # ── Trin 3: Giv op hvis ingenting fandt serien ───────────────────────────
+    if not lookup:
+        return {
+            "success": False,
+            "status": "not_found",
+            "message": (
+                f"Jeg kunne desværre ikke finde de nødvendige tekniske data på "
+                f"'{title}' lige nu. Prøv igen om et par dage, "
+                f"når den er oprettet i de store databaser."
+            ),
+        }
+
+    # Brug tvdb_id fra Sonarr-lookup hvis vi ikke havde et fra TMDB
+    resolved_tvdb_id = lookup.get("tvdbId") or tvdb_id
+    logger.info(
+        "Sonarr: resolved tvdb_id=%s for '%s'", resolved_tvdb_id, title
+    )
+
+    # ── Rodmappe og tags ──────────────────────────────────────────────────────
     if original_language == "da":
         root_folder = ROOT_TV_DANSK
     else:
         root_folder = ROOT_TV_STANDARD
 
-    # Resolve tag
     tag_ids = []
     if plex_username:
         tag_id = await _get_or_create_tag(plex_username)
         if tag_id is not None:
             tag_ids = [tag_id]
 
+    seasons = [{"seasonNumber": s, "monitored": True} for s in season_numbers]
+
     logger.info(
-        "Sonarr: adding series tvdb_id=%s title='%s' lang=%s rootFolder=%s seasons=%s tags=%s",
-        tvdb_id, title, original_language, root_folder, season_numbers, tag_ids,
+        "Sonarr: adding '%s' tvdb_id=%s lang=%s rootFolder=%s seasons=%s tags=%s",
+        title, resolved_tvdb_id, original_language, root_folder, season_numbers, tag_ids,
     )
 
-    # Build season list — all seasons monitored
-    seasons = [
-        {"seasonNumber": s, "monitored": True}
-        for s in season_numbers
-    ]
-
-    # Tjek at tvdb_id er gyldigt — Sonarr kræver det
-    if not tvdb_id:
-        return {
-            "success": False,
-            "status": "missing_tvdb_id",
-            "message": (
-                f"Serien '{title}' mangler et TVDB ID og kan desværre ikke tilføjes lige nu. "
-                "Dette sker typisk for meget nye eller sjældne titler. "
-                "Prøv igen om et par dage når databasen er opdateret."
-            ),
-        }
-
-    # Fetch full series data from Sonarr lookup for required fields
-    lookup = await lookup_series(tvdb_id)
-    if not lookup:
-        return {
-            "success": False,
-            "status": "lookup_failed",
-            "message": f"Kunne ikke finde serien i Sonarr's database (tvdb_id={tvdb_id}).",
-        }
-
-    # Merge lookup data with our overrides
+    # ── Byg payload fra Sonarr lookup-data ───────────────────────────────────
     payload = {
         **lookup,
         "qualityProfileId": SONARR_QUALITY_PROFILE_ID,
-        "rootFolderPath": root_folder,
-        "monitored": True,
-        "seasonFolder": True,
-        "tags": tag_ids,
-        "seasons": seasons,
+        "rootFolderPath":   root_folder,
+        "monitored":        True,
+        "seasonFolder":     True,
+        "tags":             tag_ids,
+        "seasons":          seasons,
         "addOptions": {
             "searchForMissingEpisodes": True,
             "monitor": "all",
@@ -205,9 +251,9 @@ async def add_series(
                 season_str = ", ".join(str(s) for s in season_numbers)
                 return {
                     "success": True,
-                    "status": "added",
+                    "status":  "added",
                     "sonarr_id": body.get("id"),
-                    "title": body.get("title"),
+                    "title":     body.get("title"),
                     "root_folder": root_folder,
                     "seasons_requested": season_numbers,
                     "message": (
@@ -218,11 +264,19 @@ async def add_series(
 
             if resp.status_code == 400:
                 body = resp.json()
-                logger.warning("Sonarr 400 response: %s", body)
+                logger.warning("Sonarr 400: %s", body)
+                # Tjek om det skyldes at serien allerede eksisterer
+                errors = body if isinstance(body, list) else [body]
+                if any("already" in str(e).lower() or "exists" in str(e).lower() for e in errors):
+                    return {
+                        "success": False,
+                        "status":  "already_exists",
+                        "message": f"'{title}' er allerede i Sonarr.",
+                    }
                 return {
                     "success": False,
-                    "status": "already_exists",
-                    "message": "Serien er allerede i Sonarr.",
+                    "status":  "bad_request",
+                    "message": f"Sonarr afviste anmodningen for '{title}'.",
                 }
 
             resp.raise_for_status()
@@ -231,14 +285,14 @@ async def add_series(
             logger.error("Sonarr HTTP error: %s — body: %s", e, e.response.text)
             return {
                 "success": False,
-                "status": "error",
+                "status":  "error",
                 "message": f"Sonarr fejl: HTTP {e.response.status_code}",
             }
         except httpx.HTTPError as e:
             logger.error("Sonarr connection error: %s", e)
             return {
                 "success": False,
-                "status": "connection_error",
+                "status":  "connection_error",
                 "message": "Kunne ikke forbinde til Sonarr.",
             }
 
