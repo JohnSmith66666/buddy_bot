@@ -9,11 +9,13 @@ Korrekte parametre (bekræftet via debug-logs 2026-04-23):
 - get_home_stats uden user_id: bruger `time_range` + stats_count (server-wide trends)
 - get_recently_added        : bruger `count`
 - Tid returneres i SEKUNDER — skal divideres med 3600 for timer, 60 for minutter.
+- added_at returneres som Unix timestamp — konverteres til ISO-dato og filtreres her.
 """
 
 import logging
 import config
 import httpx
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +142,6 @@ def _extract_rows(data, stat_id: str) -> list | None:
     """Udtræk rows fra get_home_stats response."""
     if not data:
         return None
-
     if isinstance(data, list):
         for block in data:
             if stat_id in (block.get("stat_id") or ""):
@@ -149,10 +150,8 @@ def _extract_rows(data, stat_id: str) -> list | None:
             rows = data[0].get("rows")
             if rows is not None:
                 return rows
-
     if isinstance(data, dict):
         return data.get("rows") or []
-
     return None
 
 
@@ -164,15 +163,10 @@ async def get_popular_on_plex(stats_count: int = 10, time_range: int = 30) -> di
     """
     Returns the most popular content on the Plex server globally.
     Strips users_watched, total_plays og total_duration før data sendes til AI.
-
-    Args:
-        stats_count : Antal resultater per kategori (default 10).
-        time_range  : Antal dage der kigges tilbage (default 30).
-                      Videregives direkte fra Buddy — fx 7 for 'denne uge'.
     """
     data = await _tautulli_get({
         "cmd": "get_home_stats",
-        "time_range": time_range,   # Bruger den faktiske værdi fra Buddy — ikke hardcoded!
+        "time_range": time_range,
         "stats_count": stats_count,
     })
 
@@ -199,7 +193,12 @@ async def get_popular_on_plex(stats_count: int = 10, time_range: int = 30) -> di
 async def get_recently_added(count: int = 10) -> dict | None:
     """
     Returns the most recently added content on the Plex server.
-    Adskiller film og serier i to separate lister for nem præsentation.
+
+    FIX: added_at fra Tautulli er et Unix timestamp (sekunder siden 1970).
+    Vi konverterer det til ISO-dato og tilføjer added_at_readable så Buddy
+    kan filtrere og præsentere datoer korrekt — fx "tilføjet 18. april 2026".
+
+    Returnerer film og serier i to adskilte lister.
     """
     data = await _tautulli_get({
         "cmd": "get_recently_added",
@@ -215,18 +214,35 @@ async def get_recently_added(count: int = 10) -> dict | None:
     elif isinstance(data, list):
         items = data
 
+    now = datetime.now(timezone.utc)
     movies = []
     episodes = []
 
     for item in items:
         media_type = item.get("media_type", "")
+
+        # FIX: Konverter Unix timestamp til læsbar dato
+        added_at_raw = item.get("added_at")
+        added_at_iso = None
+        added_at_readable = None
+        days_ago = None
+        try:
+            if added_at_raw:
+                dt = datetime.fromtimestamp(int(added_at_raw), tz=timezone.utc)
+                added_at_iso = dt.strftime("%Y-%m-%d")
+                added_at_readable = dt.strftime("%-d. %B %Y")
+                days_ago = (now - dt).days
+        except Exception:
+            pass
+
         base = {
-            "title":      item.get("title") or item.get("full_title") or "Ukendt",
-            "year":       item.get("year"),
-            "added_at":   item.get("added_at"),
-            "rating_key": item.get("rating_key"),
-            "thumb":      item.get("thumb"),
-            "media_type": media_type,
+            "title":            item.get("title") or item.get("full_title") or "Ukendt",
+            "year":             item.get("year"),
+            "added_at":         added_at_iso,       # "2026-04-18"
+            "added_at_readable": added_at_readable, # "18. april 2026"
+            "days_ago":         days_ago,           # 5
+            "rating_key":       item.get("rating_key"),
+            "media_type":       media_type,
         }
 
         if media_type == "movie":
@@ -244,9 +260,10 @@ async def get_recently_added(count: int = 10) -> dict | None:
                 movies.append(base)
 
     return {
-        "movies":   movies[:count],
-        "episodes": episodes[:count],
-        "total":    len(movies) + len(episodes),
+        "movies":        movies[:count],
+        "episodes":      episodes[:count],
+        "total":         len(movies) + len(episodes),
+        "fetched_at":    now.strftime("%Y-%m-%d"),
     }
 
 
