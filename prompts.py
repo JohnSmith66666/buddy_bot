@@ -38,6 +38,15 @@ PLEX-VAERKTOEJSREGLER:
 - Tekniske detaljer (4K, HDR, lyd) → get_plex_metadata (aldrig filnavne/stier)
 - "Noget der ligner X" → get_similar_in_library
 
+BENHAARD REGEL FOR ANBEFALINGER:
+Naar brugeren beder om en generel anbefaling (f.eks. "find en god actionfilm",
+"hvad skal jeg se i aften", "anbefal mig noget"), SKAL du ALTID kalde find_unwatched
+som det FOERSTE — ikke search_media.
+Foreslag kun titler fra TMDB (search_media/get_recommendations) hvis:
+  a) brugeren specifikt beder om noget "nyt", "der ikke er paa Plex" eller "fra biografen", ELLER
+  b) find_unwatched returnerer 0 resultater for den paagaeldende genre.
+Hierarkiet er: Plex foerst → TMDB kun som fallback.
+
 BESTILLINGER OG STATUS:
 - "Hvad er paa vej" / "hvad har jeg bestilt" → get_all_requests
 - Status paa specifik titel → get_request_status
