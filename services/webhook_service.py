@@ -1,18 +1,20 @@
 """
 services/webhook_service.py - Webhook handler for Radarr og Sonarr notifikationer.
 
-Når Radarr eller Sonarr sender en "On Import" webhook, finder vi alle brugere
+Når Radarr eller Sonarr sender en webhook, finder vi alle brugere
 med et matchende tag og sender dem en Telegram-besked.
 
 Setup i Radarr/Sonarr:
   Settings → Connect → Webhook
   URL: https://<din-railway-url>/webhook/radarr  (eller /webhook/sonarr)
-  Trigger: On Import
+  Triggers: On Import, On Download
+
+VIGTIGT: Fjern "Test" fra _ACCEPTED_RADARR og _ACCEPTED_SONARR når
+test er bekræftet at virke — ellers sender botten besked ved hver test-klik.
 """
 
 import logging
 
-import httpx
 from telegram import Bot
 
 from config import TELEGRAM_BOT_TOKEN
@@ -22,92 +24,110 @@ logger = logging.getLogger(__name__)
 
 _bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
+# Accepterede event types — fjern "Test" efter verifikation
+_ACCEPTED_RADARR = {"Download", "MovieAdded", "Test"}
+_ACCEPTED_SONARR = {"Download", "EpisodeFileImported", "Test"}
+
 
 async def handle_radarr_webhook(payload: dict) -> None:
-    """
-    Process an incoming Radarr webhook.
-    Sends a Telegram notification to all users tagged in the movie.
-    """
+    """Process an incoming Radarr webhook."""
     event_type = payload.get("eventType", "")
-    if event_type not in ("Download", "MovieAdded"):
+    if event_type not in _ACCEPTED_RADARR:
         logger.debug("Radarr webhook ignored: eventType=%s", event_type)
         return
 
-    movie = payload.get("movie", {})
-    title = movie.get("title", "Ukendt film")
+    movie = payload.get("movie", {}) or {}
+    title = movie.get("title", "Testfilm")
     year  = movie.get("year", "")
+    tags  = movie.get("tags", [])
 
-    tags = payload.get("movie", {}).get("tags", [])
-    logger.info("Radarr webhook: '%s' (%s) — tags=%s", title, year, tags)
+    logger.info("Radarr webhook: eventType=%s title='%s' tags=%s", event_type, title, tags)
 
-    await _notify_tagged_users(
-        tags=tags,
-        message=f"🍿 *{title}* ({year}) er nu klar på Plex\\! Rigtig god fornøjelse\\!",
-    )
+    message = f"🍿 *{title}*"
+    if year:
+        message += f" \\({year}\\)"
+    message += " er nu klar på Plex\\! Rigtig god fornøjelse\\!"
+
+    await _notify_users(tags=tags, message=message, send_to_all_on_empty=True)
 
 
 async def handle_sonarr_webhook(payload: dict) -> None:
-    """
-    Process an incoming Sonarr webhook.
-    Sends a Telegram notification to all users tagged in the series.
-    """
+    """Process an incoming Sonarr webhook."""
     event_type = payload.get("eventType", "")
-    if event_type not in ("Download", "EpisodeFileImported"):
+    if event_type not in _ACCEPTED_SONARR:
         logger.debug("Sonarr webhook ignored: eventType=%s", event_type)
         return
 
-    series  = payload.get("series", {})
-    episode = payload.get("episodes", [{}])[0] if payload.get("episodes") else {}
-    title   = series.get("title", "Ukendt serie")
-    season  = episode.get("seasonNumber", "?")
-    ep_num  = episode.get("episodeNumber", "?")
+    series   = payload.get("series", {}) or {}
+    episodes = payload.get("episodes", [{}])
+    episode  = episodes[0] if episodes else {}
+
+    title    = series.get("title", "Testserie")
+    season   = episode.get("seasonNumber", "?")
+    ep_num   = episode.get("episodeNumber", "?")
     ep_title = episode.get("title", "")
+    tags     = series.get("tags", [])
 
-    tags = series.get("tags", [])
-    logger.info("Sonarr webhook: '%s' S%sE%s — tags=%s", title, season, ep_num, tags)
+    logger.info("Sonarr webhook: eventType=%s title='%s' tags=%s", event_type, title, tags)
 
-    ep_str = f"S{season:02d}E{ep_num:02d}" if isinstance(season, int) else f"S{season}E{ep_num}"
-    msg = f"📺 *{title}* — {ep_str}"
+    try:
+        ep_str = f"S{int(season):02d}E{int(ep_num):02d}"
+    except (ValueError, TypeError):
+        ep_str = f"S{season}E{ep_num}"
+
+    message = f"📺 *{title}* — {ep_str}"
     if ep_title:
-        msg += f" \"{ep_title}\""
-    msg += " er nu klar på Plex\\! Rigtig god fornøjelse\\! 🍿"
+        safe_ep = ep_title.replace("!", "\\!").replace(".", "\\.").replace("-", "\\-")
+        message += f" _{safe_ep}_"
+    message += " er nu klar på Plex\\! Rigtig god fornøjelse\\! 🍿"
 
-    await _notify_tagged_users(tags=tags, message=msg)
+    await _notify_users(tags=tags, message=message, send_to_all_on_empty=True)
 
 
-async def _notify_tagged_users(tags: list, message: str) -> None:
+async def _notify_users(
+    tags: list,
+    message: str,
+    send_to_all_on_empty: bool = False,
+) -> None:
     """
-    Look up all whitelisted users whose plex_username matches one of the tags,
-    and send them a Telegram message.
+    Send Telegram notification to users whose plex_username matches a tag.
+
+    If tags is empty and send_to_all_on_empty is True, notify all
+    whitelisted users (used for test events where Radarr sends no tags).
     """
-    if not tags:
-        logger.info("Webhook: ingen tags — sender ingen notifikation")
+    all_users = await database.get_all_whitelisted_users()
+
+    if not tags and send_to_all_on_empty:
+        logger.info("Webhook: ingen tags — sender til alle %d whitelisted brugere", len(all_users))
+        recipients = all_users
+    else:
+        tag_labels = {str(t).lower() for t in tags}
+        recipients = [
+            u for u in all_users
+            if (u.get("plex_username") or "").lower() in tag_labels
+        ]
+
+    if not recipients:
+        logger.info("Webhook: ingen matchende brugere fundet for tags=%s", tags)
         return
 
-    # tags kan være enten strenge (labels) eller integers (IDs fra Radarr/Sonarr)
-    tag_labels = [str(t).lower() for t in tags]
-
-    all_users = await database.get_all_whitelisted_users()
     notified = 0
-
-    for user in all_users:
-        plex_username = user.get("plex_username") or ""
-        if plex_username.lower() in tag_labels:
-            try:
-                await _bot.send_message(
-                    chat_id=user["telegram_id"],
-                    text=message,
-                    parse_mode="MarkdownV2",
-                )
-                notified += 1
-                logger.info(
-                    "Webhook notification sent to telegram_id=%s (plex='%s')",
-                    user["telegram_id"], plex_username,
-                )
-            except Exception as e:
-                logger.error(
-                    "Failed to notify telegram_id=%s: %s",
-                    user["telegram_id"], e,
-                )
+    for user in recipients:
+        try:
+            await _bot.send_message(
+                chat_id=user["telegram_id"],
+                text=message,
+                parse_mode="MarkdownV2",
+            )
+            notified += 1
+            logger.info(
+                "Webhook notification sent to telegram_id=%s (plex='%s')",
+                user["telegram_id"], user.get("plex_username"),
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to notify telegram_id=%s: %s",
+                user["telegram_id"], e,
+            )
 
     logger.info("Webhook: notified %d user(s)", notified)
