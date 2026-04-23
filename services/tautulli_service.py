@@ -206,13 +206,33 @@ async def get_recently_added(count: int = 10) -> dict | None:
     })
 
     if not data:
+        logger.error("get_recently_added: Tautulli returnerede ingen data")
         return None
+
+    # DEBUG: Log hvad Tautulli faktisk returnerer så vi kan se strukturen
+    logger.info(
+        "get_recently_added raw: type=%s, keys=%s, sample=%s",
+        type(data).__name__,
+        list(data.keys()) if isinstance(data, dict) else f"list[{len(data)}]",
+        str(data[0])[:150] if isinstance(data, list) and data else
+        str({k: v for k, v in list(data.items())[:3]}) if isinstance(data, dict) else "tom",
+    )
 
     items = []
     if isinstance(data, dict):
-        items = data.get("recently_added", [])
+        # Tautulli kan bruge forskellige nøgler — prøv alle kendte varianter
+        items = (
+            data.get("recently_added")
+            or data.get("data")
+            or data.get("results")
+            or []
+        )
+        if not items:
+            logger.warning("get_recently_added: dict uden kendte nøgler. Keys: %s", list(data.keys()))
     elif isinstance(data, list):
         items = data
+
+    logger.info("get_recently_added: %d elementer fundet efter parsing", len(items))
 
     now = datetime.now(timezone.utc)
     movies = []
@@ -259,12 +279,20 @@ async def get_recently_added(count: int = 10) -> dict | None:
             else:
                 movies.append(base)
 
-    return {
+    result = {
         "movies":        movies[:count],
         "episodes":      episodes[:count],
         "total":         len(movies) + len(episodes),
         "fetched_at":    now.strftime("%Y-%m-%d"),
     }
+
+    # Hvis parsing gav 0 resultater men vi fik data, send raw så Buddy
+    # ikke siger "teknisk fejl" — han kan se at der ikke er noget nyt.
+    if result["total"] == 0 and items:
+        logger.warning("get_recently_added: %d items modtaget men 0 parset. Første item: %s", len(items), str(items[0])[:200])
+        result["raw_sample"] = str(items[0])[:300] if items else None
+
+    return result
 
 
 # ---------------------------------------------------------------------------
