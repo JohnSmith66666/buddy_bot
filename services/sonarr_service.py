@@ -155,6 +155,18 @@ async def add_series(
         for s in season_numbers
     ]
 
+    # Tjek at tvdb_id er gyldigt — Sonarr kræver det
+    if not tvdb_id:
+        return {
+            "success": False,
+            "status": "missing_tvdb_id",
+            "message": (
+                f"Serien '{title}' mangler et TVDB ID og kan desværre ikke tilføjes lige nu. "
+                "Dette sker typisk for meget nye eller sjældne titler. "
+                "Prøv igen om et par dage når databasen er opdateret."
+            ),
+        }
+
     # Fetch full series data from Sonarr lookup for required fields
     lookup = await lookup_series(tvdb_id)
     if not lookup:
