@@ -2,16 +2,17 @@
 services/sonarr_service.py - Direkte Sonarr API integration.
 
 CHANGES vs previous version:
-  - add_series() har nu fallback til Sonarr titelsøgning hvis tvdb_id mangler.
-  - lookup_series() er udvidet til at søge på titel hvis tvdb_id er None/0.
-  - Brugeren får klar besked hvis hverken TMDB eller Sonarr kan finde serien.
+  - Tag-strategi ændret: bruger nu telegram_id-baserede tags (tg_<id>)
+    i stedet for plex_username. Dette gør det muligt for webhook_service
+    at udtrække telegram_id direkte fra tag-labelnavnet uden DB-opslag.
+  - add_series() tager nu telegram_id (int) i stedet for plex_username.
+  - get_all_tags() tilføjet — bruges af webhook_service til at resolve
+    integer tag-IDs fra Sonarr-payloadet til label-navne.
+  - Fallback til Sonarr titelsøgning hvis tvdb_id mangler — uændret.
 
 Sorteringslogik (rodmapper):
   - original_language == 'da' → /mnt/unionfs/Media/TV/TV   (dansk indhold)
   - alt andet                 → /mnt/unionfs/Media/TV/Serier
-
-Tags:
-  - Hver anmodning tildeles automatisk et tag med brugerens Plex-navn.
 """
 
 import logging
@@ -60,6 +61,21 @@ async def _get_or_create_tag(label: str) -> int | None:
         except httpx.HTTPError as e:
             logger.error("Sonarr tag error: %s", e)
             return None
+
+
+async def get_all_tags() -> dict[int, str]:
+    """
+    Return a mapping of {tag_id: label} for all tags in Sonarr.
+    Used by webhook_service to resolve integer tag IDs to labels.
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(f"{_base()}/api/v3/tag", headers=_headers())
+            resp.raise_for_status()
+            return {t["id"]: t["label"] for t in resp.json()}
+        except httpx.HTTPError as e:
+            logger.error("Sonarr get_all_tags error: %s", e)
+            return {}
 
 
 # ── Library check ─────────────────────────────────────────────────────────────
@@ -130,24 +146,16 @@ async def _lookup_series_by_title(title: str) -> dict | None:
         logger.warning("Sonarr title search returned 0 results for '%s'", title)
         return None
 
-    # Forsøg præcist match først
     title_lower = title.lower()
     for result in results:
-        sonarr_title = (result.get("title") or "").lower()
-        if sonarr_title == title_lower:
-            tvdb_id = result.get("tvdbId")
-            logger.info(
-                "Sonarr title search exact match: '%s' → tvdb_id=%s",
-                result.get("title"), tvdb_id,
-            )
+        if (result.get("title") or "").lower() == title_lower:
+            logger.info("Sonarr title search exact match: '%s' → tvdb_id=%s",
+                        result.get("title"), result.get("tvdbId"))
             return result
 
-    # Ellers tag første resultat
     first = results[0]
-    logger.info(
-        "Sonarr title search best match: '%s' → tvdb_id=%s",
-        first.get("title"), first.get("tvdbId"),
-    )
+    logger.info("Sonarr title search best match: '%s' → tvdb_id=%s",
+                first.get("title"), first.get("tvdbId"))
     return first
 
 
@@ -159,21 +167,23 @@ async def add_series(
     year: int,
     original_language: str,
     season_numbers: list[int],
-    plex_username: str | None = None,
+    telegram_id: int | None = None,
 ) -> dict:
     """
     Add a series to Sonarr.
 
+    Tag-strategi: opretter/henter tagget "tg_<telegram_id>" så webhook_service
+    kan udtrække telegram_id direkte fra label-navnet uden DB-opslag.
+
     Rodmappe-logik:
-      - original_language == 'da' → ROOT_TV_DANSK    (/mnt/unionfs/Media/TV/TV)
-      - else                      → ROOT_TV_STANDARD (/mnt/unionfs/Media/TV/Serier)
+      - original_language == 'da' → ROOT_TV_DANSK
+      - else                      → ROOT_TV_STANDARD
 
     TVDB ID fallback:
       1. Brug tvdb_id fra TMDB hvis tilgængeligt.
       2. Hvis mangler: søg Sonarr på titel (SkyHook-kilde).
       3. Hvis stadig ingen match: returner brugervenlig fejl.
     """
-    # ── Trin 1: Hent lookup-data fra Sonarr ──────────────────────────────────
     lookup = None
 
     if tvdb_id:
@@ -181,11 +191,9 @@ async def add_series(
         if lookup:
             logger.info("Sonarr: found series via tvdb_id=%s", tvdb_id)
 
-    # ── Trin 2: Fallback til titelsøgning ────────────────────────────────────
     if not lookup:
         lookup = await _lookup_series_by_title(title)
 
-    # ── Trin 3: Giv op hvis ingenting fandt serien ───────────────────────────
     if not lookup:
         return {
             "success": False,
@@ -197,21 +205,15 @@ async def add_series(
             ),
         }
 
-    # Brug tvdb_id fra Sonarr-lookup hvis vi ikke havde et fra TMDB
     resolved_tvdb_id = lookup.get("tvdbId") or tvdb_id
-    logger.info(
-        "Sonarr: resolved tvdb_id=%s for '%s'", resolved_tvdb_id, title
-    )
+    logger.info("Sonarr: resolved tvdb_id=%s for '%s'", resolved_tvdb_id, title)
 
-    # ── Rodmappe og tags ──────────────────────────────────────────────────────
-    if original_language == "da":
-        root_folder = ROOT_TV_DANSK
-    else:
-        root_folder = ROOT_TV_STANDARD
+    root_folder = ROOT_TV_DANSK if original_language == "da" else ROOT_TV_STANDARD
 
     tag_ids = []
-    if plex_username:
-        tag_id = await _get_or_create_tag(plex_username)
+    if telegram_id:
+        tag_label = f"tg_{telegram_id}"
+        tag_id = await _get_or_create_tag(tag_label)
         if tag_id is not None:
             tag_ids = [tag_id]
 
@@ -222,7 +224,6 @@ async def add_series(
         title, resolved_tvdb_id, original_language, root_folder, season_numbers, tag_ids,
     )
 
-    # ── Byg payload fra Sonarr lookup-data ───────────────────────────────────
     payload = {
         **lookup,
         "qualityProfileId": SONARR_QUALITY_PROFILE_ID,
@@ -256,16 +257,11 @@ async def add_series(
                     "title":     body.get("title"),
                     "root_folder": root_folder,
                     "seasons_requested": season_numbers,
-                    "message": (
-                        f"Serien er tilføjet og søges nu! "
-                        f"(Sæson {season_str}) 📺"
-                    ),
+                    "message": f"Serien er tilføjet og søges nu! (Sæson {season_str}) 📺",
                 }
 
             if resp.status_code == 400:
                 body = resp.json()
-                logger.warning("Sonarr 400: %s", body)
-                # Tjek om det skyldes at serien allerede eksisterer
                 errors = body if isinstance(body, list) else [body]
                 if any("already" in str(e).lower() or "exists" in str(e).lower() for e in errors):
                     return {
@@ -273,11 +269,6 @@ async def add_series(
                         "status":  "already_exists",
                         "message": f"'{title}' er allerede i Sonarr.",
                     }
-                return {
-                    "success": False,
-                    "status":  "bad_request",
-                    "message": f"Sonarr afviste anmodningen for '{title}'.",
-                }
 
             resp.raise_for_status()
 
@@ -285,14 +276,14 @@ async def add_series(
             logger.error("Sonarr HTTP error: %s — body: %s", e, e.response.text)
             return {
                 "success": False,
-                "status":  "error",
+                "status": "error",
                 "message": f"Sonarr fejl: HTTP {e.response.status_code}",
             }
         except httpx.HTTPError as e:
             logger.error("Sonarr connection error: %s", e)
             return {
                 "success": False,
-                "status":  "connection_error",
+                "status": "connection_error",
                 "message": "Kunne ikke forbinde til Sonarr.",
             }
 

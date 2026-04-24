@@ -1,15 +1,16 @@
 """
 services/radarr_service.py - Direkte Radarr API integration.
 
-Erstatter Seerr for film-anmodninger.
+CHANGES vs previous version:
+  - Tag-strategi ændret: bruger nu telegram_id-baserede tags (tg_<id>)
+    i stedet for plex_username. Dette gør det muligt for webhook_service
+    at udtrække telegram_id direkte fra tag-labelnavnet uden DB-opslag.
+  - add_movie() tager nu telegram_id (int) i stedet for plex_username.
+  - _get_or_create_tag() er uændret i logik, men kaldes med "tg_<id>".
 
 Sorteringslogik (rodmapper):
   - genre indeholder 'Animation' → /mnt/unionfs/Media/Movies/Animation
   - alt andet                    → /mnt/unionfs/Media/Movies/Film
-
-Tags:
-  - Hver anmodning tildeles automatisk et tag med brugerens Plex-navn.
-  - Tagget oprettes i Radarr hvis det ikke findes.
 """
 
 import logging
@@ -65,6 +66,21 @@ async def _get_or_create_tag(label: str) -> int | None:
             return None
 
 
+async def get_all_tags() -> dict[int, str]:
+    """
+    Return a mapping of {tag_id: label} for all tags in Radarr.
+    Used by webhook_service to resolve integer tag IDs to labels.
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(f"{_base()}/api/v3/tag", headers=_headers())
+            resp.raise_for_status()
+            return {t["id"]: t["label"] for t in resp.json()}
+        except httpx.HTTPError as e:
+            logger.error("Radarr get_all_tags error: %s", e)
+            return {}
+
+
 # ── Library check ─────────────────────────────────────────────────────────────
 
 async def check_radarr_library(tmdb_id: int) -> dict:
@@ -101,26 +117,28 @@ async def add_movie(
     title: str,
     year: int,
     genres: list[str],
-    plex_username: str | None = None,
+    telegram_id: int | None = None,
 ) -> dict:
     """
     Add a movie to Radarr.
+
+    Tag-strategi: opretter/henter tagget "tg_<telegram_id>" så webhook_service
+    kan udtrække telegram_id direkte fra label-navnet uden DB-opslag.
 
     Rodmappe-logik:
       - 'Animation' in genres → ROOT_MOVIE_ANIMATION
       - else                  → ROOT_MOVIE_STANDARD
     """
-    # Determine root folder
     genre_names_lower = [g.lower() for g in genres]
     if "animation" in genre_names_lower:
         root_folder = ROOT_MOVIE_ANIMATION
     else:
         root_folder = ROOT_MOVIE_STANDARD
 
-    # Resolve tag
     tag_ids = []
-    if plex_username:
-        tag_id = await _get_or_create_tag(plex_username)
+    if telegram_id:
+        tag_label = f"tg_{telegram_id}"
+        tag_id = await _get_or_create_tag(tag_label)
         if tag_id is not None:
             tag_ids = [tag_id]
 
@@ -136,9 +154,7 @@ async def add_movie(
         "qualityProfileId": RADARR_QUALITY_PROFILE_ID,
         "rootFolderPath": root_folder,
         "monitored": True,
-        "addOptions": {
-            "searchForMovie": True,
-        },
+        "addOptions": {"searchForMovie": True},
         "tags": tag_ids,
     }
 
@@ -159,12 +175,11 @@ async def add_movie(
                     "radarr_id": body.get("id"),
                     "title": body.get("title"),
                     "root_folder": root_folder,
-                    "message": f"Filmen er tilføjet til køen og søges nu! 🎬",
+                    "message": "Filmen er tilføjet til køen og søges nu! 🎬",
                 }
 
             if resp.status_code == 400:
                 body = resp.json()
-                # Already exists in Radarr
                 if any("already" in str(e).lower() for e in body):
                     return {
                         "success": False,
@@ -192,7 +207,7 @@ async def add_movie(
     return {"success": False, "status": "unknown_error", "message": "Ukendt fejl."}
 
 
-# ── Get queue / history ───────────────────────────────────────────────────────
+# ── Get queue ─────────────────────────────────────────────────────────────────
 
 async def get_radarr_queue() -> list:
     """Return current Radarr download queue."""

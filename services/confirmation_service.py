@@ -2,14 +2,12 @@
 services/confirmation_service.py - Inline keyboard bekræftelsesflow.
 
 CHANGES vs previous version:
-  - show_confirmation() gemmer nu trailer_url fra TMDB-detaljerne i
-    pending-data (new_token), så den er tilgængelig til knappen.
-  - Keyboard i show_confirmation() har fået en "🎬 Se Trailer"-knap
-    øverst som en url_button (InlineKeyboardButton med url=trailer_url).
-    Knappen vises kun hvis trailer_url ikke er None.
-  - Buddys system prompt instrueres om IKKE at skrive trailer-linket
-    som rå tekst, da det nu håndteres via knappen.
-  - Alle øvrige handlers (show_search_results, execute_order) er uændrede.
+  - execute_order() sender nu query_callback.from_user.id (telegram_id) til
+    add_movie() og add_series() i stedet for plex_username. Dette sikrer at
+    tagget "tg_<telegram_id>" oprettes i Radarr/Sonarr, så webhook_service
+    kan sende notifikationer præcist til den bruger der bestilte.
+  - pending-data gemmer nu telegram_id eksplicit ved show_confirmation().
+  - Alle øvrige handlers (show_search_results, show_confirmation) er uændrede.
 
 Håndterer:
 1. Præsentation af søgeresultater som Inline Buttons
@@ -39,7 +37,7 @@ _TMDB_POSTER = "https://image.tmdb.org/t/p/w500"
 
 def _make_token() -> str:
     """Generate a short unique token for callback_data (fits in 64 bytes)."""
-    return secrets.token_hex(8)  # 16 chars — plenty of room
+    return secrets.token_hex(8)
 
 
 # ── Step 1: Vis søgeresultater som knapper ────────────────────────────────────
@@ -59,7 +57,6 @@ async def show_search_results(
         await message.reply_text(f"Jeg kunne ikke finde noget for '{query}' 🤔")
         return False
 
-    # Begræns til 5 resultater og lav knapper
     top = results[:5]
     buttons = []
     for item in top:
@@ -94,18 +91,17 @@ async def show_search_results(
 # ── Step 2: Vis detaljer + Trailer / Bestil / Annuller ────────────────────────
 
 async def show_confirmation(
-    query_callback,  # telegram CallbackQuery object
+    query_callback,
     token: str,
     plex_username: str | None,
 ) -> None:
     """
     Fetch full details for the picked title and show action buttons.
 
-    Keyboard-rækkefølge (øverst til nederst):
+    Keyboard-rækkefølge:
       [🎬 Se Trailer]          ← kun hvis trailer_url er tilgængelig
       [✅ Bestil]  [❌ Annuller]
     """
-    # Hent den gemte partial data
     pending = await database.get_pending_request(token)
     if not pending:
         await query_callback.edit_message_text("Sessionen er udløbet — prøv igen.")
@@ -114,7 +110,6 @@ async def show_confirmation(
     tmdb_id    = pending["tmdb_id"]
     media_type = pending["media_type"]
 
-    # Hent fuld info fra TMDB
     details = await get_media_details(tmdb_id, media_type)
     if not details:
         await query_callback.edit_message_text("Kunne ikke hente detaljer — prøv igen.")
@@ -127,9 +122,9 @@ async def show_confirmation(
     orig_lang   = details.get("original_language", "en")
     tvdb_id     = details.get("tvdb_id")
     seasons     = details.get("season_numbers", [])
-    trailer_url = details.get("trailer_url")  # kan være None
+    trailer_url = details.get("trailer_url")
 
-    # Gem fuld data til bekræftelse — inkl. trailer_url til evt. genbrug
+    # Gem fuld data inkl. telegram_id til brug i execute_order
     new_token = _make_token()
     await database.save_pending_request(new_token, query_callback.from_user.id, {
         "media_type":        media_type,
@@ -141,9 +136,9 @@ async def show_confirmation(
         "original_language": orig_lang,
         "season_numbers":    seasons,
         "trailer_url":       trailer_url,
+        "telegram_id":       query_callback.from_user.id,  # ← til tag i Radarr/Sonarr
     })
 
-    # Byg beskeden
     genre_str = ", ".join(genres[:3]) if genres else ""
     text = f"*{title}*"
     if year:
@@ -157,17 +152,13 @@ async def show_confirmation(
     if media_type == "tv" and seasons:
         text += f"\n\n📺 {len(seasons)} sæson{'er' if len(seasons) != 1 else ''}"
 
-    # Byg keyboard — trailer-knap øverst, kun hvis URL er tilgængelig
     button_rows = []
-
     if trailer_url:
-        button_rows.append([
-            InlineKeyboardButton("🎬 Se Trailer", url=trailer_url)
-        ])
+        button_rows.append([InlineKeyboardButton("🎬 Se Trailer", url=trailer_url)])
 
     button_rows.append([
-        InlineKeyboardButton("✅ Bestil",    callback_data=f"confirm:{new_token}"),
-        InlineKeyboardButton("❌ Annuller",  callback_data=f"cancel:{new_token}"),
+        InlineKeyboardButton("✅ Bestil",   callback_data=f"confirm:{new_token}"),
+        InlineKeyboardButton("❌ Annuller", callback_data=f"cancel:{new_token}"),
     ])
 
     await query_callback.edit_message_text(
@@ -186,14 +177,19 @@ async def execute_order(
 ) -> None:
     """
     Execute the actual Radarr or Sonarr request upon user confirmation.
+
+    Sender telegram_id til add_movie/add_series så tagget "tg_<id>"
+    oprettes i Radarr/Sonarr. webhook_service bruger dette tag til at
+    sende notifikationen præcist til den bruger der bestilte.
     """
     pending = await database.get_pending_request(token)
     if not pending:
         await query_callback.edit_message_text("Sessionen er udløbet — prøv igen.")
         return
 
-    media_type = pending["media_type"]
-    title      = pending["title"]
+    media_type  = pending["media_type"]
+    title       = pending["title"]
+    telegram_id = pending.get("telegram_id") or query_callback.from_user.id
 
     await query_callback.edit_message_text(
         f"⏳ Bestiller *{title}* — vent et øjeblik…",
@@ -206,7 +202,7 @@ async def execute_order(
             title=title,
             year=pending["year"] or 0,
             genres=pending["genres"],
-            plex_username=plex_username,
+            telegram_id=telegram_id,
         )
     else:
         result = await add_series(
@@ -215,7 +211,7 @@ async def execute_order(
             year=pending["year"] or 0,
             original_language=pending["original_language"],
             season_numbers=pending["season_numbers"],
-            plex_username=plex_username,
+            telegram_id=telegram_id,
         )
 
     if result.get("success"):
