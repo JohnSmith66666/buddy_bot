@@ -2,22 +2,14 @@
 services/tmdb_service.py - TMDB API integration.
 
 CHANGES vs previous version:
-  - Tilføjet get_tmdb_collection_movies(keyword):
-    Søger via /search/collection → tager top-match → kalder /collection/{id}
-    → returnerer samlingens navn + alle film fra 'parts'-arrayet.
-    Bruges af check_franchise_on_plex() i plex_service til franchise-krydstjek.
-  - get_trending() laver to separate, parallelle API-kald internt:
-    ét til /trending/movie/week og ét til /trending/tv/week.
-    Returnerer {"movies": [top 5 film], "tv": [top 5 serier]} som én dict.
+  - get_tmdb_collection_movies() returnerer nu BÅDE 'title' og 'original_title'
+    per film, så franchise-krydstjek kan matche mod begge titler.
+  - get_trending() laver to separate, parallelle API-kald internt.
+    Returnerer {"movies": [top 5 film], "tv": [top 5 serier]}.
   - get_now_playing() og get_upcoming() sorterer efter popularity (faldende)
-    og returnerer kun de 10 mest populære — fjerner ukendte indie-film.
+    og returnerer kun de 10 mest populære.
 
 All requests use language=da-DK for Danish titles and overviews.
-
-TOKEN OPTIMISATION:
-  - poster_path, backdrop_path og andre visuelle felter strippes.
-  - Person biography truncates til 300 chars.
-  - Lister cappes til 10 items.
 """
 
 import asyncio
@@ -205,10 +197,14 @@ async def get_tmdb_collection_movies(keyword: str) -> dict | None:
     Søg efter en TMDB-samling via keyword og returner alle film i samlingen.
 
     Flow:
-      1. GET /search/collection?query={keyword} → find top-match (f.eks. 'Marvel
-         Cinematic Universe Collection', 'James Bond Collection').
+      1. GET /search/collection?query={keyword} → find top-match.
       2. Tag collection-ID'et og kald GET /collection/{id}.
-      3. Returner samlingens navn + en minimal liste over alle film i 'parts'.
+      3. Returner samlingens navn + alle film fra 'parts'.
+
+    FIX: Returnerer nu BÅDE 'title' (oversat, da-DK) og 'original_title' per
+    film, så _franchise_plex_check_sync kan matche mod begge — nødvendigt fordi
+    Plex ofte gemmer film under originaltitlen (engelsk) mens TMDB returnerer
+    en oversat titel som 'title'.
 
     Returnerer:
       {
@@ -216,15 +212,17 @@ async def get_tmdb_collection_movies(keyword: str) -> dict | None:
         "collection_name": "Marvel Cinematic Universe Collection",
         "total_parts":     33,
         "movies": [
-          {"tmdb_id": 1234, "title": "Iron Man", "release_date": "2008-05-02"},
+          {
+            "tmdb_id":        1234,
+            "title":          "Iron Man",     # oversat (da-DK)
+            "original_title": "Iron Man",     # original sprog
+            "release_date":   "2008-05-02",
+          },
           ...
         ]
       }
 
-    Returnerer None hvis ingen samling findes, eller ved API-fejl.
-
-    Bruges af check_franchise_on_plex() i plex_service til at bygge en
-    autoritativ TMDB-liste der derefter krydstjekkes mod Plex.
+    Returnerer None hvis ingen samling findes eller ved API-fejl.
     """
     async with httpx.AsyncClient(timeout=10) as client:
         # Trin 1: søg efter samlingen
@@ -243,8 +241,7 @@ async def get_tmdb_collection_movies(keyword: str) -> dict | None:
             logger.info("TMDB collection search: ingen resultater for '%s'", keyword)
             return None
 
-        # Top-match — TMDB returnerer allerede efter relevans
-        top = search_results[0]
+        top             = search_results[0]
         collection_id   = top.get("id")
         collection_name = top.get("name") or top.get("original_name") or keyword
 
@@ -267,20 +264,21 @@ async def get_tmdb_collection_movies(keyword: str) -> dict | None:
             )
             return None
 
-    # Trin 3: byg minimal film-liste fra 'parts'
-    parts = detail.get("parts", [])
+    # Trin 3: byg film-liste med BÅDE title og original_title
+    parts  = detail.get("parts", [])
     movies = []
     for part in parts:
-        title = part.get("title") or part.get("original_title") or ""
+        title          = part.get("title") or part.get("original_title") or ""
+        original_title = part.get("original_title") or title
         if not title:
             continue
         movies.append({
-            "tmdb_id":      part.get("id"),
-            "title":        title,
-            "release_date": part.get("release_date") or "Ukendt",
+            "tmdb_id":        part.get("id"),
+            "title":          title,
+            "original_title": original_title,
+            "release_date":   part.get("release_date") or "Ukendt",
         })
 
-    # Sortér kronologisk efter udgivelsesdato
     movies.sort(key=lambda x: x["release_date"])
 
     logger.info(
@@ -377,12 +375,10 @@ async def get_person_filmography(person_id: int) -> dict | None:
 
 async def get_trending() -> dict:
     """
-    Laver to separate, parallelle API-kald til TMDB:
+    Laver to separate, parallelle API-kald:
       - /trending/movie/week → top 5 film
       - /trending/tv/week   → top 5 serier
-
     Returnerer {"movies": [5 film], "tv": [5 serier]}.
-    Bruger asyncio.gather for minimal latens.
     """
     _TOP_N = 5
 

@@ -15,13 +15,14 @@ TOKEN OPTIMISATION (data-diæt):
     which is called explicitly when the user asks for them.
 
 CHANGES vs previous version:
-  - Tilføjet check_franchise_on_plex(keyword, plex_username):
-    Henter den fulde franchise-liste fra TMDB via get_tmdb_collection_movies(),
-    krydstjekker alle film mod Plex via _clean_title fuzzy-matching,
-    og returnerer {"collection_name", "found_on_plex", "missing_from_plex"}.
-  - _collection_sync returnerer nu animations-filtreret output:
+  - _franchise_plex_check_sync matcher nu mod BÅDE 'title' og 'original_title'
+    fra TMDB — løser falske negativer hvor Plex gemmer filmen under engelsk
+    originaltitel men TMDB returnerer en oversat titel som 'title'.
+  - check_franchise_on_plex + _franchise_plex_check_sync: avanceret franchise-
+    søgning via TMDB collection API + lokalt Plex fuzzy-match indeks.
+  - _collection_sync: animations-filter returnerer
     {"results": [top 10 ikke-animation], "hidden_animation_count": N}.
-  - _clean_title og _titles_match_fuzzy: tre-lags fuzzy matching der fanger
+  - _clean_title + _titles_match_fuzzy: tre-lags fuzzy matching der fanger
     Plex-titler med regions-tags eller årstal i parentes.
 """
 
@@ -55,9 +56,6 @@ _TMDB_LANG = "da-DK"
 
 _TV_YEAR_TOLERANCE   = 2
 _COLLECTION_MAX_MAIN = 10
-
-# Max antal titler i found_on_plex / missing_from_plex ved franchise-søgning.
-# Holdes lavt for at undgå token-overflow ved store franchises (MCU = 33+ film).
 _FRANCHISE_MAX_PER_LIST = 20
 
 
@@ -294,10 +292,6 @@ async def get_collection(
     media_type: str,
     plex_username: str | None = None,
 ) -> dict:
-    """
-    Simpel Plex-tekstsøgning på keyword med animations-filter.
-    Til franchise-søgninger: brug check_franchise_on_plex() i stedet.
-    """
     try:
         return await asyncio.to_thread(
             partial(_collection_sync, keyword=keyword,
@@ -314,30 +308,10 @@ async def check_franchise_on_plex(
 ) -> dict:
     """
     Avanceret franchise-søgning: henter autoritativ film-liste fra TMDB
-    og krydstjekker mod Plex via fuzzy matching.
-
-    Flow:
-      1. Kalder get_tmdb_collection_movies(keyword) for at hente den
-         komplette TMDB-samling (f.eks. alle 33 MCU-film).
-      2. For hvert film i samlingen: tjek om det findes i Plex via
-         _titles_match / _titles_match_fuzzy mod alle film-sektioner.
-      3. Returnerer:
-         {
-           "collection_name":    "Marvel Cinematic Universe Collection",
-           "total_in_franchise": 33,
-           "found_on_plex":      [{"title": ..., "year": ...}, ...],  # max 20
-           "missing_from_plex":  [{"title": ..., "release_date": ...}, ...],  # max 20
-           "found_count":        N,
-           "missing_count":      M,
-         }
-
-    Begge lister er begrænset til _FRANCHISE_MAX_PER_LIST (20) for at
-    undgå token-overflow ved store franchises. Counts afspejler det reelle tal.
+    og krydstjekker mod Plex via fuzzy matching på BÅDE title og original_title.
     """
-    # Import her for at undgå cirkulær import (tmdb_service ↔ plex_service)
     from services.tmdb_service import get_tmdb_collection_movies
 
-    # Trin 1: hent TMDB-samlingen
     collection = await get_tmdb_collection_movies(keyword)
 
     if not collection:
@@ -358,9 +332,7 @@ async def check_franchise_on_plex(
         keyword, collection_name, len(tmdb_movies),
     )
 
-    # Trin 2: byg Plex-indeks én gang (alle film-sektioner)
-    # Vi kører dette i en thread da PlexAPI er synkront
-    result = await asyncio.to_thread(
+    return await asyncio.to_thread(
         partial(
             _franchise_plex_check_sync,
             collection_name=collection_name,
@@ -368,7 +340,6 @@ async def check_franchise_on_plex(
             plex_username=plex_username,
         )
     )
-    return result
 
 
 async def get_on_deck(plex_username: str | None = None) -> dict:
@@ -462,13 +433,18 @@ def _franchise_plex_check_sync(
     """
     Synkron kerne af check_franchise_on_plex — kører i thread pool.
 
-    Strategi for at holde det hurtigt på store franchises (MCU = 33 film):
-      - Byg ét Plex-indeks over alle film-sektioner (søg med første ord af
-        hvert TMDB-filmnavn, deduplikér via set på item.ratingKey).
-      - For hvert TMDB-film: kør fuzzy match mod Plex-indekset lokalt
-        uden ekstra API-kald.
+    FIX: Matcher nu mod BÅDE 'title' (oversat, da-DK) og 'original_title'
+    per TMDB-film. Løser falske negativer hvor:
+      - TMDB title='Jernmand', original_title='Iron Man', men Plex har 'Iron Man'
+      - TMDB title='Iron Man', original_title='Iron Man', og Plex har 'Iron Man'
 
-    Dette giver O(N × M) sammenligninger lokalt frem for N × Plex API-kald.
+    Match-logik per TMDB-film:
+      1. Byg ét Plex-indeks over alle film-sektioner (ingen gentagne API-kald).
+      2. Rens Plex-titel, TMDB title og TMDB original_title via _clean_title().
+      3. Godkend som fundet hvis Plex-titel matcher NOGEN af de to TMDB-titler
+         via _titles_match() (Lag 1) ELLER _titles_match_fuzzy() (Lag 2/3).
+      4. original_title-tjek kortslutter hvis original_title == title
+         (undgår dobbelt-arbejde for engelske film).
     """
     plex = _connect(plex_username)
     if isinstance(plex, dict):
@@ -482,7 +458,6 @@ def _franchise_plex_check_sync(
         }
 
     # Byg lokalt Plex-indeks: {ratingKey: (plex_title, plex_year)}
-    # Vi søger bredt (ingen titel-filter) for at dække hele biblioteket.
     plex_index: dict[int, tuple[str, int | None]] = {}
     for section in sections:
         try:
@@ -505,29 +480,45 @@ def _franchise_plex_check_sync(
     missing_from_plex: list[dict] = []
 
     for tmdb_movie in tmdb_movies:
-        tmdb_title = tmdb_movie.get("title", "")
-        release    = tmdb_movie.get("release_date", "")
-        tmdb_year  = int(release[:4]) if release and release[:4].isdigit() else None
+        tmdb_title     = tmdb_movie.get("title", "")
+        original_title = tmdb_movie.get("original_title", "") or tmdb_title
+        release        = tmdb_movie.get("release_date", "")
+        tmdb_year      = int(release[:4]) if release and release[:4].isdigit() else None
+
+        # titles er identiske for engelske film — undgår dobbelt-arbejde
+        titles_differ = original_title != tmdb_title
 
         matched = False
         for plex_title, plex_year in plex_index.values():
-            # Tre-lags titel-match
-            if not (_titles_match(plex_title, tmdb_title) or
-                    _titles_match_fuzzy(plex_title, tmdb_title)):
-                continue
-
-            # Løst årstals-tjek for film: max 1 år afvigelse, eller manglende år
+            # Årstals-tjek: max 1 år afvigelse eller manglende år
             if tmdb_year and plex_year and abs(plex_year - tmdb_year) > 1:
                 continue
 
-            matched = True
-            found_on_plex.append({
-                "title": tmdb_title,
-                "year":  tmdb_year,
-            })
-            break
+            # Lag 1 + 2/3 mod oversat TMDB-titel
+            match_translated = (
+                _titles_match(plex_title, tmdb_title) or
+                _titles_match_fuzzy(plex_title, tmdb_title)
+            )
 
-        if not matched:
+            # Lag 1 + 2/3 mod original TMDB-titel (kun hvis den adskiller sig)
+            match_original = titles_differ and (
+                _titles_match(plex_title, original_title) or
+                _titles_match_fuzzy(plex_title, original_title)
+            )
+
+            if match_translated or match_original:
+                matched = True
+                logger.debug(
+                    "Franchise HIT: plex='%s' ← tmdb='%s' / orig='%s' "
+                    "(år: plex=%s tmdb=%s, via=%s)",
+                    plex_title, tmdb_title, original_title, plex_year, tmdb_year,
+                    "translated" if match_translated else "original",
+                )
+                break
+
+        if matched:
+            found_on_plex.append({"title": tmdb_title, "year": tmdb_year})
+        else:
             missing_from_plex.append({
                 "title":        tmdb_title,
                 "release_date": release or "Ukendt",
@@ -542,14 +533,13 @@ def _franchise_plex_check_sync(
     )
 
     return {
-        "status":            "ok",
-        "collection_name":   collection_name,
+        "status":             "ok",
+        "collection_name":    collection_name,
         "total_in_franchise": len(tmdb_movies),
-        "found_count":       found_count,
-        "missing_count":     missing_count,
-        # Lister begrænses for at undgå token-overflow
-        "found_on_plex":    found_on_plex[:_FRANCHISE_MAX_PER_LIST],
-        "missing_from_plex": missing_from_plex[:_FRANCHISE_MAX_PER_LIST],
+        "found_count":        found_count,
+        "missing_count":      missing_count,
+        "found_on_plex":      found_on_plex[:_FRANCHISE_MAX_PER_LIST],
+        "missing_from_plex":  missing_from_plex[:_FRANCHISE_MAX_PER_LIST],
     }
 
 
@@ -563,6 +553,7 @@ def _check_sync(
     Tre-lags fuzzy titel-matching.
     Lag 1: eksakt normaliseret. Lag 2: renset (_clean_title). Lag 3: substring.
     TV: løst årstal (+/- 2 år). Film: strengt (max 1 år).
+    Alle sektioner af den givne type gennemsøges.
     """
     is_tv     = (media_type == "tv")
     plex_type = _TV_TYPE if is_tv else _MOVIE_TYPE
@@ -580,13 +571,11 @@ def _check_sync(
             item_title = getattr(item, "title", "") or ""
             item_year  = getattr(item, "year", None)
 
-            lag1      = _titles_match(item_title, title)
-            lag2_or_3 = _titles_match_fuzzy(item_title, title)
-
-            if not (lag1 or lag2_or_3):
+            if not (_titles_match(item_title, title) or
+                    _titles_match_fuzzy(item_title, title)):
                 continue
 
-            match_lag = 1 if lag1 else "2/3"
+            match_lag = 1 if _titles_match(item_title, title) else "2/3"
 
             if is_tv:
                 if not _year_ok_for_tv(item_year, year):
@@ -755,7 +744,7 @@ def _similar_sync(title: str, plex_username: str | None = None) -> dict:
             for item in _safe_search(section, title):
                 if (_titles_match(getattr(item, "title", ""), title) or
                         _titles_match_fuzzy(getattr(item, "title", ""), title)):
-                    source_item = item
+                    source_item    = item
                     source_section = section
                     break
             if source_item:
