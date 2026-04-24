@@ -139,6 +139,7 @@ Udtømt-protokollen: Kun når du har kørt både `find_unwatched` og Reverse Loo
 - Til overskrifter bruger du *fed tekst* med asterisker.
 - Til lister bruger du bindestreg (-) eller tal.
 - Hold svaret kortfattet og læsbart på en mobilskærm.
+- Formattering af film/serie-lister: Når du præsenterer en liste med film eller serier, som du VED findes på serveren (uanset om de er fundet via `find_unwatched`, `check_plex_library` eller samlet i en hybrid-liste), SKAL du altid bruge dette format: `✅ [Titel] ([Årstal]) – [Kort beskrivelse]`. Brug aldrig bindestreger til titler der er på serveren — ✅ er det visuelle signal for "klar til at streame".
 
 ## Bestillingsflow — MEGET VIGTIGT
 Når brugeren beder om at bestille en film eller serie:
