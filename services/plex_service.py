@@ -15,10 +15,11 @@ TOKEN OPTIMISATION (data-diæt):
     which is called explicitly when the user asks for them.
 
 CHANGES vs previous version:
-  - _check_sync(): returnerer nu ratingKey, machineIdentifier og rating ved STATUS_FOUND.
-    rating = item.rating (IMDb-score fra Plex-agenten, typisk 0-10).
+  - _check_sync(): kalder nu item.reload() inden ratings udtrækkes.
+    Søgeresultater er "lette" objekter uden ratings — reload() henter
+    det fulde metadata-objekt inkl. rating og audienceRating.
+    Bruger p_rating (IMDb) med fallback til a_rating (publikum).
   - add_to_watchlist() og _add_to_watchlist_sync() tilføjet — uændret.
-  - Alle øvrige funktioner er uændrede.
 """
 
 import asyncio
@@ -759,13 +760,29 @@ def _check_sync(
                 "Plex HIT (lag %s): '%s' (%s) i '%s' — søgt på '%s' (%s)",
                 match_lag, item_title, item_year, section.title, title, year,
             )
+
+            # reload() henter det fulde metadata-objekt inkl. ratings
+            # (søgeresultater er "lette" objekter uden ratings)
+            try:
+                item.reload()
+            except Exception as e:
+                logger.warning("item.reload() fejlede for '%s': %s", item_title, e)
+
+            p_rating    = getattr(item, "rating", None)
+            a_rating    = getattr(item, "audienceRating", None)
+            final_rating = p_rating if p_rating else a_rating
+            logger.debug(
+                "Plex ratings for '%s': rating=%s audienceRating=%s → bruger=%s",
+                item_title, p_rating, a_rating, final_rating,
+            )
+
             return {
                 "status":            STATUS_FOUND,
                 "title":             item_title,
                 "year":              item_year,
                 "ratingKey":         item.ratingKey,
                 "machineIdentifier": plex.machineIdentifier,
-                "rating":            getattr(item, "rating", None),
+                "rating":            final_rating,
             }
 
     return {"status": STATUS_MISSING}
