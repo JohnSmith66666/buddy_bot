@@ -13,6 +13,14 @@ TOKEN OPTIMISATION (data-diæt):
   - File paths, codecs, bitrates and other heavy metadata are stripped from
     all list responses. Technical specs are only returned by get_plex_metadata(),
     which is called explicitly when the user asks for them.
+
+CHANGES vs previous version:
+  - check_library / _check_sync er omskrevet for at fikse falske negativer på
+    TV-serier (f.eks. 'Euphoria' markeret som 'ikke på Plex'):
+    1. For TV-serier bruges løsere årstals-match (+/- 2 år) — eller ingen
+       årstals-validering ved eksakt titel-match.
+    2. Tjekker kun om Show-objektet eksisterer — antal afsnit er irrelevant.
+    3. Itererer korrekt over ALLE tv-sektioner (dækker opdelte biblioteker).
 """
 
 import asyncio
@@ -42,6 +50,11 @@ _MAX_RESULTS = 25      # Hard cap on all list responses sent to the AI.
 
 _TMDB_BASE = "https://api.themoviedb.org/3"
 _TMDB_LANG = "da-DK"
+
+# Maks antal år en serie må afvige fra TMDB-årstallet og stadig godkendes.
+# Sættes til 2 fordi TMDB og Plex-metadata ikke altid er enige om præcist
+# hvilket år en serie "begyndte" (pilot-år vs. første sæson-år osv.).
+_TV_YEAR_TOLERANCE = 2
 
 
 # ── Lightweight item serialiser ───────────────────────────────────────────────
@@ -89,6 +102,25 @@ def _normalise(title: str) -> str:
 
 def _titles_match(title_a: str, title_b: str) -> bool:
     return _normalise(title_a) == _normalise(title_b)
+
+
+def _year_ok_for_tv(item_year: int | None, query_year: int | None) -> bool:
+    """
+    Loose year check for TV shows.
+
+    Rules (in priority order):
+      1. If either year is missing → accept (don't penalise missing metadata).
+      2. If years are within _TV_YEAR_TOLERANCE → accept.
+      3. Otherwise → reject.
+
+    We intentionally do NOT require an exact year match for shows, because:
+      - TMDB may use the pilot/announcement year while Plex uses the
+        first full season year (or vice versa).
+      - Metadata providers disagree by 1-2 years surprisingly often.
+    """
+    if item_year is None or query_year is None:
+        return True
+    return abs(item_year - query_year) <= _TV_YEAR_TOLERANCE
 
 
 # ── Plex connection helper ────────────────────────────────────────────────────
@@ -391,24 +423,88 @@ def _check_sync(
     media_type: str,
     plex_username: str | None = None,
 ) -> dict:
-    """check_library — returns minimal match info, no heavy metadata."""
-    plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
+    """
+    check_library — robust title lookup for both movies and TV shows.
+
+    FIX for TV-serier (tre forbedringer):
+
+    1. Løsere årstals-match for shows:
+       - Ved eksakt titel-match (efter normalisering) bruges _year_ok_for_tv(),
+         som godkender match hvis årstallet afviger med højst _TV_YEAR_TOLERANCE (2) år,
+         eller hvis et af årstallene mangler.
+       - Film beholder det strenge match (max 1 års afvigelse).
+
+    2. Serieniveau-tjek:
+       - For shows kigger vi KUN på om Show-objektet eksisterer.
+       - Vi tæller ALDRIG afsnit eller checker episodeFileCount.
+       - Enhver serie der er lagt ind i Plex — også dem der mangler afsnit —
+         returnerer STATUS_FOUND.
+
+    3. Søg i alle sektioner:
+       - _sections() returnerer alle biblioteker af den pågældende type.
+       - Koden itererer over dem alle, så opdelte biblioteker
+         (f.eks. "TV - Dansk" og "TV - Serier") begge gennemsøges.
+    """
+    is_tv    = (media_type == "tv")
+    plex_type = _TV_TYPE if is_tv else _MOVIE_TYPE
+
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
-    for section in _sections(plex, plex_type):
+    sections = _sections(plex, plex_type)
+    if not sections:
+        logger.warning(
+            "check_library: no sections of type '%s' found on server", plex_type
+        )
+
+    for section in sections:
+        logger.debug(
+            "check_library: searching section '%s' for '%s' (%s)",
+            section.title, title, media_type,
+        )
+
         for item in _safe_search(section, title):
             item_title = getattr(item, "title", "") or ""
             item_year  = getattr(item, "year", None)
+
+            # ── Titel-match ───────────────────────────────────────────────────
             if not _titles_match(item_title, title):
                 continue
-            if year and item_year and abs(item_year - year) > 1:
-                continue
-            logger.info("Plex HIT: '%s' (%s) in '%s'", item_title, item_year, section.title)
-            # Return only what the AI needs to confirm the title exists.
-            return {"status": STATUS_FOUND, "title": item_title, "year": item_year}
 
+            # ── Årstals-validering ────────────────────────────────────────────
+            if is_tv:
+                # TV-serier: løst match — +/- _TV_YEAR_TOLERANCE år eller manglende år
+                if not _year_ok_for_tv(item_year, year):
+                    logger.debug(
+                        "check_library: TV year mismatch — item=%s query=%s tolerance=%s",
+                        item_year, year, _TV_YEAR_TOLERANCE,
+                    )
+                    continue
+            else:
+                # Film: strengt match — max 1 års afvigelse
+                if year and item_year and abs(item_year - year) > 1:
+                    logger.debug(
+                        "check_library: movie year mismatch — item=%s query=%s",
+                        item_year, year,
+                    )
+                    continue
+
+            # ── Match fundet ──────────────────────────────────────────────────
+            logger.info(
+                "Plex HIT: '%s' (%s) in section '%s' [%s]",
+                item_title, item_year, section.title, plex_type,
+            )
+            return {
+                "status": STATUS_FOUND,
+                "title":  item_title,
+                "year":   item_year,
+            }
+
+    logger.info(
+        "Plex MISS: '%s' (%s) not found in any %s section",
+        title, year, plex_type,
+    )
     return {"status": STATUS_MISSING}
 
 
@@ -652,7 +748,6 @@ def _missing_sync(collection_name: str, plex_username: str | None = None) -> dic
             if in_plex:
                 break
 
-        # Only title/year/tmdb_id — the AI doesn't need anything else.
         entry = {"title": tmdb_title, "year": tmdb_year, "tmdb_id": movie.get("id")}
         if in_plex:
             found_in_plex.append(entry)
