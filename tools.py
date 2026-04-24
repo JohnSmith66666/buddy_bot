@@ -2,9 +2,9 @@
 tools.py - Claude Tool Use definitions for Buddy.
 
 CHANGES vs previous version:
-  - search_web tool har fået en benhård negativ constraint (STRENGT FORBUDT)
-    der eksplicit forbyder brug til generelle emner som nyheder, vejr,
-    opskrifter og andet ikke-medie-relateret indhold.
+  - check_franchise_status: tilføjet instruks om at bruge dette ved 'den
+    seneste', 'den nyeste' eller 'næste' film i en serie, så Claude ikke
+    gætter på en ældre film baseret på træningsdata.
 """
 
 TOOLS = [
@@ -27,7 +27,10 @@ TOOLS = [
     },
     {
         "name": "get_media_details",
-        "description": "Hent detaljerede oplysninger om en specifik film eller TV-serie via TMDB ID.",
+        "description": (
+            "Hent detaljerede oplysninger om en specifik film eller TV-serie via TMDB ID. "
+            "Returnerer nu ogsaa trailer_url (YouTube-link) hvis tilgaengeligt."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -91,8 +94,7 @@ TOOLS = [
         "description": (
             "Hent den fulde filmografi for en person via TMDB person-ID. "
             "Returnerer ALLE film sorteret efter popularity (stoerste hits foerst) "
-            "samt top 10 TV-serier. Brug dette til at besvare spoergsmaal om en "
-            "persons karriere generelt. "
+            "samt top 10 TV-serier. Brug dette til karriere-spoergsmaal generelt. "
             "Til fuld Plex-analyse med mangler og statistik: brug search_plex_by_actor."
         ),
         "input_schema": {
@@ -122,9 +124,7 @@ TOOLS = [
             "ikke er registreret i TMDB. "
             "(2) Plot-resumeer eller handling af specifikke afsnit af en serie. "
             "(3) Anmeldelser eller baggrundsstof om specifikke film og TV-programmer. "
-            "Formuler query som et naturligt dansk spoergsmaal for bedste resultat, "
-            "f.eks.: 'hvad handler TV-programmet Kontant paa DR1?' eller "
-            "'resumee af Sherlock Holmes saeson 2 afsnit 3'. "
+            "Formuler query som et naturligt dansk spoergsmaal for bedste resultat. "
             "Returnerer answer (LLM-opsummering) og results (kildeliste med uddrag). "
             "VIGTIGT: Dette vaerktoej maa KUN bruges til foresproegsler relateret til "
             "tv-programmer, film, skuespillere og underholdning — isaer lokalt/dansk "
@@ -140,19 +140,13 @@ TOOLS = [
                 "query": {
                     "type": "string",
                     "description": (
-                        "Sogeforesproegslen — skal vaere relateret til film, TV eller underholdning. "
-                        "Formuler som et naturligt spoergsmaal, f.eks. "
-                        "'hvad handler Kontant paa DR?' eller "
-                        "'anmeldelse af filmen The Brutalist 2024'."
+                        "Sogeforesproegslen — skal vaere relateret til film, TV eller underholdning."
                     ),
                 },
                 "search_depth": {
                     "type": "string",
                     "enum": ["basic", "advanced"],
-                    "description": (
-                        "Sogedybde. Brug 'basic' (standard, hurtig) til de fleste spoergsmaal. "
-                        "Brug 'advanced' kun til komplekse eller svare-at-finde emner."
-                    ),
+                    "description": "Sogedybde. Brug 'basic' (standard). 'advanced' til svare emner.",
                 },
             },
             "required": ["query"],
@@ -184,21 +178,26 @@ TOOLS = [
         "name": "check_franchise_status",
         "description": (
             "Avanceret franchise-søgning: finder den officielle samling fra TMDB "
-            "(f.eks. 'Marvel Cinematic Universe Collection', 'James Bond Collection', "
+            "(f.eks. 'Avatar Collection', 'James Bond Collection', "
             "'Harry Potter Collection') og krydstjekker ALLE film mod Plex via "
             "GUID-matching (100% skudsikker) med fuzzy-matching som fallback. "
             "Brug dette NÅR brugeren spørger efter en franchise, samling eller film-serie — "
             "f.eks. 'hvilke Marvel-film har vi?', 'hvad mangler vi af Bond?', "
             "'vis mig Harry Potter-samlingen'. "
+            "Brug OGSÅ dette værktøj, når brugeren spørger efter 'den seneste', "
+            "'den nyeste' eller 'næste' film i en specifik serie (f.eks. 'den nyeste "
+            "Avatar film' eller 'den seneste Batman'). Det sikrer, at du får hele "
+            "tidslinjen fra TMDB og ikke ved en fejl gætter på en ældre film ud fra "
+            "din forhåndsviden. "
             "Returnerer: collection_name, found_on_plex, missing_from_plex, counts. "
-            "Input: kun keyword (f.eks. 'Marvel', 'James Bond', 'Harry Potter')."
+            "Input: kun keyword (f.eks. 'Avatar', 'Batman', 'James Bond')."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "keyword": {
                     "type": "string",
-                    "description": "Franchise- eller samlingsnavn, f.eks. 'Marvel', 'James Bond'.",
+                    "description": "Franchise- eller samlingsnavn, f.eks. 'Avatar', 'Batman', 'James Bond'.",
                 },
             },
             "required": ["keyword"],
@@ -209,11 +208,7 @@ TOOLS = [
         "description": (
             "Completionist skuespiller-analyse: slaar op BAADE lokalt paa Plex OG "
             "mod skuespillerens FULDE filmografi fra TMDB. "
-            "Returnerer det fulde statistiske overblik: "
-            "total_movies (alle film i karrieren), "
-            "owned_movies (antal vi har paa Plex), "
-            "found_on_plex (liste over film vi har), "
-            "top_5_missing (de 5 mest populaere film vi mangler). "
+            "Returnerer: total_movies, owned_movies, found_on_plex, top_5_missing. "
             "Brug dette NÅR brugeren spørger om en skuespiller — baade "
             "'hvilke film har vi med X?', 'hvad mangler vi af X?' og "
             "'hvor mange af X's film har vi?'. "
@@ -271,8 +266,8 @@ TOOLS = [
     {
         "name": "get_missing_from_collection",
         "description": (
-            "Find hvad der mangler af en samling eller franchise i Plex via simpel TMDB-søgning. "
-            "Til avanceret franchise-krydstjek med GUID-matching: brug check_franchise_status."
+            "Find hvad der mangler af en samling i Plex via simpel TMDB-søgning. "
+            "Til avanceret krydstjek med GUID-matching: brug check_franchise_status."
         ),
         "input_schema": {
             "type": "object",
@@ -286,16 +281,15 @@ TOOLS = [
         "name": "get_popular_on_plex",
         "description": (
             "Hent de mest populaere film og serier paa Plex-serveren. "
-            "Brug days=30 for seneste maaned (standard), days=365 for seneste aar. "
-            "Brug days=0 naar brugeren spørger om 'all time', 'nogensinde', "
-            "'mest populaere gennem tiderne' eller lignende historisk/ubegrænset statistik."
+            "days=30 for seneste maaned (standard), days=365 for seneste aar. "
+            "days=0 for 'all time' / 'nogensinde'."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "days": {
                     "type": "integer",
-                    "description": "Antal dage. Standard 30. Brug 0 for all-time / nogensinde.",
+                    "description": "Antal dage. Standard 30. Brug 0 for all-time.",
                 },
             },
             "required": [],
@@ -305,16 +299,14 @@ TOOLS = [
         "name": "get_user_watch_stats",
         "description": (
             "Hent brugerens personlige statistik — seertid og top 5 film/serier. "
-            "Brug days=30 for seneste maaned, days=365 for seneste aar (standard). "
-            "Brug days=0 naar brugeren spørger om 'all time', 'nogensinde', "
-            "'historisk', 'absolut mest sete' eller lignende ubegrænset statistik."
+            "days=365 standard. days=0 for 'all time' / 'nogensinde' / 'absolut mest sete'."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "days": {
                     "type": "integer",
-                    "description": "Antal dage. Standard 365. Brug 0 for all-time / nogensinde.",
+                    "description": "Antal dage. Standard 365. Brug 0 for all-time.",
                 },
             },
             "required": [],
@@ -324,9 +316,7 @@ TOOLS = [
         "name": "get_user_history",
         "description": (
             "Soeg i brugerens egen afspilningshistorik. "
-            "Brug media_type='movie' naar brugeren spørger om senest sete film, "
-            "media_type='episode' for serier, eller udelad for begge. "
-            "Ingen tidsbegrænsning — returnerer de nyeste afspilninger."
+            "media_type='movie' for senest sete film, 'episode' for serier."
         ),
         "input_schema": {
             "type": "object",
