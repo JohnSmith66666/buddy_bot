@@ -6,7 +6,9 @@ CHANGES vs previous version:
     efter persona-linjen. Sektionen forbyder engelske indlån, klodset
     oversatte talemåder og grammatiske fejl — og kræver idiomatisk,
     indfødt dansk i alle svar.
-  - Alle øvrige sektioner og regler er uændrede.
+  - URL-escape-reglen er FJERNET fra System Prompten. Escaping håndteres nu
+    automatisk og pålideligt af escape_markdown() i main.py, så vi sparer
+    tokens og slipper for at stole på at modellen husker det.
 """
 
 SYSTEM_PROMPT = """

@@ -2,14 +2,19 @@
 main.py - Buddy bot entry point.
 
 CHANGES vs previous version:
-  - Tilføjet Inline Keyboard bekræftelsesflow for bestillinger.
-  - Claude returnerer SHOW_SEARCH_RESULTS-signal → main.py kalder confirmation_service.
-  - Tilføjet CallbackQueryHandlers for pick/confirm/cancel.
-  - Webhook-server kører stadig på port 8080.
+  - Tilføjet hjælpefunktion escape_markdown(text) der automatisk escaper
+    underscores inde i URL'er, så Telegrams Markdown-parser ikke krasjer
+    med 'Can't parse entities' på YouTube-links med underscores i video-ID'et.
+    Funktionen bruger re.sub med en URL-matching gruppe, og rammer KUN tegn
+    inde i URL'er — al anden Markdown-formatering forbliver uændret.
+  - escape_markdown() kaldes i handle_text() på Buddys svar, inden
+    update.message.reply_text() afsender beskeden.
+  - Alle øvrige handlers, webhook-server og lifecycle-hooks er uændrede.
 """
 
 import asyncio
 import logging
+import re
 import sys
 from aiohttp import web
 
@@ -41,6 +46,27 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
+
+# Matches http(s):// URLs — captures the full URL as group 1.
+_URL_RE = re.compile(r"(https?://[^\s)\]>\"]+)")
+
+
+def escape_markdown(text: str) -> str:
+    """
+    Escape underscores inside URLs so Telegram's Markdown parser doesn't
+    misinterpret them as italic markers and crash with 'Can't parse entities'.
+
+    Only characters *inside* a URL are touched — all other Markdown formatting
+    (bold, italic, inline code, etc.) in the surrounding text is left intact.
+
+    Example:
+        "🎬 Se traileren her: https://www.youtube.com/watch?v=ioKYnkD9_IM"
+        →  "🎬 Se traileren her: https://www.youtube.com/watch?v=ioKYnkD9\_IM"
+    """
+    def _escape_url(match: re.Match) -> str:
+        return match.group(1).replace("_", r"\_")
+
+    return _URL_RE.sub(_escape_url, text)
 
 
 # ── Guards ────────────────────────────────────────────────────────────────────
@@ -201,12 +227,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if reply.startswith(SEARCH_SIGNAL):
         # Format: SHOW_SEARCH_RESULTS:<query>:<media_type>
         parts = reply[len(SEARCH_SIGNAL):].split(":", 1)
-        query_term  = parts[0].strip()
-        media_type  = parts[1].strip() if len(parts) > 1 else "both"
+        query_term = parts[0].strip()
+        media_type = parts[1].strip() if len(parts) > 1 else "both"
         await show_search_results(update.message, query_term, media_type)
         return
 
-    await update.message.reply_text(reply, parse_mode="Markdown")
+    # Escape underscores inde i URL'er så Telegrams Markdown-parser ikke krasjer
+    safe_reply = escape_markdown(reply)
+
+    await update.message.reply_text(safe_reply, parse_mode="Markdown")
     await database.log_message(user.id, "outgoing", reply)
 
 
