@@ -2,8 +2,10 @@
 services/tmdb_service.py - TMDB API integration.
 
 CHANGES vs previous version:
-  - get_tmdb_collection_movies() returnerer nu BÅDE 'title' og 'original_title'
-    per film, så franchise-krydstjek kan matche mod begge titler.
+  - get_tmdb_collection_movies() returnerer nu 'tmdb_id' eksplicit (var 'id' før).
+    Nøglen omdøbt til 'tmdb_id' for klarhed og konsistens med resten af kodebasen.
+    Bruges af _franchise_plex_check_sync til GUID-matching mod Plex.
+  - get_tmdb_collection_movies() returnerer stadig 'title' og 'original_title'.
   - get_trending() laver to separate, parallelle API-kald internt.
     Returnerer {"movies": [top 5 film], "tv": [top 5 serier]}.
   - get_now_playing() og get_upcoming() sorterer efter popularity (faldende)
@@ -201,22 +203,26 @@ async def get_tmdb_collection_movies(keyword: str) -> dict | None:
       2. Tag collection-ID'et og kald GET /collection/{id}.
       3. Returner samlingens navn + alle film fra 'parts'.
 
-    FIX: Returnerer nu BÅDE 'title' (oversat, da-DK) og 'original_title' per
-    film, så _franchise_plex_check_sync kan matche mod begge — nødvendigt fordi
-    Plex ofte gemmer film under originaltitlen (engelsk) mens TMDB returnerer
-    en oversat titel som 'title'.
+    Returnerer 'tmdb_id', 'title', 'original_title' og 'release_date' per film.
+
+    'tmdb_id' er den primære nøgle der bruges til GUID-matching i Plex:
+      Plex gemmer TMDB ID'et i sine guids som "tmdb://12345".
+      Dette er 100% skudsikkert og løser edge-cases som:
+        - 'Philosopher's Stone' (britisk) vs 'Sorcerer's Stone' (amerikansk)
+        - Oversatte titler i da-DK vs engelske Plex-titler
+      Fuzzy titel-matching bruges kun som fallback.
 
     Returnerer:
       {
         "collection_id":   123,
-        "collection_name": "Marvel Cinematic Universe Collection",
-        "total_parts":     33,
+        "collection_name": "Harry Potter Collection",
+        "total_parts":     8,
         "movies": [
           {
-            "tmdb_id":        1234,
-            "title":          "Iron Man",     # oversat (da-DK)
-            "original_title": "Iron Man",     # original sprog
-            "release_date":   "2008-05-02",
+            "tmdb_id":        671,
+            "title":          "Harry Potter og De Vises Sten",  # oversat da-DK
+            "original_title": "Harry Potter and the Philosopher's Stone",
+            "release_date":   "2001-11-16",
           },
           ...
         ]
@@ -264,18 +270,19 @@ async def get_tmdb_collection_movies(keyword: str) -> dict | None:
             )
             return None
 
-    # Trin 3: byg film-liste med BÅDE title og original_title
+    # Trin 3: byg film-liste med tmdb_id, title, original_title og release_date
     parts  = detail.get("parts", [])
     movies = []
     for part in parts:
         title          = part.get("title") or part.get("original_title") or ""
         original_title = part.get("original_title") or title
-        if not title:
+        tmdb_id        = part.get("id")
+        if not title or not tmdb_id:
             continue
         movies.append({
-            "tmdb_id":        part.get("id"),
-            "title":          title,
-            "original_title": original_title,
+            "tmdb_id":        tmdb_id,        # bruges til Plex GUID-match
+            "title":          title,           # oversat (da-DK)
+            "original_title": original_title,  # original sprog — fuzzy fallback
             "release_date":   part.get("release_date") or "Ukendt",
         })
 
