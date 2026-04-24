@@ -2,13 +2,10 @@
 main.py - Buddy bot entry point.
 
 CHANGES vs previous version:
-  - INFO_SIGNAL importeret fra ai_handler.
-  - handle_text: nyt SHOW_INFO signal — henter TMDB-detaljer, opretter token
-    og kalder show_confirmation(message, context, token, plex_username).
-  - handle_info_link: kalder show_confirmation direkte med Message og context.
-  - handle_pick_callback: sender context med til show_confirmation.
-  - show_confirmation signaturen er nu (trigger, context, token, plex_username).
-  - Webhook secret + global error handler bevaret fra forrige version.
+  - handle_watchlist_callback importeret fra confirmation_service
+    (ikke defineret her længere — al confirmation-logik er samlet dér).
+  - Duplikeret watchlist-handler fjernet fra main.py.
+  - Alle andre handlers uændrede.
 """
 
 import asyncio
@@ -34,6 +31,7 @@ from admin_handlers import handle_approve_callback, notify_admin_new_user
 from ai_handler import INFO_SIGNAL, SEARCH_SIGNAL, TRAILER_SIGNAL, clear_history, get_ai_response
 from services.confirmation_service import (
     execute_order,
+    handle_watchlist_callback,
     show_confirmation,
     show_search_results,
 )
@@ -242,38 +240,6 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ── Watchlist callback ────────────────────────────────────────────────────────
-
-async def handle_watchlist_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Bruger trykkede på 📌 Tilføj til Watchlist."""
-    query = update.callback_query
-    await query.answer()
-
-    if not await _guard(update):
-        return
-
-    token = query.data.split(":", 1)[1]
-    pending = await database.get_pending_request(token)
-    if not pending:
-        await query.answer("Sessionen er udløbet — prøv igen.", show_alert=True)
-        return
-
-    title         = pending["title"]
-    tmdb_id       = pending["tmdb_id"]
-    plex_username = await database.get_plex_username(query.from_user.id)
-
-    # Lazy import — funktionen tilføjes til plex_service.py separat
-    try:
-        from services.plex_service import add_to_watchlist
-        result = await add_to_watchlist(tmdb_id, title, plex_username)
-    except ImportError:
-        result = {"success": False, "message": "Watchlist-funktion ikke tilgængelig endnu."}
-
-    if result.get("success"):
-        await query.answer(f"✅ '{title}' er tilføjet til din Watchlist!", show_alert=True)
-    else:
-        msg = result.get("message", "Ukendt fejl")
-        await query.answer(f"❌ Kunne ikke tilføje: {msg}", show_alert=True)
-
 
 # ── Message handler ───────────────────────────────────────────────────────────
 

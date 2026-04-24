@@ -2,21 +2,17 @@
 services/confirmation_service.py - Inline keyboard bekræftelsesflow.
 
 CHANGES vs previous version:
-  - KRITISK FIX: MarkdownV2 → Markdown overalt i show_confirmation.
-    MarkdownV2 kræver at alle specialtegn (. ! ( ) - etc.) escapes —
-    dette crashede Telegram ved filmtitler og beskrivelser med punktum.
-    Markdown er mere tilgivende og kræver kun *fed* og _kursiv_ escaping.
-  - _build_caption() omskrevet til simpel Markdown uden _esc():
-    ingen kompleks escape-logik, ingen MarkdownV2 specialtegn.
-  - Caption inkluderer nu: titel, årstal, genrer, score, cast, overview.
-  - cast trækkes nu direkte fra details["cast"] (liste fra tmdb_service).
-  - execute_order() uændret.
+  - handle_watchlist_callback() tilføjet — håndterer 📌-knappen direkte
+    her i stedet for i main.py, så al confirmation-logik er samlet.
+  - Plex deep-link URL bruger URL-encoded key: %2Flibrary%2Fmetadata%2F{ratingKey}.
+  - parse_mode="Markdown" overalt — ingen MarkdownV2.
+  - cast og ⭐️ score i caption — uændret fra forrige version.
 """
 
 import logging
 import secrets
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import ContextTypes
 
 import database
@@ -280,6 +276,43 @@ async def show_confirmation(
             )
         except Exception as e2:
             logger.error("show_confirmation absolut fallback fejl: %s", e2)
+
+
+# ── Watchlist callback ────────────────────────────────────────────────────────
+
+async def handle_watchlist_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Håndterer 📌 Tilføj til Watchlist-knappen.
+    Henter pending data, kalder add_to_watchlist og svarer brugeren.
+    """
+    from services.plex_service import add_to_watchlist
+
+    query = update.callback_query
+    await query.answer()
+
+    token = query.data.split(":", 1)[1]
+    pending = await database.get_pending_request(token)
+    if not pending:
+        await query.answer("Sessionen er udløbet — prøv igen.", show_alert=True)
+        return
+
+    title         = pending["title"]
+    plex_username = await database.get_plex_username(query.from_user.id)
+
+    try:
+        success = await add_to_watchlist(title, plex_username)
+        if success:
+            await query.answer(f"✅ '{title}' er tilføjet til din Watchlist!", show_alert=True)
+        else:
+            await query.answer(
+                f"❌ Kunne ikke finde '{title}' i Plex Discover.", show_alert=True
+            )
+    except Exception as e:
+        logger.error("handle_watchlist_callback fejl: %s", e)
+        await query.answer("❌ Noget gik galt — prøv igen.", show_alert=True)
 
 
 # ── Step 3: Udfør bestilling ──────────────────────────────────────────────────
