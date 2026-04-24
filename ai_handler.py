@@ -2,15 +2,12 @@
 ai_handler.py - Agentic loop for Buddy.
 
 CHANGES vs previous version:
-  - Prompt caching aktiveret: system prompt og tools caches hos Anthropic.
-    Reducerer input-tokens med ~90% for gentagne kald (kun charged for cache misses).
-  - _MAX_HISTORY reduceret fra 20 til 10.
-  - Tool-resultater trimmes til max 2000 chars før de sendes til Claude.
-    Forhindrer enorme Tautulli/Plex JSON-payloads i at spise tokens.
-  - check_franchise_status routed til check_franchise_on_plex() i plex_service.
-    Erstatter den gamle get_plex_collection-routing for franchise-søgninger.
-  - FIX: SEARCH_SIGNAL konstant genindsat — manglede efter seneste omskrivning
-    og forårsagede ImportError ved opstart.
+  - search_plex_by_actor routed til check_actor_on_plex() — completionist
+    bridge-funktion der returnerer total_movies, owned_movies, found_on_plex
+    og top_5_missing for hele skuespillerens karriere.
+  - check_franchise_status routed til check_franchise_on_plex() (uændret).
+  - SEARCH_SIGNAL konstant bevaret.
+  - Prompt caching aktiveret på system prompt og tools.
 """
 
 import json
@@ -22,6 +19,7 @@ import anthropic
 from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
 from prompts import SYSTEM_PROMPT
 from services.plex_service import (
+    check_actor_on_plex,
     check_franchise_on_plex,
     check_library,
     find_unwatched,
@@ -90,8 +88,8 @@ def _slim_data(data, max_list_items: int = 10):
 
 def _trim_tool_result(result: str) -> str:
     """
-    Trim tool result til gyldig, kompakt JSON.
-    Bruger strukturel trimming (ikke hård string-truncation) så JSON altid er valid.
+    Trim tool result til gyldig, kompakt JSON via strukturel trimming.
+    Bruger to pas: første med max 10 items, andet med max 5 hvis stadig for lang.
     """
     if len(result) <= _MAX_TOOL_RESULT_CHARS:
         return result
@@ -103,7 +101,6 @@ def _trim_tool_result(result: str) -> str:
         compact = json.dumps(slimmed, ensure_ascii=False, separators=(",", ":"))
         if len(compact) <= _MAX_TOOL_RESULT_CHARS:
             return compact
-        # Andet pas: aggressiv trimming til 5 items
         slimmed2 = _slim_data(data, max_list_items=5)
         return json.dumps(slimmed2, ensure_ascii=False, separators=(",", ":"))
     except (json.JSONDecodeError, Exception) as e:
@@ -116,15 +113,23 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
 
     # ── TMDB ──────────────────────────────────────────────────────────────────
     if tool_name == "search_media":
-        return j(await search_media(tool_input["query"], tool_input.get("media_type", "both")))
+        return j(await search_media(
+            tool_input["query"], tool_input.get("media_type", "both")
+        ))
     if tool_name == "get_media_details":
-        return j(await get_media_details(tool_input["tmdb_id"], tool_input["media_type"]))
+        return j(await get_media_details(
+            tool_input["tmdb_id"], tool_input["media_type"]
+        ))
     if tool_name == "get_trending":
         return j(await get_trending())
     if tool_name == "get_recommendations":
-        return j(await get_recommendations(tool_input["tmdb_id"], tool_input["media_type"]))
+        return j(await get_recommendations(
+            tool_input["tmdb_id"], tool_input["media_type"]
+        ))
     if tool_name == "get_watch_providers":
-        return j(await get_watch_providers(tool_input["tmdb_id"], tool_input["media_type"]))
+        return j(await get_watch_providers(
+            tool_input["tmdb_id"], tool_input["media_type"]
+        ))
     if tool_name == "search_person":
         return j(await search_person(tool_input["query"]))
     if tool_name == "get_person_filmography":
@@ -147,6 +152,12 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
             keyword=tool_input["keyword"],
             plex_username=plex_username,
         ))
+    if tool_name == "search_plex_by_actor":
+        # Completionist bridge: returnerer fuld karriere-statistik + top 5 mangler
+        return j(await check_actor_on_plex(
+            actor_name=tool_input["actor_name"],
+            plex_username=plex_username,
+        ))
     if tool_name == "get_on_deck":
         return j(await get_on_deck(plex_username))
     if tool_name == "get_plex_metadata":
@@ -162,12 +173,6 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
     if tool_name == "get_missing_from_collection":
         return j(await get_missing_from_collection(
             tool_input["collection_name"], plex_username
-        ))
-    if tool_name == "search_plex_by_actor":
-        return j(await search_by_actor(
-            tool_input["actor_name"],
-            tool_input.get("media_type", "movie"),
-            plex_username,
         ))
 
     # ── Tautulli ──────────────────────────────────────────────────────────────

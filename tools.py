@@ -2,11 +2,11 @@
 tools.py - Claude Tool Use definitions for Buddy.
 
 CHANGES vs previous version:
-  - get_plex_collection omdøbt til check_franchise_status med ny beskrivelse.
-    Bruges når brugeren spørger efter franchises, samlinger eller film-serier
-    (Marvel, James Bond, Harry Potter osv.). Input: kun keyword.
-  - get_trending returnerer altid præcis 5 film og 5 serier som en struktureret
-    dict: {"movies": [...], "tv": [...]} via to parallelle interne API-kald.
+  - search_plex_by_actor: nu en completionist bridge-funktion der returnerer
+    total_movies, owned_movies, found_on_plex og top_5_missing.
+  - check_franchise_status: avanceret franchise-søgning via GUID-matching.
+  - get_trending: returnerer altid 5+5 dict via ét kald.
+  - get_person_filmography: returnerer nu ALLE film sorteret efter popularity.
 """
 
 TOOLS = [
@@ -90,7 +90,13 @@ TOOLS = [
     },
     {
         "name": "get_person_filmography",
-        "description": "Hent den fulde filmografi for en person. Kraever TMDB person-ID.",
+        "description": (
+            "Hent den fulde filmografi for en person via TMDB person-ID. "
+            "Returnerer ALLE film sorteret efter popularity (stoerste hits foerst) "
+            "samt top 10 TV-serier. Brug dette til at besvare spoergsmaal om en "
+            "persons karriere generelt. "
+            "Til fuld Plex-analyse med mangler og statistik: brug search_plex_by_actor."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"person_id": {"type": "integer"}},
@@ -134,12 +140,12 @@ TOOLS = [
         "description": (
             "Avanceret franchise-søgning: finder den officielle samling fra TMDB "
             "(f.eks. 'Marvel Cinematic Universe Collection', 'James Bond Collection', "
-            "'Harry Potter Collection') og krydstjekker ALLE film mod Plex. "
+            "'Harry Potter Collection') og krydstjekker ALLE film mod Plex via "
+            "GUID-matching (100% skudsikker) med fuzzy-matching som fallback. "
             "Brug dette NÅR brugeren spørger efter en franchise, samling eller film-serie — "
             "f.eks. 'hvilke Marvel-film har vi?', 'hvad mangler vi af Bond?', "
             "'vis mig Harry Potter-samlingen'. "
-            "Returnerer: collection_name, found_on_plex (titler vi har), "
-            "missing_from_plex (titler vi mangler), found_count og missing_count. "
+            "Returnerer: collection_name, found_on_plex, missing_from_plex, counts. "
             "Input: kun keyword (f.eks. 'Marvel', 'James Bond', 'Harry Potter')."
         ),
         "input_schema": {
@@ -147,7 +153,7 @@ TOOLS = [
             "properties": {
                 "keyword": {
                     "type": "string",
-                    "description": "Franchise- eller samlingsnavn, f.eks. 'Marvel', 'James Bond', 'Jurassic Park'.",
+                    "description": "Franchise- eller samlingsnavn, f.eks. 'Marvel', 'James Bond'.",
                 },
             },
             "required": ["keyword"],
@@ -155,12 +161,26 @@ TOOLS = [
     },
     {
         "name": "search_plex_by_actor",
-        "description": "Find film eller serier i Plex med en bestemt skuespiller eller instruktør.",
+        "description": (
+            "Completionist skuespiller-analyse: slaar op BAADE lokalt paa Plex OG "
+            "mod skuespillerens FULDE filmografi fra TMDB. "
+            "Returnerer det fulde statistiske overblik: "
+            "total_movies (alle film i karrieren), "
+            "owned_movies (antal vi har paa Plex), "
+            "found_on_plex (liste over film vi har), "
+            "top_5_missing (de 5 mest populaere film vi mangler). "
+            "Brug dette NÅR brugeren spørger om en skuespiller — baade "
+            "'hvilke film har vi med X?', 'hvad mangler vi af X?' og "
+            "'hvor mange af X's film har vi?'. "
+            "Input: actor_name (skuespillerens navn)."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "actor_name": {"type": "string"},
-                "media_type": {"type": "string", "enum": ["movie", "tv"]},
+                "actor_name": {
+                    "type": "string",
+                    "description": "Skuespillerens navn, f.eks. 'Robert Downey Jr.'",
+                },
             },
             "required": ["actor_name"],
         },
@@ -207,7 +227,7 @@ TOOLS = [
         "name": "get_missing_from_collection",
         "description": (
             "Find hvad der mangler af en samling eller franchise i Plex via simpel TMDB-søgning. "
-            "Til avanceret franchise-krydstjek: brug check_franchise_status i stedet."
+            "Til avanceret franchise-krydstjek med GUID-matching: brug check_franchise_status."
         ),
         "input_schema": {
             "type": "object",
@@ -233,9 +253,7 @@ TOOLS = [
         "description": "Hent brugerens personlige statistik — seertid og top 5 film/serier.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "days": {"type": "integer"},
-            },
+            "properties": {"days": {"type": "integer"}},
             "required": [],
         },
     },
@@ -244,9 +262,7 @@ TOOLS = [
         "description": "Soeg i brugerens egen afspilningshistorik.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-            },
+            "properties": {"query": {"type": "string"}},
             "required": [],
         },
     },
@@ -258,9 +274,7 @@ TOOLS = [
         ),
         "input_schema": {
             "type": "object",
-            "properties": {
-                "count": {"type": "integer"},
-            },
+            "properties": {"count": {"type": "integer"}},
             "required": [],
         },
     },

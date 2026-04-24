@@ -2,20 +2,19 @@
 services/tmdb_service.py - TMDB API integration.
 
 CHANGES vs previous version:
-  - get_tmdb_collection_movies() returnerer nu 'tmdb_id' eksplicit (var 'id' før).
-    Nøglen omdøbt til 'tmdb_id' for klarhed og konsistens med resten af kodebasen.
-    Bruges af _franchise_plex_check_sync til GUID-matching mod Plex.
-  - get_tmdb_collection_movies() returnerer stadig 'title' og 'original_title'.
-  - get_trending() laver to separate, parallelle API-kald internt.
-    Returnerer {"movies": [top 5 film], "tv": [top 5 serier]}.
-  - get_now_playing() og get_upcoming() sorterer efter popularity (faldende)
-    og returnerer kun de 10 mest populære.
-
-All requests use language=da-DK for Danish titles and overviews.
+  - get_person_filmography() returnerer nu top 20 film (var 10) sorteret efter
+    en popularitets-score (vote_average × log(vote_count + 1)) fremfor
+    udelukkende release_date. Giver de reelle "biggest hits" frem for nyeste.
+    Returnerer nu også 'original_title' og 'tmdb_id' per film til brug i
+    check_actor_on_plex() krydstjek.
+  - get_tmdb_collection_movies() returnerer 'tmdb_id', 'title', 'original_title'.
+  - get_trending() laver to parallelle API-kald, returnerer 5+5 dict.
+  - get_now_playing() og get_upcoming() sorterer efter popularity, top 10.
 """
 
 import asyncio
 import logging
+import math
 
 import httpx
 
@@ -95,6 +94,20 @@ def _format_provider_list(providers: list[dict]) -> list[str]:
     return [p["provider_name"] for p in providers if "provider_name" in p]
 
 
+def _popularity_score(item: dict) -> float:
+    """
+    Kombinations-score til sortering af filmografi:
+      vote_average × log(vote_count + 1)
+
+    Formålet er at løfte film med høj rating OG mange stemmer
+    (de reelle "biggest hits") over nyere film med få stemmer.
+    log() dæmper effekten af ekstreme vote_count-tal.
+    """
+    avg   = item.get("vote_average", 0) or 0
+    count = item.get("vote_count", 0) or 0
+    return avg * math.log(count + 1)
+
+
 async def search_media(query: str, media_type: str = "both") -> list[dict]:
     results: list[dict] = []
     async with httpx.AsyncClient(timeout=10) as client:
@@ -157,7 +170,6 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
             "media_type":        "movie",
         })
 
-    # TV-serie: hent også external_ids for tvdb_id
     tvdb_id = None
     async with httpx.AsyncClient(timeout=10) as client:
         try:
@@ -197,41 +209,9 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
 async def get_tmdb_collection_movies(keyword: str) -> dict | None:
     """
     Søg efter en TMDB-samling via keyword og returner alle film i samlingen.
-
-    Flow:
-      1. GET /search/collection?query={keyword} → find top-match.
-      2. Tag collection-ID'et og kald GET /collection/{id}.
-      3. Returner samlingens navn + alle film fra 'parts'.
-
     Returnerer 'tmdb_id', 'title', 'original_title' og 'release_date' per film.
-
-    'tmdb_id' er den primære nøgle der bruges til GUID-matching i Plex:
-      Plex gemmer TMDB ID'et i sine guids som "tmdb://12345".
-      Dette er 100% skudsikkert og løser edge-cases som:
-        - 'Philosopher's Stone' (britisk) vs 'Sorcerer's Stone' (amerikansk)
-        - Oversatte titler i da-DK vs engelske Plex-titler
-      Fuzzy titel-matching bruges kun som fallback.
-
-    Returnerer:
-      {
-        "collection_id":   123,
-        "collection_name": "Harry Potter Collection",
-        "total_parts":     8,
-        "movies": [
-          {
-            "tmdb_id":        671,
-            "title":          "Harry Potter og De Vises Sten",  # oversat da-DK
-            "original_title": "Harry Potter and the Philosopher's Stone",
-            "release_date":   "2001-11-16",
-          },
-          ...
-        ]
-      }
-
-    Returnerer None hvis ingen samling findes eller ved API-fejl.
     """
     async with httpx.AsyncClient(timeout=10) as client:
-        # Trin 1: søg efter samlingen
         try:
             search_resp = await client.get(
                 f"{_BASE_URL}/search/collection",
@@ -256,7 +236,6 @@ async def get_tmdb_collection_movies(keyword: str) -> dict | None:
             keyword, collection_name, collection_id,
         )
 
-        # Trin 2: hent samlingens fulde indhold
         try:
             detail_resp = await client.get(
                 f"{_BASE_URL}/collection/{collection_id}",
@@ -265,12 +244,9 @@ async def get_tmdb_collection_movies(keyword: str) -> dict | None:
             detail_resp.raise_for_status()
             detail = detail_resp.json()
         except httpx.HTTPError as e:
-            logger.error(
-                "TMDB collection detail error (id=%s): %s", collection_id, e
-            )
+            logger.error("TMDB collection detail error (id=%s): %s", collection_id, e)
             return None
 
-    # Trin 3: byg film-liste med tmdb_id, title, original_title og release_date
     parts  = detail.get("parts", [])
     movies = []
     for part in parts:
@@ -280,17 +256,15 @@ async def get_tmdb_collection_movies(keyword: str) -> dict | None:
         if not title or not tmdb_id:
             continue
         movies.append({
-            "tmdb_id":        tmdb_id,        # bruges til Plex GUID-match
-            "title":          title,           # oversat (da-DK)
-            "original_title": original_title,  # original sprog — fuzzy fallback
+            "tmdb_id":        tmdb_id,
+            "title":          title,
+            "original_title": original_title,
             "release_date":   part.get("release_date") or "Ukendt",
         })
 
     movies.sort(key=lambda x: x["release_date"])
 
-    logger.info(
-        "TMDB collection '%s': %d film fundet", collection_name, len(movies)
-    )
+    logger.info("TMDB collection '%s': %d film fundet", collection_name, len(movies))
 
     return {
         "collection_id":   collection_id,
@@ -334,6 +308,19 @@ async def search_person(query: str) -> list[dict]:
 
 
 async def get_person_filmography(person_id: int) -> dict | None:
+    """
+    Hent filmografi for en person.
+
+    FIX: Returnerer nu TOP 20 film sorteret efter popularitets-score
+    (vote_average × log(vote_count + 1)) fremfor udelukkende release_date.
+    Dette giver de reelle "biggest hits" — f.eks. Iron Man højere end en
+    nyere B-film med få anmeldelser.
+
+    Returnerer nu BÅDE 'title' (oversat, da-DK), 'original_title' og 'tmdb_id'
+    per film, så check_actor_on_plex() kan lave GUID- og titel-matching.
+
+    TV-credits er stadig sorteret efter release_date (kronologisk).
+    """
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             bio_resp = await client.get(
@@ -350,15 +337,27 @@ async def get_person_filmography(person_id: int) -> dict | None:
             logger.error("TMDB filmography error (id=%s): %s", person_id, e)
             return None
 
-    movie_credits = sorted(
-        [{"id": i.get("id"), "title": i.get("title") or i.get("original_title"),
-          "release_date": i.get("release_date", "")[:4] or "Ukendt",
-          "character": i.get("character"),
-          "vote_average": round(i.get("vote_average", 0), 1)}
-         for i in credits.get("cast", []) if i.get("media_type") == "movie"],
-        key=lambda x: x["release_date"], reverse=True,
-    )[:10]
+    # Film-credits: sortér efter popularitets-score, tag top 20
+    raw_movie_cast = [
+        i for i in credits.get("cast", []) if i.get("media_type") == "movie"
+    ]
+    raw_movie_cast.sort(key=_popularity_score, reverse=True)
 
+    movie_credits = []
+    for i in raw_movie_cast[:20]:
+        title          = i.get("title") or i.get("original_title") or ""
+        original_title = i.get("original_title") or title
+        movie_credits.append({
+            "tmdb_id":        i.get("id"),
+            "title":          title,
+            "original_title": original_title,
+            "release_date":   (i.get("release_date") or "")[:4] or "Ukendt",
+            "character":      i.get("character"),
+            "vote_average":   round(i.get("vote_average", 0), 1),
+            "vote_count":     i.get("vote_count", 0),
+        })
+
+    # TV-credits: kronologisk, top 10
     tv_credits = sorted(
         [{"id": i.get("id"), "title": i.get("name") or i.get("original_name"),
           "first_air_date": i.get("first_air_date", "")[:4] or "Ukendt",
@@ -375,8 +374,8 @@ async def get_person_filmography(person_id: int) -> dict | None:
         "birthday":             bio.get("birthday"),
         "place_of_birth":       bio.get("place_of_birth"),
         "known_for_department": bio.get("known_for_department", "Ukendt"),
-        "movie_credits":        movie_credits,
-        "tv_credits":           tv_credits,
+        "movie_credits":        movie_credits,   # top 20, sorteret efter popularitet
+        "tv_credits":           tv_credits,      # top 10, kronologisk
     }
 
 
@@ -452,10 +451,7 @@ async def get_watch_providers(tmdb_id: int, media_type: str) -> dict:
 
 
 async def get_now_playing() -> list[dict]:
-    """
-    Sorterer efter popularity (faldende), returnerer top 10.
-    Henter 2 sider for nok kandidater.
-    """
+    """Sorterer efter popularity (faldende), returnerer top 10. Henter 2 sider."""
     raw: list[dict] = []
     async with httpx.AsyncClient(timeout=10) as client:
         for page in (1, 2):
@@ -475,10 +471,7 @@ async def get_now_playing() -> list[dict]:
 
 
 async def get_upcoming() -> list[dict]:
-    """
-    Sorterer efter popularity (faldende), returnerer top 10 kronologisk.
-    Henter 2 sider for nok kandidater.
-    """
+    """Sorterer efter popularity (faldende), top 10 præsenteret kronologisk."""
     raw: list[dict] = []
     async with httpx.AsyncClient(timeout=10) as client:
         for page in (1, 2):
