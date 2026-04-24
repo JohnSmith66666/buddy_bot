@@ -2,12 +2,12 @@
 services/tmdb_service.py - TMDB API integration.
 
 CHANGES vs previous version:
-  - _extract_trailer_url() konstruerer nu korte YouTube-links via
-    https://youtu.be/{key} i stedet for det lange watch?v= format.
-    Det korte format er nødvendigt for at Telegram trigger sin
-    indbyggede video-afspiller direkte i chatten.
-  - Alle øvrige funktioner (get_media_details, get_trending,
-    get_person_filmography, osv.) er uændrede.
+  - Engelsk trailer-fallback i get_media_details(): hvis da-DK kaldet
+    returnerer ingen trailer (trailer_url er None), laves et ekstra kald
+    til TMDB's /videos endpoint med language=en-US. Dette løser problemet
+    med kendte film som Interstellar og Inception, der ikke har en dansk
+    trailer i TMDB men altid har en engelsk.
+  - _extract_trailer_url() og youtu.be-format er uændret.
 """
 
 import asyncio
@@ -167,6 +167,11 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
     API-kald og undgå ekstra latens. trailer_url konstrueres via
     _extract_trailer_url() og er None hvis ingen YouTube-video findes.
 
+    Trailer-strategi (to-trins fallback):
+      1. da-DK: traileren hentes i det primære API-kald (append_to_response=videos).
+      2. en-US: hvis ingen dansk trailer, laves et ekstra kald til /videos
+         med language=en-US. Løser manglende trailers for film som Interstellar.
+
     For TV-serier hentes external_ids separat for tvdb_id (Sonarr kræver det).
     """
     endpoint = "movie" if media_type == "movie" else "tv"
@@ -186,10 +191,28 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
     # Udtræk trailer URL inden _strip() fjerner 'videos'-feltet
     trailer_url = _extract_trailer_url(data)
 
+    # ── Engelsk fallback hvis ingen dansk trailer ─────────────────────────────
+    if not trailer_url:
+        logger.debug("TMDB: ingen da-DK trailer for tmdb_id=%s — prøver en-US", tmdb_id)
+        async with httpx.AsyncClient(timeout=10) as client:
+            try:
+                en_resp = await client.get(
+                    f"{_BASE_URL}/{endpoint}/{tmdb_id}/videos",
+                    params={"api_key": TMDB_API_KEY, "language": "en-US"},
+                )
+                en_resp.raise_for_status()
+                trailer_url = _extract_trailer_url({"videos": en_resp.json()})
+                if trailer_url:
+                    logger.info(
+                        "TMDB trailer (en-US fallback): tmdb_id=%s → %s", tmdb_id, trailer_url
+                    )
+            except httpx.HTTPError as e:
+                logger.warning("TMDB en-US video fallback fejlede (id=%s): %s", tmdb_id, e)
+
     if trailer_url:
         logger.info("TMDB trailer: tmdb_id=%s → %s", tmdb_id, trailer_url)
     else:
-        logger.debug("TMDB: ingen trailer for tmdb_id=%s", tmdb_id)
+        logger.debug("TMDB: ingen trailer fundet (hverken da-DK eller en-US) for tmdb_id=%s", tmdb_id)
 
     if media_type == "movie":
         return _strip({
