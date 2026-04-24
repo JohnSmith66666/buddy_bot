@@ -2,10 +2,10 @@
 ai_handler.py - Agentic loop for Buddy.
 
 CHANGES vs previous version:
-  - search_plex_by_actor routed til check_actor_on_plex() — completionist
-    bridge-funktion der returnerer total_movies, owned_movies, found_on_plex
-    og top_5_missing for hele skuespillerens karriere.
-  - check_franchise_status routed til check_franchise_on_plex() (uændret).
+  - get_user_history routing sender nu tool_input.get("media_type") videre
+    til tautulli_service, så 'senest sete film' filtrerer korrekt.
+  - get_user_watch_stats og get_popular_on_plex sender days=0 direkte igennem
+    til tautulli_service som signalerer 'all-time' (time_range udelades).
   - SEARCH_SIGNAL konstant bevaret.
   - Prompt caching aktiveret på system prompt og tools.
 """
@@ -89,7 +89,7 @@ def _slim_data(data, max_list_items: int = 10):
 def _trim_tool_result(result: str) -> str:
     """
     Trim tool result til gyldig, kompakt JSON via strukturel trimming.
-    Bruger to pas: første med max 10 items, andet med max 5 hvis stadig for lang.
+    To pas: max 10 items, derefter max 5 hvis stadig for lang.
     """
     if len(result) <= _MAX_TOOL_RESULT_CHARS:
         return result
@@ -153,7 +153,6 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
             plex_username=plex_username,
         ))
     if tool_name == "search_plex_by_actor":
-        # Completionist bridge: returnerer fuld karriere-statistik + top 5 mangler
         return j(await check_actor_on_plex(
             actor_name=tool_input["actor_name"],
             plex_username=plex_username,
@@ -177,25 +176,35 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
 
     # ── Tautulli ──────────────────────────────────────────────────────────────
     if tool_name == "get_popular_on_plex":
+        # days=0 sendes direkte igennem — tautulli_service udelader time_range ved 0
+        days = tool_input.get("days", 30)
         return j(await get_popular_on_plex(
             stats_count=tool_input.get("stats_count", 10),
-            time_range=tool_input.get("days", 30),
+            time_range=days if days is not None else 30,
         ))
+
     if tool_name == "get_user_watch_stats":
         if not plex_username:
             return j({"error": "Intet Plex-brugernavn fundet."})
+        # days=0 → all-time; None → default 365
+        days = tool_input.get("days")
+        query_days = days if days is not None else 365
         return j(await get_user_watch_stats(
             plex_username,
-            query_days=tool_input.get("days", 365),
+            query_days=query_days,
         ))
+
     if tool_name == "get_user_history":
         if not plex_username:
             return j({"error": "Intet Plex-brugernavn fundet."})
+        # Sender media_type videre hvis Claude har specificeret det
         return j(await get_user_history(
             plex_username,
-            length=tool_input.get("length", 10),
+            length=tool_input.get("length", 25),
             query=tool_input.get("query"),
+            media_type=tool_input.get("media_type"),   # FIX: ny parameter
         ))
+
     if tool_name == "get_recently_added":
         return j(await get_recently_added(count=tool_input.get("count", 10)))
 
@@ -213,8 +222,6 @@ async def get_ai_response(
     Prompt caching:
       - system prompt caches med cache_control: {"type": "ephemeral"}
       - tools-listen caches ligeledes
-      Anthropic cacher disse i 5 minutter. Ved cache hit betales kun 10% af
-      normal input-pris. Cache miss koster 25% ekstra men betales kun én gang.
     """
     _histories[telegram_id].append({"role": "user", "content": user_message})
     _trim(telegram_id)

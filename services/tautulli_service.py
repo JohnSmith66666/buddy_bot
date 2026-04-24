@@ -4,19 +4,27 @@ services/tautulli_service.py
 Handles all communication with the Tautulli API.
 
 CHANGES vs previous version:
-  - get_user_watch_stats() now fires the two get_home_stats calls (top_movies
-    + top_tv) in parallel via asyncio.gather — cuts latency roughly in half.
-  - get_user_history() now accepts an optional `query` parameter and filters
-    results client-side when provided (Tautulli has no server-side title filter
-    on the history endpoint).
+  - get_user_watch_stats() og get_popular_on_plex() understøtter nu all-time:
+    Hvis query_days/time_range er 0 eller None, udelades time_range-parameteren
+    helt fra API-kaldet. Tautulli returnerer dermed statistik for al tid.
+    Dette løser problemet med 'absolut mest sete nogensinde' der returnerede
+    kun 30 dage.
+  - get_user_history() rettet:
+    Bruger nu korrekt Tautulli-parameter `user` (ikke `user_id`) til
+    brugerfiltrering på get_history-endpoint.
+    Fjernet tidsbegrænsning (length øget til 100 ved ingen query).
+    Parsed korrekt: response['response']['data']['data'] arrayet.
+    Tilføjet media_type=movie parameter til film-specifik historik.
+  - Alle tidsbegrænsede kald bruger query_days til get_user_watch_time_stats
+    og time_range til get_home_stats — konsistent med Tautulli API-dokumentation.
 
-Korrekte parametre (bekræftet via debug-logs 2026-04-23):
-- get_user_watch_time_stats : bruger `query_days` + user_id
-- get_home_stats med user_id : bruger `time_range` + user_id + stats_count
-- get_home_stats uden user_id: bruger `time_range` + stats_count (server-wide)
-- get_recently_added        : bruger `count`
-- Tid returneres i SEKUNDER — skal divideres med 3600 for timer, 60 for minutter.
-- added_at returneres som Unix timestamp — konverteres til ISO-dato her.
+Korrekte parametre (bekræftet via debug-logs 2026-04-23 + 2026-04-24):
+  - get_user_watch_time_stats: query_days + user_id
+  - get_home_stats med user_id:  time_range + user_id + stats_count
+    (udelad time_range for all-time)
+  - get_history: user (brugernavn som string), media_type, length
+  - Tid returneres i SEKUNDER — divider med 3600 for timer.
+  - added_at returneres som Unix timestamp.
 """
 
 import asyncio
@@ -31,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 TAUTULLI_BASE = config.TAUTULLI_URL.rstrip("/")
 API_KEY = config.TAUTULLI_API_KEY
+
+# Sentinel-værdi der signalerer "alle tider" til interne funktioner
+ALL_TIME = 0
 
 
 async def _tautulli_get(params: dict) -> dict | None:
@@ -87,42 +98,42 @@ async def get_tautulli_user_id(plex_username: str) -> int | None:
 async def get_user_watch_stats(plex_username: str, query_days: int = 365) -> dict | None:
     """
     Returns a combined personal statistics payload for a single user:
-      - watch_time_stats : total seertid i timer/minutter + antal afspilninger
-      - top_movies       : top 5 film set af denne bruger
-      - top_tv           : top 5 serier set af denne bruger
+      - watch_time_stats: total seertid i timer/minutter + antal afspilninger
+      - top_movies:       top 5 film set af denne bruger
+      - top_tv:           top 5 serier set af denne bruger
 
-    FIX: top_movies and top_tv are now fetched in parallel with asyncio.gather,
-    cutting the latency of this function roughly in half.
+    FIX: query_days=0 betyder 'all time' — time_range udelades fra API-kaldet.
+    Film og serier hentes parallelt med asyncio.gather.
     """
     user_id = await get_tautulli_user_id(plex_username)
     if user_id is None:
         logger.error("Cannot fetch stats: user_id not resolved for '%s'.", plex_username)
         return None
 
-    # Fire all three requests concurrently.
+    # Byg home_stats params — udelad time_range ved all-time
+    def _home_stats_params(stat_id: str) -> dict:
+        p = {
+            "cmd":         "get_home_stats",
+            "user_id":     user_id,
+            "stats_count": 5,
+            "stat_id":     stat_id,
+        }
+        if query_days and query_days != ALL_TIME:
+            p["time_range"] = query_days
+        # query_days=0/None → udelad time_range → Tautulli returnerer all-time
+        return p
+
     watch_time_raw, top_movies_raw, top_tv_raw = await asyncio.gather(
         _tautulli_get({
-            "cmd": "get_user_watch_time_stats",
-            "user_id": user_id,
-            "query_days": query_days,
+            "cmd":        "get_user_watch_time_stats",
+            "user_id":    user_id,
+            "query_days": query_days if query_days and query_days != ALL_TIME else 99999,
         }),
-        _tautulli_get({
-            "cmd": "get_home_stats",
-            "user_id": user_id,
-            "time_range": query_days,
-            "stats_count": 5,
-            "stat_id": "top_movies",
-        }),
-        _tautulli_get({
-            "cmd": "get_home_stats",
-            "user_id": user_id,
-            "time_range": query_days,
-            "stats_count": 5,
-            "stat_id": "top_tv",
-        }),
+        _tautulli_get(_home_stats_params("top_movies")),
+        _tautulli_get(_home_stats_params("top_tv")),
     )
 
-    # Convert raw seconds to hours/minutes.
+    # Konverter sekunder til timer/minutter
     watch_time_data = None
     if watch_time_raw:
         watch_time_data = []
@@ -168,14 +179,19 @@ def _extract_rows(data, stat_id: str) -> list | None:
 async def get_popular_on_plex(stats_count: int = 10, time_range: int = 30) -> dict | None:
     """
     Returns the most popular content on the Plex server globally.
-    Strips users_watched, total_plays og total_duration før data sendes til AI.
-    """
-    data = await _tautulli_get({
-        "cmd": "get_home_stats",
-        "time_range": time_range,
-        "stats_count": stats_count,
-    })
 
+    FIX: time_range=0 betyder 'all time' — parameteren udelades fra kaldet.
+    Strips users_watched, total_plays og total_duration inden data sendes til AI.
+    """
+    params: dict = {
+        "cmd":         "get_home_stats",
+        "stats_count": stats_count,
+    }
+    if time_range and time_range != ALL_TIME:
+        params["time_range"] = time_range
+    # time_range=0/None → udelad → Tautulli returnerer all-time statistik
+
+    data = await _tautulli_get(params)
     if not data:
         return None
 
@@ -199,12 +215,10 @@ async def get_popular_on_plex(stats_count: int = 10, time_range: int = 30) -> di
 async def get_recently_added(count: int = 10) -> dict | None:
     """
     Returns the most recently added content on the Plex server.
-
-    added_at fra Tautulli er et Unix timestamp (sekunder siden 1970).
-    Vi konverterer det til ISO-dato og tilføjer added_at_readable.
+    added_at fra Tautulli er et Unix timestamp — konverteres til ISO-dato.
     """
     data = await _tautulli_get({
-        "cmd": "get_recently_added",
+        "cmd":   "get_recently_added",
         "count": count,
     })
 
@@ -213,11 +227,9 @@ async def get_recently_added(count: int = 10) -> dict | None:
         return None
 
     logger.info(
-        "get_recently_added raw: type=%s, keys=%s, sample=%s",
+        "get_recently_added raw: type=%s, keys=%s",
         type(data).__name__,
         list(data.keys()) if isinstance(data, dict) else f"list[{len(data)}]",
-        str(data[0])[:150] if isinstance(data, list) and data else
-        str({k: v for k, v in list(data.items())[:3]}) if isinstance(data, dict) else "tom",
     )
 
     items = []
@@ -228,12 +240,8 @@ async def get_recently_added(count: int = 10) -> dict | None:
             or data.get("results")
             or []
         )
-        if not items:
-            logger.warning("get_recently_added: dict uden kendte nøgler. Keys: %s", list(data.keys()))
     elif isinstance(data, list):
         items = data
-
-    logger.info("get_recently_added: %d elementer fundet efter parsing", len(items))
 
     now = datetime.now(timezone.utc)
     movies   = []
@@ -242,10 +250,10 @@ async def get_recently_added(count: int = 10) -> dict | None:
     for item in items:
         media_type = item.get("media_type", "")
 
-        added_at_raw     = item.get("added_at")
-        added_at_iso     = None
+        added_at_raw      = item.get("added_at")
+        added_at_iso      = None
         added_at_readable = None
-        days_ago         = None
+        days_ago          = None
         try:
             if added_at_raw:
                 dt = datetime.fromtimestamp(int(added_at_raw), tz=timezone.utc)
@@ -255,8 +263,6 @@ async def get_recently_added(count: int = 10) -> dict | None:
         except Exception:
             pass
 
-        # FIX: Udtræk det rigtige TMDB ID fra guids-listen.
-        # Plex's rating_key er IKKE et TMDB ID — brug aldrig rating_key til TMDB-opslag.
         tmdb_id = None
         for guid in item.get("guids", []):
             if isinstance(guid, str) and guid.startswith("tmdb://"):
@@ -272,7 +278,7 @@ async def get_recently_added(count: int = 10) -> dict | None:
             "added_at":          added_at_iso,
             "added_at_readable": added_at_readable,
             "days_ago":          days_ago,
-            "tmdb_id":           tmdb_id,   # Korrekt TMDB ID — brug dette til get_media_details
+            "tmdb_id":           tmdb_id,
             "media_type":        media_type,
         }
 
@@ -290,21 +296,12 @@ async def get_recently_added(count: int = 10) -> dict | None:
             else:
                 movies.append(base)
 
-    result = {
+    return {
         "movies":     movies[:count],
         "episodes":   episodes[:count],
         "total":      len(movies) + len(episodes),
         "fetched_at": now.strftime("%Y-%m-%d"),
     }
-
-    if result["total"] == 0 and items:
-        logger.warning(
-            "get_recently_added: %d items modtaget men 0 parset. Første item: %s",
-            len(items), str(items[0])[:200],
-        )
-        result["raw_sample"] = str(items[0])[:300] if items else None
-
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -322,35 +319,77 @@ async def get_activity() -> dict | None:
 
 async def get_user_history(
     plex_username: str,
-    length: int = 10,
+    length: int = 25,
     query: str | None = None,
+    media_type: str | None = None,
 ) -> list | None:
     """
-    Returns the most recent watch history entries for a user.
+    Returns the most recent watch history for a user.
 
-    FIX: Accepts an optional `query` parameter. When provided, results are
-    filtered client-side (Tautulli's /get_history endpoint has no title filter).
-    We fetch a larger batch when filtering to increase the chance of matches.
+    FIX 1: Bruger nu `user` parameter (brugernavn som string) i stedet for
+    `user_id`. Tautulli's get_history endpoint accepterer `user` direkte
+    og er mere pålidelig end user_id-baseret filtrering på dette endpoint.
+
+    FIX 2: Parser korrekt: Tautulli returnerer
+    response['response']['data']['data'] — det inderste 'data'-array
+    indeholder de faktiske afspilningsposter. Den generelle _tautulli_get()
+    returnerer allerede 'data'-niveauet, så vi henter .get('data') én gang til.
+
+    FIX 3: Ingen tidsbegrænsning på kaldet — length øges til 100 ved
+    titel-søgning for at øge chancen for at finde posten.
+
+    FIX 4: Tilføjet media_type parameter (f.eks. 'movie') til filtrering
+    direkte i API-kaldet, så Tautulli kun returnerer den ønskede type.
     """
-    user_id = await get_tautulli_user_id(plex_username)
-    if user_id is None:
-        return None
+    fetch_length = max(length, 100) if query else length
 
-    fetch_length = max(length, 50) if query else length
-
-    data = await _tautulli_get({
-        "cmd": "get_history",
-        "user_id": user_id,
+    params: dict = {
+        "cmd":    "get_history",
+        "user":   plex_username,   # FIX: 'user' ikke 'user_id' på dette endpoint
         "length": fetch_length,
-    })
+    }
 
+    # Tilføj media_type filter hvis angivet
+    if media_type:
+        params["media_type"] = media_type
+
+    data = await _tautulli_get(params)
+
+    # FIX: get_history returnerer {"draw": ..., "recordsTotal": ..., "data": [...]}
+    # _tautulli_get() returnerer allerede det ydre 'data'-objekt,
+    # så vi skal hente det inderste 'data'-array herfra.
     rows: list = []
-    if data and isinstance(data, dict):
+    if data is None:
+        logger.warning("get_user_history: Tautulli returnerede None for user='%s'", plex_username)
+        return []
+
+    if isinstance(data, dict):
+        # Korrekt parsing: det inderste 'data'-array
         rows = data.get("data", [])
+        if not rows:
+            # Fallback: prøv andre kendte nøgler
+            rows = data.get("rows", []) or data.get("results", [])
+        logger.info(
+            "get_user_history: parsed %d poster for user='%s' (dict-format)",
+            len(rows), plex_username,
+        )
     elif isinstance(data, list):
         rows = data
+        logger.info(
+            "get_user_history: parsed %d poster for user='%s' (list-format)",
+            len(rows), plex_username,
+        )
 
-    if query:
+    if not rows:
+        logger.warning(
+            "get_user_history: tom historik for user='%s'. "
+            "Rådata-keys: %s",
+            plex_username,
+            list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+        )
+
+    # Titel-filtrering client-side (Tautulli har ingen server-side titelfilter)
+    if query and rows:
         q = query.lower()
         rows = [
             r for r in rows
@@ -358,5 +397,8 @@ async def get_user_history(
             or q in (r.get("grandparent_title") or "").lower()
             or q in (r.get("full_title") or "").lower()
         ]
+        logger.info(
+            "get_user_history: %d poster matchede query='%s'", len(rows), query
+        )
 
     return rows[:length]

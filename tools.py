@@ -2,11 +2,13 @@
 tools.py - Claude Tool Use definitions for Buddy.
 
 CHANGES vs previous version:
-  - search_plex_by_actor: nu en completionist bridge-funktion der returnerer
-    total_movies, owned_movies, found_on_plex og top_5_missing.
-  - check_franchise_status: avanceret franchise-søgning via GUID-matching.
-  - get_trending: returnerer altid 5+5 dict via ét kald.
-  - get_person_filmography: returnerer nu ALLE film sorteret efter popularity.
+  - get_user_watch_stats: days=0 betyder nu 'all time' / 'nogensinde'.
+    Beskrivelsen fortæller Claude præcist hvornår den skal sende 0.
+  - get_popular_on_plex: days=0 betyder nu 'all time'.
+    Beskrivelsen er opdateret tilsvarende.
+  - get_user_history: tilføjet media_type parameter så Claude kan
+    specificere 'movie' eller 'episode' direkte.
+  - Alle øvrige tools er uændrede.
 """
 
 TOOLS = [
@@ -239,30 +241,63 @@ TOOLS = [
     # ── Tautulli ──────────────────────────────────────────────────────────────
     {
         "name": "get_popular_on_plex",
-        "description": "Hent de mest populaere film og serier paa Plex-serveren.",
+        "description": (
+            "Hent de mest populaere film og serier paa Plex-serveren. "
+            "Brug days=30 for seneste maaned (standard), days=365 for seneste aar. "
+            "Brug days=0 naar brugeren spørger om 'all time', 'nogensinde', "
+            "'mest populaere gennem tiderne' eller lignende historisk/ubegrænset statistik."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "days": {"type": "integer", "description": "Antal dage. Standard 30."},
+                "days": {
+                    "type": "integer",
+                    "description": "Antal dage. Standard 30. Brug 0 for all-time / nogensinde.",
+                },
             },
             "required": [],
         },
     },
     {
         "name": "get_user_watch_stats",
-        "description": "Hent brugerens personlige statistik — seertid og top 5 film/serier.",
+        "description": (
+            "Hent brugerens personlige statistik — seertid og top 5 film/serier. "
+            "Brug days=30 for seneste maaned, days=365 for seneste aar (standard). "
+            "Brug days=0 naar brugeren spørger om 'all time', 'nogensinde', "
+            "'historisk', 'absolut mest sete' eller lignende ubegrænset statistik."
+        ),
         "input_schema": {
             "type": "object",
-            "properties": {"days": {"type": "integer"}},
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "Antal dage. Standard 365. Brug 0 for all-time / nogensinde.",
+                },
+            },
             "required": [],
         },
     },
     {
         "name": "get_user_history",
-        "description": "Soeg i brugerens egen afspilningshistorik.",
+        "description": (
+            "Soeg i brugerens egen afspilningshistorik. "
+            "Brug media_type='movie' naar brugeren spørger om senest sete film, "
+            "media_type='episode' for serier, eller udelad for begge. "
+            "Ingen tidsbegrænsning — returnerer de nyeste afspilninger."
+        ),
         "input_schema": {
             "type": "object",
-            "properties": {"query": {"type": "string"}},
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Valgfri titel-søgning i historikken.",
+                },
+                "media_type": {
+                    "type": "string",
+                    "enum": ["movie", "episode"],
+                    "description": "Filtrer paa type: 'movie' eller 'episode'.",
+                },
+            },
             "required": [],
         },
     },
