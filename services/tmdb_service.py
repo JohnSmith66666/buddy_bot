@@ -2,10 +2,12 @@
 services/tmdb_service.py - TMDB API integration.
 
 CHANGES vs previous version:
-  - get_trending() tager nu en `media_type` parameter ("movie", "tv", "all").
-    Filtrerer resultater så film og serier ikke blandes unødigt.
-  - get_now_playing() og get_upcoming() sorterer nu efter `popularity` (faldende)
-    og returnerer kun de 10 mest populære — fjerner ukendte indie-film fra listen.
+  - get_trending() laver nu to separate API-kald internt:
+    ét til /trending/movie/week og ét til /trending/tv/week.
+    Returnerer {"movies": [top 5 film], "tv": [top 5 serier]} som én dict.
+    media_type-parameteren er fjernet — funktionen returnerer ALTID begge.
+  - get_now_playing() og get_upcoming() sorterer efter popularity (faldende)
+    og returnerer kun de 10 mest populære — fjerner ukendte indie-film.
 
 All requests use language=da-DK for Danish titles and overviews.
 
@@ -15,6 +17,7 @@ TOKEN OPTIMISATION:
   - Lister cappes til 10 items.
 """
 
+import asyncio
 import logging
 
 import httpx
@@ -23,9 +26,9 @@ from config import TMDB_API_KEY
 
 logger = logging.getLogger(__name__)
 
-_BASE_URL     = "https://api.themoviedb.org/3"
-_LANGUAGE     = "da-DK"
-_MAX_RESULTS  = 10
+_BASE_URL    = "https://api.themoviedb.org/3"
+_LANGUAGE    = "da-DK"
+_MAX_RESULTS = 10
 
 _MOVIE_GENRES: dict[int, str] = {
     28: "Action", 12: "Eventyr", 16: "Animation", 35: "Komedie",
@@ -229,7 +232,10 @@ async def get_person_filmography(person_id: int) -> dict | None:
             bio_resp = await client.get(f"{_BASE_URL}/person/{person_id}", params=_params())
             bio_resp.raise_for_status()
             bio = bio_resp.json()
-            credits_resp = await client.get(f"{_BASE_URL}/person/{person_id}/combined_credits", params=_params())
+            credits_resp = await client.get(
+                f"{_BASE_URL}/person/{person_id}/combined_credits",
+                params=_params(),
+            )
             credits_resp.raise_for_status()
             credits = credits_resp.json()
         except httpx.HTTPError as e:
@@ -264,44 +270,53 @@ async def get_person_filmography(person_id: int) -> dict | None:
     }
 
 
-async def get_trending(media_type: str = "all") -> list[dict]:
+async def get_trending() -> dict:
     """
-    FIX: Tager nu `media_type` som parameter ("movie", "tv" eller "all").
-    Filtrerer TMDB-resultater så film og serier ikke blandes unødigt.
-    TMDB's /trending/{media_type}/week endpoint understøtter alle tre værdier direkte.
+    FIX: Laver nu to separate, parallelle API-kald til TMDB:
+      - /trending/movie/week → top 5 film
+      - /trending/tv/week   → top 5 serier
+
+    Returnerer en struktureret dict:
+      {"movies": [5 film], "tv": [5 serier]}
+
+    Den faste opdeling på 5+5 sikrer at trunkering i ai_handler aldrig
+    kan afskære den ene kategori, og at Claude altid modtager begge lister.
+    Bruger asyncio.gather for at minimere latens.
     """
-    # TMDB accepterer "movie", "tv" og "all" direkte i URL'en
-    valid_types = {"movie", "tv", "all"}
-    endpoint_type = media_type if media_type in valid_types else "all"
+    _TOP_N = 5
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            resp = await client.get(
-                f"{_BASE_URL}/trending/{endpoint_type}/week",
-                params=_params(),
-            )
-            resp.raise_for_status()
-            results = resp.json().get("results", [])[:_MAX_RESULTS]
-        except httpx.HTTPError as e:
-            logger.error("TMDB trending error: %s", e)
-            return []
+    async def _fetch(endpoint_type: str) -> list[dict]:
+        async with httpx.AsyncClient(timeout=10) as client:
+            try:
+                resp = await client.get(
+                    f"{_BASE_URL}/trending/{endpoint_type}/week",
+                    params=_params(),
+                )
+                resp.raise_for_status()
+                return resp.json().get("results", [])[:_TOP_N]
+            except httpx.HTTPError as e:
+                logger.error("TMDB trending/%s error: %s", endpoint_type, e)
+                return []
 
-    formatted = []
-    for item in results:
-        item_type = item.get("media_type", endpoint_type)
-        if item_type == "movie":
-            formatted.append(_format_movie_result(item))
-        elif item_type == "tv":
-            formatted.append(_format_tv_result(item))
+    movie_raw, tv_raw = await asyncio.gather(
+        _fetch("movie"),
+        _fetch("tv"),
+    )
 
-    return formatted
+    return {
+        "movies": [_format_movie_result(i) for i in movie_raw],
+        "tv":     [_format_tv_result(i)    for i in tv_raw],
+    }
 
 
 async def get_recommendations(tmdb_id: int, media_type: str) -> list[dict]:
     endpoint = "movie" if media_type == "movie" else "tv"
     async with httpx.AsyncClient(timeout=10) as client:
         try:
-            resp = await client.get(f"{_BASE_URL}/{endpoint}/{tmdb_id}/recommendations", params=_params())
+            resp = await client.get(
+                f"{_BASE_URL}/{endpoint}/{tmdb_id}/recommendations",
+                params=_params(),
+            )
             resp.raise_for_status()
             results = resp.json().get("results", [])[:_MAX_RESULTS]
         except httpx.HTTPError as e:
@@ -338,9 +353,9 @@ async def get_watch_providers(tmdb_id: int, media_type: str) -> dict:
 
 async def get_now_playing() -> list[dict]:
     """
-    FIX: Sorterer nu efter `popularity` (faldende) og returnerer kun top 10.
+    Sorterer efter popularity (faldende) og returnerer kun top 10.
     Fjerner ukendte indie-film der sneg sig ind pga. dansk udgivelsesdato.
-    Henter 2 sider fra TMDB for at have nok kandidater til popularitetssorteringen.
+    Henter 2 sider fra TMDB for at have nok kandidater.
     """
     raw: list[dict] = []
     async with httpx.AsyncClient(timeout=10) as client:
@@ -356,17 +371,16 @@ async def get_now_playing() -> list[dict]:
                 logger.error("TMDB now_playing error (page %d): %s", page, e)
                 break
 
-    # Sortér efter popularity faldende, behold top 10
     raw.sort(key=lambda x: x.get("popularity", 0), reverse=True)
     return [_format_movie_result(i) for i in raw[:_MAX_RESULTS]]
 
 
 async def get_upcoming() -> list[dict]:
     """
-    FIX: Sorterer nu efter `popularity` (faldende) og returnerer kun top 10.
+    Sorterer efter popularity (faldende) og returnerer kun top 10.
     Fjerner ukendte indie-film der sneg sig ind pga. dansk udgivelsesdato.
-    Henter 2 sider fra TMDB for at have nok kandidater til popularitetssorteringen.
-    Sekundær sortering på release_date (stigende) sker EFTER popularity-filtrering,
+    Henter 2 sider fra TMDB for at have nok kandidater.
+    Sekundær sortering på release_date (stigende) efter popularity-filtrering,
     så listen præsenteres kronologisk for brugeren.
     """
     raw: list[dict] = []

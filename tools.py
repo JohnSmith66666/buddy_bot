@@ -4,7 +4,9 @@ tools.py - Claude Tool Use definitions for Buddy.
 CHANGES vs previous version:
   - Fjernet add_movie og add_series — bestilling sker nu via Inline Keyboards.
   - Claude trigger bestilling via SHOW_SEARCH_RESULTS-svar, ikke direkte tool-kald.
-  - get_trending har nu en `media_type` parameter ("movie", "tv", "all").
+  - get_trending returnerer nu altid præcis 5 film og 5 serier som en struktureret
+    dict: {"movies": [...], "tv": [...]}. Ingen media_type parameter — begge
+    kategorier hentes altid i ét kald via to parallelle interne API-kald.
 """
 
 TOOLS = [
@@ -40,19 +42,17 @@ TOOLS = [
     {
         "name": "get_trending",
         "description": (
-            "Hent de mest populaere og trendende film og/eller serier denne uge globalt. "
-            "Brug media_type for at filtrere: 'movie' for kun film, 'tv' for kun serier, "
-            "'all' for begge blandet. Standard er 'all'."
+            "Hent de mest trendende titler globalt denne uge. "
+            "Returnerer ALTID praecis 5 film og 5 serier som en struktureret dict: "
+            "{\"movies\": [5 film], \"tv\": [5 serier]}. "
+            "Begge kategorier hentes altid i eet kald — brug dette ene tool naar "
+            "brugeren vil se trending film og/eller serier. "
+            "Efter du modtager resultatet, SKAL du tjekke alle 10 titler i Plex "
+            "via check_plex_library (se Plex-tjek reglen i system-prompten)."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {
-                "media_type": {
-                    "type": "string",
-                    "enum": ["movie", "tv", "all"],
-                    "description": "Filtrer paa type: 'movie', 'tv' eller 'all'. Standard: 'all'.",
-                },
-            },
+            "properties": {},
             "required": [],
         },
     },
@@ -115,8 +115,10 @@ TOOLS = [
         "description": (
             "Tjek om en specifik titel allerede findes i Plex-biblioteket. "
             "SKAL altid kaldes foer en bestilling. "
-            "Hvis 'found': fortael brugeren vi allerede har den og STOP. "
-            "Hvis 'missing': svar med SHOW_SEARCH_RESULTS-kommandoen."
+            "Skal ogsaa kaldes for ALLE titler i en trending- eller anbefalingsliste "
+            "foer svaret formuleres til brugeren (se system-prompten). "
+            "Hvis 'found': fortael brugeren vi allerede har den og STOP (ved bestilling). "
+            "Hvis 'missing': svar med SHOW_SEARCH_RESULTS-kommandoen (ved bestilling)."
         ),
         "input_schema": {
             "type": "object",
