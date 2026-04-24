@@ -197,19 +197,25 @@ async def handle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Fanger /info_movie_<tmdb_id> og /info_tv_<tmdb_id> kommandoer.
-    Disse oprettes automatisk af Buddy i lister og er klikbare i Telegram.
+    Fleksibelt regex fanger også varianter uden underscore (f.eks. /infomovie123).
+    Disse links oprettes automatisk af Buddy i lister og er klikbare i Telegram.
     """
     if not await _guard(update):
         return
 
-    text = (update.message.text or "").strip()
-    import re as _re
-    match = _re.match(r"^/info_(movie|tv)_(\d+)$", text)
-    if not match:
-        return
+    # context.matches indeholder regex-matches fra filters.Regex
+    # Gruppe 1 = movie|tv, Gruppe 2 = tmdb_id
+    if context.matches:
+        match = context.matches[0]
+    else:
+        import re as _re
+        text  = (update.message.text or "").strip()
+        match = _re.match(r"^/info_?(movie|tv)_?(\d+)$", text)
+        if not match:
+            return
 
-    media_type = match.group(1)
-    tmdb_id    = int(match.group(2))
+    media_type    = match.group(1)
+    tmdb_id       = int(match.group(2))
     plex_username = await database.get_plex_username(update.effective_user.id)
 
     await update.message.chat.send_action("typing")
@@ -427,8 +433,9 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_watchlist_callback, pattern=r"^watchlist:"))
 
     # Info-links fra lister (/info_movie_<id>, /info_tv_<id>)
+    # Fleksibelt mønster fanger også varianter uden underscore (Buddy-fejlskrivning)
     app.add_handler(MessageHandler(
-        filters.Regex(r"^/info_(movie|tv)_(\d+)$"),
+        filters.Regex(r"^/info_?(movie|tv)_?(\d+)$"),
         handle_info_link,
     ))
 
