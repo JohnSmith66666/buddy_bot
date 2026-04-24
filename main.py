@@ -313,35 +313,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # ── Signal: Netflix-look infokort ─────────────────────────────────────────
     # Format: SHOW_INFO:<tmdb_id>:<media_type>
     if reply.startswith(INFO_SIGNAL):
-        parts = reply[len(INFO_SIGNAL):].split(":", 1)
-        if len(parts) == 2:
+        payload = reply[len(INFO_SIGNAL):].strip()
+        parts   = payload.split(":")
+        if len(parts) >= 2:
+            tmdb_id_str = parts[0].strip()
+            media_type  = parts[1].strip()
             try:
-                info_tmdb_id   = int(parts[0].strip())
-                info_media_type = parts[1].strip()
-            except ValueError:
-                info_tmdb_id = None
-
-            if info_tmdb_id:
-                await update.message.chat.send_action("typing")
-                info_details = await get_media_details(info_tmdb_id, info_media_type)
-                if info_details:
-                    info_title = info_details.get("title") or "Ukendt"
-                    info_year  = info_details.get(
-                        "release_date", info_details.get("first_air_date", "")
-                    )[:4]
-                    import secrets as _sec
-                    info_token = _sec.token_hex(8)
-                    await database.save_pending_request(info_token, user.id, {
-                        "media_type": info_media_type,
-                        "tmdb_id":    info_tmdb_id,
-                        "title":      info_title,
-                        "year":       int(info_year) if info_year else None,
-                        "step":       "picked",
-                    })
-                    await show_confirmation(update.message, context, info_token, plex_username)
-                    return
-        # Fallback: vis som normalt svar hvis parsing fejler
-        logger.warning("SHOW_INFO signal kunne ikke parses: %s", reply)
+                from services.confirmation_service import _make_token
+                token = _make_token()
+                await database.save_pending_request(token, user.id, {
+                    "media_type": media_type,
+                    "tmdb_id":    int(tmdb_id_str),
+                    "title":      "Slår op...",
+                    "step":       "picked",
+                })
+                await show_confirmation(update.message, context, token, plex_username)
+                return
+            except Exception as e:
+                logger.error("Fejl ved håndtering af SHOW_INFO: %s", e)
+        else:
+            logger.warning("SHOW_INFO signal kunne ikke parses: %r", reply)
 
     # ── Signal: trailer-knap ──────────────────────────────────────────────────
     # Format: SHOW_TRAILER:<beskedtekst>|<trailer_url>
