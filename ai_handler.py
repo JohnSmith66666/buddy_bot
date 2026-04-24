@@ -5,14 +5,13 @@ CHANGES vs previous version:
   - Importeret ZoneInfo fra zoneinfo (med try/except fallback).
   - _dansk_dato() bruger nu datetime.now(ZoneInfo("Europe/Copenhagen"))
     for korrekt dansk tid på Railway (der kører UTC).
-  - _dansk_dato() returnerer nu ISO-datoen (YYYY-MM-DD) forrest i strengen,
-    efterfulgt af den danske tekst i parentes.
-    Eksempel: '2026-04-24 (Fredag d. 24. april 2026, kl. 19:42)'
-    Dette gør det muligt for Claude at sammenligne direkte med TMDB's
-    release_date-felter (som også er YYYY-MM-DD) uden konvertering.
-  - dynamic_lines (Blok 1) indeholder nu en eksplicit instruktion om at
-    sammenligne release_date med ISO-datoen for at afgøre om en film
-    er udkommet eller ej.
+  - _dansk_dato() returnerer ISO-datoen (YYYY-MM-DD) forrest, efterfulgt
+    af den danske tekst i parentes — uden klokkeslæt, da det er irrelevant
+    for dato-sammenligning med TMDB's release_date-felter.
+    Eksempel: '2026-04-24 (Fredag d. 24. april 2026)'
+  - dynamic_lines (Blok 1) indeholder nu en matematisk direkte instruktion:
+    Claude skal sammenligne release_date alfabetisk/numerisk med ISO-datoen.
+    Eksempel skæres ud i pap: '2025-12-17 < 2026-04-24 → filmen er udkommet'.
   - Alle øvrige funktioner er uændrede.
 """
 
@@ -93,13 +92,14 @@ _MAANEDER = {
 
 def _dansk_dato() -> str:
     """
-    Returnerer den aktuelle dato og tid i Copenhagen-tidszone formateret på dansk.
+    Returnerer dags dato i Copenhagen-tidszone, med ISO-format forrest.
 
-    Output-format: '2026-04-24 (Fredag d. 24. april 2026, kl. 19:42)'
-    ISO-datoen (YYYY-MM-DD) placeres forrest så Claude kan sammenligne den
-    direkte med TMDB's release_date-felter uden konvertering.
+    Output-format: '2026-04-24 (Fredag d. 24. april 2026)'
+    Klokkeslættet er udeladt — det er irrelevant for dato-sammenligning.
+    ISO-delen (YYYY-MM-DD) kan sammenlignes alfabetisk/numerisk direkte
+    med TMDB's release_date-felter (der også er YYYY-MM-DD).
 
-    Bruger ZoneInfo("Europe/Copenhagen") for korrekt dansk tid på Railway
+    Bruger ZoneInfo("Europe/Copenhagen") for korrekt dansk dato på Railway
     (der kører UTC). Falder tilbage til datetime.now() hvis zoneinfo fejler.
     strftime-output er engelsk på Railway — vi mapper manuelt til dansk.
     """
@@ -107,11 +107,10 @@ def _dansk_dato() -> str:
         nu = datetime.now(_TZ_COPENHAGEN) if _TZ_COPENHAGEN else datetime.now()
     except Exception:
         nu = datetime.now()
-    iso     = nu.strftime("%Y-%m-%d")
-    ugedag  = _UGEDAGE.get(nu.strftime("%A"), nu.strftime("%A"))
-    maaned  = _MAANEDER.get(nu.strftime("%B"), nu.strftime("%B"))
-    dansk   = f"{ugedag} d. {nu.day}. {maaned} {nu.year}, kl. {nu.strftime('%H:%M')}"
-    return f"{iso} ({dansk})"
+    iso    = nu.strftime("%Y-%m-%d")
+    ugedag = _UGEDAGE.get(nu.strftime("%A"), nu.strftime("%A"))
+    maaned = _MAANEDER.get(nu.strftime("%B"), nu.strftime("%B"))
+    return f"{iso} ({ugedag} d. {nu.day}. {maaned} {nu.year})"
 
 
 def _trim(telegram_id: int) -> None:
@@ -303,10 +302,12 @@ async def get_ai_response(
 
     # ── Blok 1: dynamisk kontekst — aldrig cachet ─────────────────────────────
     dynamic_lines = [
-        f"Intern system-info (MÅ IKKE NÆVNES FOR BRUGEREN):\n"
-        f"Dags dato er: {_dansk_dato()}.\n"
-        f"Når du vurderer om en film er udkommet, SKAL du sammenligne filmens "
-        f"'release_date' (YYYY-MM-DD) direkte med ISO-datoen ovenfor."
+        f"Intern system-info (MÅ IKKE NÆVNES):\n"
+        f"Dags dato (ISO) er: {_dansk_dato()}.\n"
+        f"VIGTIGT: Sammenlign ALTID filmens 'release_date' med ISO-datoen. "
+        f"Hvis 'release_date' er alfabetisk/matematisk MINDRE end dags dato, "
+        f"ER FILMEN UDKOMMET, og du SKAL omtale den i datid (f.eks. 'udkom i', 'er landet'). "
+        f"Eksempel: '2025-12-17' er MINDRE end '{_dansk_dato()[:10]}' → filmen er udkommet."
     ]
     if plex_username:
         dynamic_lines.append(f"Den aktuelle bruger hedder '{plex_username}' på Plex.")
