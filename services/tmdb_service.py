@@ -2,12 +2,10 @@
 services/tmdb_service.py - TMDB API integration.
 
 CHANGES vs previous version:
-  - Engelsk trailer-fallback i get_media_details(): hvis da-DK kaldet
-    returnerer ingen trailer (trailer_url er None), laves et ekstra kald
-    til TMDB's /videos endpoint med language=en-US. Dette løser problemet
-    med kendte film som Interstellar og Inception, der ikke har en dansk
-    trailer i TMDB men altid har en engelsk.
-  - _extract_trailer_url() og youtu.be-format er uændret.
+  - get_media_details: append_to_response udvidet til "videos,credits".
+  - Top 3 skuespillere udtrækkes fra credits.cast og returneres som "cast".
+  - poster_url bygges fra poster_path og returneres i dict'en.
+  - Engelsk trailer-fallback bevaret fra forrige version.
 """
 
 import asyncio
@@ -22,6 +20,19 @@ logger = logging.getLogger(__name__)
 _BASE_URL    = "https://api.themoviedb.org/3"
 _LANGUAGE    = "da-DK"
 _MAX_RESULTS = 10
+_POSTER_BASE = "https://image.tmdb.org/t/p/w500"
+
+
+def _extract_cast(data: dict, max_cast: int = 3) -> list[str]:
+    """Returner de øverste max_cast skuespillernavne fra credits.cast."""
+    cast = data.get("credits", {}).get("cast", [])
+    return [c["name"] for c in cast[:max_cast] if c.get("name")]
+
+
+def _build_poster_url(data: dict) -> str | None:
+    """Byg fuld TMDB poster URL fra poster_path, eller None hvis mangler."""
+    path = data.get("poster_path")
+    return f"{_POSTER_BASE}{path}" if path else None
 
 _MOVIE_GENRES: dict[int, str] = {
     28: "Action", 12: "Eventyr", 16: "Animation", 35: "Komedie",
@@ -40,7 +51,7 @@ _TV_GENRES: dict[int, str] = {
 }
 
 _STRIP_FIELDS = {
-    "poster_path", "backdrop_path", "poster_url", "backdrop_url",
+    "backdrop_path", "poster_url", "backdrop_url",
     "profile_url", "profile_path", "still_path",
     "production_companies", "production_countries",
     "spoken_languages", "belongs_to_collection",
@@ -161,16 +172,14 @@ async def search_media(query: str, media_type: str = "both") -> list[dict]:
 
 async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
     """
-    Fetch full details for a film or TV show, including YouTube trailer URL.
+    Fetch full details for a film or TV show.
 
-    append_to_response=videos er inkluderet for at hente trailere i samme
-    API-kald og undgå ekstra latens. trailer_url konstrueres via
-    _extract_trailer_url() og er None hvis ingen YouTube-video findes.
+    append_to_response=videos,credits henter trailer + cast i ét kald.
+    Returnerer cast (top 3 navne) og poster_url til Netflix-look visningen.
 
     Trailer-strategi (to-trins fallback):
-      1. da-DK: traileren hentes i det primære API-kald (append_to_response=videos).
-      2. en-US: hvis ingen dansk trailer, laves et ekstra kald til /videos
-         med language=en-US. Løser manglende trailers for film som Interstellar.
+      1. da-DK: traileren hentes i det primære API-kald.
+      2. en-US: fallback hvis ingen dansk trailer findes.
 
     For TV-serier hentes external_ids separat for tvdb_id (Sonarr kræver det).
     """
@@ -180,7 +189,7 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
         try:
             resp = await client.get(
                 f"{_BASE_URL}/{endpoint}/{tmdb_id}",
-                params=_params(append_to_response="videos"),
+                params=_params(append_to_response="videos,credits"),
             )
             resp.raise_for_status()
             data = resp.json()
@@ -188,8 +197,10 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
             logger.error("TMDB details error (id=%s type=%s): %s", tmdb_id, media_type, e)
             return None
 
-    # Udtræk trailer URL inden _strip() fjerner 'videos'-feltet
+    # Udtræk trailer, cast og poster FØR _strip() fjerner felterne
     trailer_url = _extract_trailer_url(data)
+    cast        = _extract_cast(data)
+    poster_url  = _build_poster_url(data)
 
     # ── Engelsk fallback hvis ingen dansk trailer ─────────────────────────────
     if not trailer_url:
@@ -212,7 +223,7 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
     if trailer_url:
         logger.info("TMDB trailer: tmdb_id=%s → %s", tmdb_id, trailer_url)
     else:
-        logger.debug("TMDB: ingen trailer fundet (hverken da-DK eller en-US) for tmdb_id=%s", tmdb_id)
+        logger.debug("TMDB: ingen trailer (hverken da-DK eller en-US) for tmdb_id=%s", tmdb_id)
 
     if media_type == "movie":
         return _strip({
@@ -228,6 +239,8 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
             "original_language": data.get("original_language"),
             "imdb_id":           data.get("imdb_id"),
             "trailer_url":       trailer_url,
+            "cast":              cast,
+            "poster_url":        poster_url,
             "media_type":        "movie",
         })
 
@@ -265,6 +278,8 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
         "status":               data.get("status"),
         "tvdb_id":              tvdb_id,
         "trailer_url":          trailer_url,
+        "cast":                 cast,
+        "poster_url":           poster_url,
         "media_type":           "tv",
     })
 

@@ -2,14 +2,11 @@
 main.py - Buddy bot entry point.
 
 CHANGES vs previous version:
-  - Webhook secret token: _webhook_radarr og _webhook_sonarr tjekker nu
-    query-parameteren ?token= mod config.WEBHOOK_SECRET. Uautoriserede
-    requests afvises med HTTP 401. Mangler WEBHOOK_SECRET i env, logges
-    en advarsel og webhooks accepteres (bagudkompatibelt).
-  - Global error handler: handle_error() tilføjet og registreret med
-    app.add_error_handler(). Fanger alle uventede Telegram-fejl, logger
-    fuld traceback og sender en venlig besked til brugeren hvis muligt.
-  - Trailer-signal arkitektur og escape_markdown() er uændret.
+  - Webhook secret token + global error handler fra forrige version bevaret.
+  - Ny /info_movie_<id> og /info_tv_<id> handler: fanger kommando-links
+    som Buddy skriver i lister, henter TMDB-detaljer og åbner Netflix-look.
+  - Ny watchlist: callback handler til 📌-knappen i show_confirmation.
+  - add_to_watchlist importeret fra plex_service.
 """
 
 import asyncio
@@ -35,10 +32,11 @@ from admin_handlers import handle_approve_callback, notify_admin_new_user
 from ai_handler import SEARCH_SIGNAL, TRAILER_SIGNAL, clear_history, get_ai_response
 from services.confirmation_service import (
     execute_order,
+    handle_info_command,
     show_confirmation,
     show_search_results,
 )
-from services.plex_service import validate_plex_user
+from services.plex_service import add_to_watchlist, validate_plex_user
 from services.webhook_service import handle_radarr_webhook, handle_sonarr_webhook
 
 logging.basicConfig(
@@ -192,6 +190,59 @@ async def handle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
         await database.get_pending_request(token)  # sletter fra DB
 
     await query.edit_message_text("Bestillingen blev annulleret. 👍")
+
+
+# ── /info_movie_<id> og /info_tv_<id> handler ────────────────────────────────
+
+async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Fanger /info_movie_<tmdb_id> og /info_tv_<tmdb_id> kommandoer.
+    Disse oprettes automatisk af Buddy i lister og er klikbare i Telegram.
+    """
+    if not await _guard(update):
+        return
+
+    text = (update.message.text or "").strip()
+    import re as _re
+    match = _re.match(r"^/info_(movie|tv)_(\d+)$", text)
+    if not match:
+        return
+
+    media_type = match.group(1)
+    tmdb_id    = int(match.group(2))
+    plex_username = await database.get_plex_username(update.effective_user.id)
+
+    await update.message.chat.send_action("typing")
+    await handle_info_command(update, media_type, tmdb_id, plex_username)
+
+
+# ── Watchlist callback ────────────────────────────────────────────────────────
+
+async def handle_watchlist_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bruger trykkede på 📌 Tilføj til Watchlist."""
+    query = update.callback_query
+    await query.answer()
+
+    if not await _guard(update):
+        return
+
+    token = query.data.split(":", 1)[1]
+    pending = await database.get_pending_request(token)
+    if not pending:
+        await query.answer("Sessionen er udløbet — prøv igen.", show_alert=True)
+        return
+
+    title         = pending["title"]
+    tmdb_id       = pending["tmdb_id"]
+    plex_username = await database.get_plex_username(query.from_user.id)
+
+    result = await add_to_watchlist(tmdb_id, title, plex_username)
+
+    if result.get("success"):
+        await query.answer(f"✅ '{title}' er tilføjet til din Watchlist!", show_alert=True)
+    else:
+        msg = result.get("message", "Ukendt fejl")
+        await query.answer(f"❌ Kunne ikke tilføje: {msg}", show_alert=True)
 
 
 # ── Message handler ───────────────────────────────────────────────────────────
@@ -365,9 +416,16 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve_user:\d+$"))
 
     # Bestillingsflow
-    app.add_handler(CallbackQueryHandler(handle_pick_callback,    pattern=r"^pick:"))
-    app.add_handler(CallbackQueryHandler(handle_confirm_callback, pattern=r"^confirm:"))
-    app.add_handler(CallbackQueryHandler(handle_cancel_callback,  pattern=r"^cancel:"))
+    app.add_handler(CallbackQueryHandler(handle_pick_callback,      pattern=r"^pick:"))
+    app.add_handler(CallbackQueryHandler(handle_confirm_callback,   pattern=r"^confirm:"))
+    app.add_handler(CallbackQueryHandler(handle_cancel_callback,    pattern=r"^cancel:"))
+    app.add_handler(CallbackQueryHandler(handle_watchlist_callback, pattern=r"^watchlist:"))
+
+    # Info-links fra lister (/info_movie_<id>, /info_tv_<id>)
+    app.add_handler(MessageHandler(
+        filters.Regex(r"^/info_(movie|tv)_(\d+)$"),
+        handle_info_link,
+    ))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(handle_error)

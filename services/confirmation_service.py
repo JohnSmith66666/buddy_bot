@@ -2,22 +2,16 @@
 services/confirmation_service.py - Inline keyboard bekræftelsesflow.
 
 CHANGES vs previous version:
-  - execute_order() sender nu query_callback.from_user.id (telegram_id) til
-    add_movie() og add_series() i stedet for plex_username. Dette sikrer at
-    tagget "tg_<telegram_id>" oprettes i Radarr/Sonarr, så webhook_service
-    kan sende notifikationer præcist til den bruger der bestilte.
-  - pending-data gemmer nu telegram_id eksplicit ved show_confirmation().
-  - Alle øvrige handlers (show_search_results, show_confirmation) er uændrede.
-
-Håndterer:
-1. Præsentation af søgeresultater som Inline Buttons
-2. Visning af medie-detaljer med Trailer/Bestil/Annuller knapper
-3. Selve bestillingen til Radarr eller Sonarr ved bekræftelse
-
-Callback data format (max 64 bytes):
-  "pick:<token>"     — bruger valgte et søgeresultat
-  "confirm:<token>"  — bruger bekræftede bestilling
-  "cancel:<token>"   — bruger annullerede
+  - show_confirmation() er fundamentalt omskrevet til et "Netflix-look":
+    * Sletter den gamle tekstbesked og sender i stedet send_photo() med
+      TMDB poster som billede og rig caption med emojis.
+    * Tjekker check_library for at vise den rette knap:
+      - PÅ PLEX:    [▶️ Se på Plex] (deep-link via ratingKey + machineIdentifier)
+      - IKKE PLEX:  [➕ Tilføj til Plex] (confirm:token flow)
+    * Altid: [📌 Tilføj til Watchlist] + [🎬 Se Trailer] (hvis trailer_url).
+  - Ny info_handler() til /info_movie_<id> og /info_tv_<id> kommandoer.
+    Opretter pending token og kalder show_confirmation direkte.
+  - execute_order() sender nu telegram_id til Radarr/Sonarr (uændret).
 """
 
 import logging
@@ -26,6 +20,7 @@ import secrets
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import database
+from services.plex_service import check_library, STATUS_FOUND
 from services.radarr_service import add_movie
 from services.sonarr_service import add_series
 from services.tmdb_service import get_media_details, search_media
@@ -36,8 +31,75 @@ _TMDB_POSTER = "https://image.tmdb.org/t/p/w500"
 
 
 def _make_token() -> str:
-    """Generate a short unique token for callback_data (fits in 64 bytes)."""
     return secrets.token_hex(8)
+
+
+def _star_rating(score: float | None) -> str:
+    """Konverter TMDB vote_average (0-10) til stjerner (0-5)."""
+    if not score:
+        return "–"
+    stars = round(score / 2)
+    return "⭐" * stars + "☆" * (5 - stars)
+
+
+def _build_caption(details: dict) -> str:
+    """Byg rig MarkdownV2-caption til send_photo."""
+    title       = details.get("title", "Ukendt")
+    year        = (details.get("release_date") or details.get("first_air_date") or "")[:4]
+    genres      = details.get("genres", [])[:3]
+    rating      = details.get("vote_average")
+    overview    = details.get("overview") or "Ingen beskrivelse."
+    cast        = details.get("cast", [])
+    runtime     = details.get("runtime_minutes")
+    seasons     = details.get("number_of_seasons")
+    tagline     = details.get("tagline") or ""
+
+    def esc(text: str) -> str:
+        """Escape MarkdownV2 specialtegn."""
+        for ch in r"\_*[]()~`>#+-=|{}.!":
+            text = text.replace(ch, f"\\{ch}")
+        return text
+
+    lines = []
+    # Titel + årstal
+    title_line = f"*{esc(title)}*"
+    if year:
+        title_line += f" \\({esc(year)}\\)"
+    lines.append(title_line)
+
+    # Tagline
+    if tagline:
+        lines.append(f"_{esc(tagline)}_")
+
+    lines.append("")  # blank linje
+
+    # Genrer + rating
+    genre_str = " · ".join(genres) if genres else ""
+    rating_str = _star_rating(rating)
+    if genre_str:
+        lines.append(f"🎭 {esc(genre_str)}  {rating_str}")
+    else:
+        lines.append(rating_str)
+
+    # Varighed / sæsoner
+    if runtime:
+        lines.append(f"⏱ {runtime} min")
+    elif seasons:
+        lines.append(f"📺 {seasons} sæson{'er' if seasons != 1 else ''}")
+
+    # Cast
+    if cast:
+        lines.append(f"🎬 {esc(', '.join(cast))}")
+
+    lines.append("")
+
+    # Beskrivelse
+    desc = overview[:250]
+    if len(overview) > 250:
+        desc += "…"
+    lines.append(esc(desc))
+
+    return "\n".join(lines)
 
 
 # ── Step 1: Vis søgeresultater som knapper ────────────────────────────────────
@@ -47,12 +109,8 @@ async def show_search_results(
     query: str,
     media_type: str = "both",
 ) -> bool:
-    """
-    Search TMDB and present top results as inline buttons.
-    Returns True if results were found, False otherwise.
-    """
+    """Search TMDB og præsenter top resultater som inline buttons."""
     results = await search_media(query, media_type)
-
     if not results:
         await message.reply_text(f"Jeg kunne ikke finde noget for '{query}' 🤔")
         return False
@@ -64,8 +122,7 @@ async def show_search_results(
         year    = (item.get("release_date") or item.get("first_air_date") or "")[:4]
         mtype   = item.get("media_type", media_type if media_type != "both" else "movie")
         tmdb_id = item.get("id")
-
-        label = f"{title} ({year})" if year else title
+        label   = f"{title} ({year})" if year else title
 
         token = _make_token()
         await database.save_pending_request(token, message.chat_id, {
@@ -75,7 +132,6 @@ async def show_search_results(
             "year":       int(year) if year else None,
             "step":       "picked",
         })
-
         buttons.append([InlineKeyboardButton(label, callback_data=f"pick:{token}")])
 
     buttons.append([InlineKeyboardButton("❌ Annuller", callback_data="cancel:none")])
@@ -88,7 +144,7 @@ async def show_search_results(
     return True
 
 
-# ── Step 2: Vis detaljer + Trailer / Bestil / Annuller ────────────────────────
+# ── Step 2: Netflix-look visning med plakat ───────────────────────────────────
 
 async def show_confirmation(
     query_callback,
@@ -96,11 +152,13 @@ async def show_confirmation(
     plex_username: str | None,
 ) -> None:
     """
-    Fetch full details for the picked title and show action buttons.
+    Hent fuld detaljer og vis Netflix-look med plakat, cast og interaktive knapper.
 
-    Keyboard-rækkefølge:
-      [🎬 Se Trailer]          ← kun hvis trailer_url er tilgængelig
-      [✅ Bestil]  [❌ Annuller]
+    Knap-logik:
+      - PÅ PLEX:   [▶️ Se på Plex]    (deep-link URL)
+      - IKKE PLEX: [➕ Tilføj til Plex] (confirm:token)
+      - ALTID:     [📌 Tilføj til Watchlist] (watchlist:token)
+      - HVIS URL:  [🎬 Se Trailer]    (URL)
     """
     pending = await database.get_pending_request(token)
     if not pending:
@@ -117,14 +175,14 @@ async def show_confirmation(
 
     title       = details.get("title") or pending["title"]
     year        = details.get("release_date", details.get("first_air_date", ""))[:4]
-    overview    = details.get("overview") or "Ingen beskrivelse."
     genres      = details.get("genres", [])
     orig_lang   = details.get("original_language", "en")
     tvdb_id     = details.get("tvdb_id")
     seasons     = details.get("season_numbers", [])
     trailer_url = details.get("trailer_url")
+    poster_url  = details.get("poster_url")
 
-    # Gem fuld data inkl. telegram_id til brug i execute_order
+    # Gem fuld data inkl. telegram_id til execute_order
     new_token = _make_token()
     await database.save_pending_request(new_token, query_callback.from_user.id, {
         "media_type":        media_type,
@@ -136,36 +194,125 @@ async def show_confirmation(
         "original_language": orig_lang,
         "season_numbers":    seasons,
         "trailer_url":       trailer_url,
-        "telegram_id":       query_callback.from_user.id,  # ← til tag i Radarr/Sonarr
+        "telegram_id":       query_callback.from_user.id,
     })
 
-    genre_str = ", ".join(genres[:3]) if genres else ""
-    text = f"*{title}*"
-    if year:
-        text += f" ({year})"
-    if genre_str:
-        text += f"\n_{genre_str}_"
-    text += f"\n\n{overview[:300]}"
-    if len(overview) > 300:
-        text += "…"
+    # ── Tjek om titlen er på Plex ─────────────────────────────────────────────
+    plex_check = await check_library(
+        title, int(year) if year else None, media_type, plex_username
+    )
+    on_plex       = plex_check.get("status") == STATUS_FOUND
+    rating_key    = plex_check.get("ratingKey")
+    machine_id    = plex_check.get("machineIdentifier")
 
-    if media_type == "tv" and seasons:
-        text += f"\n\n📺 {len(seasons)} sæson{'er' if len(seasons) != 1 else ''}"
-
+    # ── Byg knap-rækker ───────────────────────────────────────────────────────
     button_rows = []
+
+    if on_plex and rating_key and machine_id:
+        plex_url = (
+            f"https://app.plex.tv/desktop/#!/server/{machine_id}"
+            f"/details?key=/library/metadata/{rating_key}"
+        )
+        button_rows.append([InlineKeyboardButton("▶️ Se på Plex", url=plex_url)])
+    else:
+        button_rows.append([
+            InlineKeyboardButton("➕ Tilføj til Plex", callback_data=f"confirm:{new_token}")
+        ])
+
+    button_rows.append([
+        InlineKeyboardButton("📌 Tilføj til Watchlist", callback_data=f"watchlist:{new_token}")
+    ])
+
     if trailer_url:
         button_rows.append([InlineKeyboardButton("🎬 Se Trailer", url=trailer_url)])
 
-    button_rows.append([
-        InlineKeyboardButton("✅ Bestil",   callback_data=f"confirm:{new_token}"),
-        InlineKeyboardButton("❌ Annuller", callback_data=f"cancel:{new_token}"),
-    ])
+    keyboard = InlineKeyboardMarkup(button_rows)
+    caption  = _build_caption(details)
 
-    await query_callback.edit_message_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(button_rows),
-    )
+    # ── Send som foto eller tekst (fallback) ──────────────────────────────────
+    try:
+        await query_callback.message.delete()
+    except Exception:
+        pass  # Besked allerede slettet eller ingen adgang
+
+    try:
+        if poster_url:
+            await query_callback.get_bot().send_photo(
+                chat_id=query_callback.from_user.id,
+                photo=poster_url,
+                caption=caption,
+                parse_mode="MarkdownV2",
+                reply_markup=keyboard,
+            )
+        else:
+            # Fallback: ingen plakat — send som tekst
+            await query_callback.get_bot().send_message(
+                chat_id=query_callback.from_user.id,
+                text=caption,
+                parse_mode="MarkdownV2",
+                reply_markup=keyboard,
+            )
+    except Exception as e:
+        logger.error("show_confirmation send fejl: %s", e)
+        # Absolut fallback uden formattering
+        try:
+            await query_callback.get_bot().send_message(
+                chat_id=query_callback.from_user.id,
+                text=f"{title} ({year})\n\n{details.get('overview', '')}",
+                reply_markup=keyboard,
+            )
+        except Exception as e2:
+            logger.error("show_confirmation absolut fallback fejl: %s", e2)
+
+
+# ── /info_movie_<id> og /info_tv_<id> handler ────────────────────────────────
+
+async def handle_info_command(
+    update,
+    media_type: str,
+    tmdb_id: int,
+    plex_username: str | None,
+) -> None:
+    """
+    Håndterer /info_movie_<tmdb_id> og /info_tv_<tmdb_id> kommandoer.
+    Opretter en pending token og kalder show_confirmation.
+    """
+    # Vi har ingen query_callback her — vi bruger en adapter
+    details = await get_media_details(tmdb_id, media_type)
+    if not details:
+        await update.message.reply_text("Kunne ikke hente info — prøv igen.")
+        return
+
+    title = details.get("title") or "Ukendt"
+    year  = details.get("release_date", details.get("first_air_date", ""))[:4]
+
+    token = _make_token()
+    await database.save_pending_request(token, update.effective_user.id, {
+        "media_type": media_type,
+        "tmdb_id":    tmdb_id,
+        "title":      title,
+        "year":       int(year) if year else None,
+        "step":       "picked",
+    })
+
+    # Vi sender en midlertidig besked og bruger den som query_callback-adapter
+    msg = await update.message.reply_text("⏳ Henter info…")
+
+    class _MsgAdapter:
+        """Minimal adapter så show_confirmation kan bruges med en Message."""
+        def __init__(self, message, user):
+            self.message   = message
+            self.from_user = user
+            self._bot      = message.get_bot()
+
+        async def edit_message_text(self, text, **kwargs):
+            await self.message.edit_text(text, **kwargs)
+
+        async def get_bot(self):
+            return self._bot
+
+    adapter = _MsgAdapter(msg, update.effective_user)
+    await show_confirmation(adapter, token, plex_username)
 
 
 # ── Step 3: Udfør bestilling ──────────────────────────────────────────────────
@@ -176,11 +323,7 @@ async def execute_order(
     plex_username: str | None,
 ) -> None:
     """
-    Execute the actual Radarr or Sonarr request upon user confirmation.
-
-    Sender telegram_id til add_movie/add_series så tagget "tg_<id>"
-    oprettes i Radarr/Sonarr. webhook_service bruger dette tag til at
-    sende notifikationen præcist til den bruger der bestilte.
+    Execute Radarr/Sonarr bestilling. Sender telegram_id som tag.
     """
     pending = await database.get_pending_request(token)
     if not pending:
