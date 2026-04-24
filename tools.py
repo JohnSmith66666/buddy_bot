@@ -4,6 +4,7 @@ tools.py - Claude Tool Use definitions for Buddy.
 CHANGES vs previous version:
   - Fjernet add_movie og add_series — bestilling sker nu via Inline Keyboards.
   - Claude trigger bestilling via SHOW_SEARCH_RESULTS-svar, ikke direkte tool-kald.
+  - get_trending har nu en `media_type` parameter ("movie", "tv", "all").
 """
 
 TOOLS = [
@@ -38,8 +39,22 @@ TOOLS = [
     },
     {
         "name": "get_trending",
-        "description": "Hent de mest populaere og trendende film og serier denne uge globalt.",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "description": (
+            "Hent de mest populaere og trendende film og/eller serier denne uge globalt. "
+            "Brug media_type for at filtrere: 'movie' for kun film, 'tv' for kun serier, "
+            "'all' for begge blandet. Standard er 'all'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "media_type": {
+                    "type": "string",
+                    "enum": ["movie", "tv", "all"],
+                    "description": "Filtrer paa type: 'movie', 'tv' eller 'all'. Standard: 'all'.",
+                },
+            },
+            "required": [],
+        },
     },
     {
         "name": "get_recommendations",
@@ -85,12 +100,12 @@ TOOLS = [
     },
     {
         "name": "get_now_playing",
-        "description": "Hent film der korer i biografen lige nu (dansk region).",
+        "description": "Hent de mest populaere film der korer i biografen lige nu (dansk region).",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "get_upcoming",
-        "description": "Hent kommende film der snart udkommer i biografen (dansk region).",
+        "description": "Hent de mest populaere kommende film der snart udkommer i biografen (dansk region).",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
 
