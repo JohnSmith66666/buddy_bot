@@ -2,10 +2,9 @@
 tools.py - Claude Tool Use definitions for Buddy.
 
 CHANGES vs previous version:
-  - Tilføjet search_web tool til Tavily web-søgning.
-    Bruges til information om dansk TV-indhold, dokumentarer og nyheder
-    som ikke findes i TMDB (f.eks. 'Kontant', 'Toppen af poppen',
-    plot-resuméer af specifikke afsnit, anmeldelser osv.).
+  - search_web tool har fået en benhård negativ constraint (STRENGT FORBUDT)
+    der eksplicit forbyder brug til generelle emner som nyheder, vejr,
+    opskrifter og andet ikke-medie-relateret indhold.
 """
 
 TOOLS = [
@@ -115,18 +114,24 @@ TOOLS = [
     {
         "name": "search_web",
         "description": (
-            "Soeg paa internettet efter information der ikke findes i filmdata-basen. "
+            "Soeg paa internettet efter information om tv-programmer, film og underholdning "
+            "der ikke findes i filmdata-basen. "
             "Brug dette naar brugeren spørger om: "
             "(1) Dansk TV-indhold som 'Kontant', 'Toppen af poppen', 'Nak & Aed', "
             "'Dansker i verden', 'DR-dokumentarer' eller andre lokale programmer der "
             "ikke er registreret i TMDB. "
             "(2) Plot-resumeer eller handling af specifikke afsnit af en serie. "
-            "(3) Anmeldelser, baggrundsstof eller aktuelle nyheder om film og TV. "
-            "(4) Generel information Claude ikke kender til fra traening. "
+            "(3) Anmeldelser eller baggrundsstof om specifikke film og TV-programmer. "
             "Formuler query som et naturligt dansk spoergsmaal for bedste resultat, "
             "f.eks.: 'hvad handler TV-programmet Kontant paa DR1?' eller "
-            "'resumee af Sherlock Holmes afsnit 3 saeson 2'. "
+            "'resumee af Sherlock Holmes saeson 2 afsnit 3'. "
             "Returnerer answer (LLM-opsummering) og results (kildeliste med uddrag). "
+            "VIGTIGT: Dette vaerktoej maa KUN bruges til foresproegsler relateret til "
+            "tv-programmer, film, skuespillere og underholdning — isaer lokalt/dansk "
+            "indhold som TMDB mangler. "
+            "Det er STRENGT FORBUDT at kalde dette vaerktoej for at besvare generelle "
+            "spoergsmaal om nyheder, fakta, vejret, opskrifter, sport, politik, historie, "
+            "kodning eller andre emner der ikke har direkte med film og TV at goere. "
             "Brug IKKE dette til bestilling af film/serier eller Plex-relaterede spoergsmaal."
         ),
         "input_schema": {
@@ -135,8 +140,9 @@ TOOLS = [
                 "query": {
                     "type": "string",
                     "description": (
-                        "Sogeforesproegslen. Formuler som et naturligt spoergsmaal, "
-                        "f.eks. 'hvad handler Kontant paa DR?' eller "
+                        "Sogeforesproegslen — skal vaere relateret til film, TV eller underholdning. "
+                        "Formuler som et naturligt spoergsmaal, f.eks. "
+                        "'hvad handler Kontant paa DR?' eller "
                         "'anmeldelse af filmen The Brutalist 2024'."
                     ),
                 },
