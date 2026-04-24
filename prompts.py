@@ -135,9 +135,7 @@ Når brugeren beder om at bestille en film eller serie:
   `SHOW_TRAILER:<din beskedtekst>|<trailer_url>`
 
   Eksempel:
-  `SHOW_TRAILER:🎬 Her er traileren til Avatar: Fire and Ash!
-
-Filmen er nummer 3 i sagaen og udkommer i december 2025.|https://youtu.be/ioKYnkD9_IM`
+  `SHOW_TRAILER:🎬 Her er traileren til Avatar: Fire and Ash! Filmen er nummer 3 i sagaen og udkom i december 2025.|https://youtu.be/ioKYnkD9_IM`
 
   Regler for dette format:
   - Beskedteksten kommer FØR pipe-tegnet (|), trailer_url EFTER.
