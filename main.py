@@ -36,7 +36,7 @@ from services.confirmation_service import (
     show_confirmation,
     show_search_results,
 )
-from services.plex_service import add_to_watchlist, validate_plex_user
+from services.plex_service import validate_plex_user
 from services.webhook_service import handle_radarr_webhook, handle_sonarr_webhook
 
 logging.basicConfig(
@@ -236,7 +236,12 @@ async def handle_watchlist_callback(update: Update, context: ContextTypes.DEFAUL
     tmdb_id       = pending["tmdb_id"]
     plex_username = await database.get_plex_username(query.from_user.id)
 
-    result = await add_to_watchlist(tmdb_id, title, plex_username)
+    # Lazy import — funktionen tilføjes til plex_service.py separat
+    try:
+        from services.plex_service import add_to_watchlist
+        result = await add_to_watchlist(tmdb_id, title, plex_username)
+    except ImportError:
+        result = {"success": False, "message": "Watchlist-funktion ikke tilgængelig endnu."}
 
     if result.get("success"):
         await query.answer(f"✅ '{title}' er tilføjet til din Watchlist!", show_alert=True)
