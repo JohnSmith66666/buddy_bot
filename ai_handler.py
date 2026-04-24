@@ -66,6 +66,10 @@ _MAX_TOOL_RESULT_CHARS = 2000
 # Signal som Claude returnerer for at trigge bestillingsflow i main.py
 SEARCH_SIGNAL = "SHOW_SEARCH_RESULTS:"
 
+# Signal som Claude returnerer for at vise en trailer-knap i main.py
+# Format: SHOW_TRAILER:<beskedtekst>|<youtu.be-url>
+TRAILER_SIGNAL = "SHOW_TRAILER:"
+
 # Dansk mapning af engelske ugedags- og månedsnavne fra strftime
 _UGEDAGE = {
     "Monday": "Mandag", "Tuesday": "Tirsdag", "Wednesday": "Onsdag",

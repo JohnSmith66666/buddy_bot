@@ -2,19 +2,15 @@
 main.py - Buddy bot entry point.
 
 CHANGES vs previous version:
-  - BUGFIX SyntaxWarning: docstring-eksemplet med invalid escape sequence
-    er erstattet med en beskrivende tekst. Python 3.12+ advarer om
-    backslash-sekvenser selv i docstrings og kommentarer.
-  - BUGFIX Trailer-knap i chat: handle_text() detekterer nu om Buddys
-    svar indeholder en youtu.be-URL (trailer fra get_media_details).
-    Hvis ja, strippes URL'en fra beskedteksten og sendes i stedet som
-    en separat InlineKeyboardButton ("🎬 Se Trailer") under beskeden.
-    Dette giver samme knap-oplevelse som i bestillingsflowet, uanset
-    om brugeren spørger direkte i chat eller via bestillingsknapper.
-  - _extract_trailer() hjælpefunktion tilføjet til URL-detektion og
-    tekstoprydning. Bruger raw strings korrekt i alle regex-patterns.
-  - escape_markdown() er bevaret og bruger raw string replacement
-    internt for at undgå SyntaxWarning i Python 3.12+.
+  - REDESIGN trailer-logik: fra regex-ekstraktion til signal-mønster.
+    Buddy returnerer nu SHOW_TRAILER:<url> som sit svar, præcis ligesom
+    SHOW_SEARCH_RESULTS-signalet. main.py fanger signalet, parser URL'en
+    og sender beskeden med InlineKeyboardButton("🎬 Se Trailer", url=...).
+    Den tidligere _extract_trailer() regex-tilgang fjernet — den virkede
+    ikke fordi prompten instruerede Buddy til ikke at skrive URL'en i teksten.
+  - TRAILER_SIGNAL konstant tilføjet, _TRAILER_RE og _extract_trailer() fjernet.
+  - VERSION CHECK log-linje bevaret til deployment-verifikation.
+  - escape_markdown() og _URL_RE bevaret til ordinære tekstbeskeder.
 """
 
 import asyncio
@@ -36,7 +32,7 @@ from telegram.ext import (
 import config
 import database
 from admin_handlers import handle_approve_callback, notify_admin_new_user
-from ai_handler import SEARCH_SIGNAL, clear_history, get_ai_response
+from ai_handler import SEARCH_SIGNAL, TRAILER_SIGNAL, clear_history, get_ai_response
 from services.confirmation_service import (
     execute_order,
     show_confirmation,
@@ -51,9 +47,6 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
-
-# Matcher youtu.be kort-URL'er — bruges til at detektere trailer-links i Buddys svar
-_TRAILER_RE = re.compile(r"https://youtu\.be/[A-Za-z0-9_\-]+")
 
 # Matcher alle http(s)-URL'er — bruges til escape af underscores i tekst-beskeder
 _URL_RE = re.compile(r"(https?://[^\s)\]>\"]+)")
@@ -72,27 +65,6 @@ def escape_markdown(text: str) -> str:
         return match.group(1).replace("_", r"\_")
 
     return _URL_RE.sub(_escape_url, text)
-
-
-def _extract_trailer(reply: str) -> tuple[str, str | None]:
-    """
-    Detekter og ekstraher en youtu.be trailer-URL fra Buddys svar.
-
-    Returnerer (renset_tekst, trailer_url) hvor:
-      - renset_tekst er svaret uden linjen der indeholder URL'en
-      - trailer_url er den fundne URL, eller None hvis ingen trailer fundet
-    """
-    match = _TRAILER_RE.search(reply)
-    if not match:
-        return reply, None
-
-    trailer_url = match.group(0)
-
-    # Fjern hele linjen der indeholder URL'en (inkl. evt. "Se trailer her:"-prefix)
-    cleaned = re.sub(r"[^\n]*" + re.escape(trailer_url) + r"[^\n]*\n?", "", reply)
-    cleaned = cleaned.rstrip()
-
-    return cleaned, trailer_url
 
 
 # ── Guards ────────────────────────────────────────────────────────────────────
@@ -249,7 +221,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         plex_username=plex_username,
     )
 
-    # Tjek om Claude returnerer et søge-signal
+    # ── Signal: bestillingsflow ───────────────────────────────────────────────
     if reply.startswith(SEARCH_SIGNAL):
         parts = reply[len(SEARCH_SIGNAL):].split(":", 1)
         query_term = parts[0].strip()
@@ -257,26 +229,31 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await show_search_results(update.message, query_term, media_type)
         return
 
-    # Detekter trailer-URL i svaret — send som knap i stedet for raa tekst
-    clean_reply, trailer_url = _extract_trailer(reply)
+    # ── Signal: trailer-knap ──────────────────────────────────────────────────
+    # Format: SHOW_TRAILER:<beskedtekst>|<trailer_url>
+    if reply.startswith(TRAILER_SIGNAL):
+        payload = reply[len(TRAILER_SIGNAL):]
+        # Del ved det SIDSTE pipe-tegn for at beskytte mod pipe i beskeden
+        pipe_idx = payload.rfind("|")
+        if pipe_idx != -1:
+            besked_tekst = payload[:pipe_idx].strip()
+            trailer_url  = payload[pipe_idx + 1:].strip()
+            safe_reply = escape_markdown(besked_tekst)
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🎬 Se Trailer", url=trailer_url)
+            ]])
+            await update.message.reply_text(
+                safe_reply,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+            logger.info("Trailer-knap sendt: %s", trailer_url)
+            await database.log_message(user.id, "outgoing", besked_tekst)
+            return
 
-    if trailer_url:
-        # Send tekstbesked uden URL + trailer-knap nedenunder
-        safe_reply = escape_markdown(clean_reply)
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🎬 Se Trailer", url=trailer_url)
-        ]])
-        await update.message.reply_text(
-            safe_reply,
-            parse_mode="Markdown",
-            reply_markup=keyboard,
-        )
-        logger.info("Trailer-knap sendt: %s", trailer_url)
-    else:
-        # Normalt svar uden trailer
-        safe_reply = escape_markdown(reply)
-        await update.message.reply_text(safe_reply, parse_mode="Markdown")
-
+    # ── Normalt svar ──────────────────────────────────────────────────────────
+    safe_reply = escape_markdown(reply)
+    await update.message.reply_text(safe_reply, parse_mode="Markdown")
     await database.log_message(user.id, "outgoing", reply)
 
 
@@ -322,7 +299,7 @@ async def on_startup(application: Application) -> None:
     await database.setup_pending_requests()
     await _start_webhook_server()
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
-    logger.info("VERSION CHECK — trailer: JA | dato: JA | _extract_trailer: JA")
+    logger.info("VERSION CHECK — TRAILER_SIGNAL: JA | dato: JA | signal-arkitektur: JA")
 
 
 async def on_shutdown(application: Application) -> None:
