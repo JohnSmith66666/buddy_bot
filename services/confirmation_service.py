@@ -2,14 +2,13 @@
 services/confirmation_service.py - Inline keyboard bekræftelsesflow.
 
 CHANGES vs previous version:
-  - show_confirmation() refaktoreret fundamentalt:
-    * Signaturen er nu (trigger, context, token, plex_username) hvor
-      trigger er enten en CallbackQuery ELLER en Message.
-    * chat_id og user_id udtrækkes via duck-typing på trigger-objektet.
-    * Besked slettes KUN hvis trigger er en CallbackQuery.
-    * Sender via context.bot.send_photo() — ingen _MsgAdapter, ingen hack.
-  - handle_info_command() er fjernet — main.py kalder show_confirmation direkte.
-  - execute_order() sender telegram_id som tag til Radarr/Sonarr — uændret.
+  - _star_rating() fjernet — rating vises nu som numerisk score: ⭐️ 8.6/10.
+  - Overview trunkering fjernet — vises i fuld længde fra TMDB.
+  - Telegram caption max er 1024 tegn — overview trimmes kun hvis caption
+    samlet set overstiger dette, ikke med en hardcodet grænse.
+  - Plex-tjek (check_library) er bekræftet aktiv og korrekt — uændret logik.
+  - send_photo() bruges altid når poster_url er tilgængeligt — uændret.
+  - execute_order() uændret.
 """
 
 import logging
@@ -26,17 +25,12 @@ from services.tmdb_service import get_media_details, search_media
 
 logger = logging.getLogger(__name__)
 
+# Telegram's max caption-længde for billeder
+_MAX_CAPTION = 1024
+
 
 def _make_token() -> str:
     return secrets.token_hex(8)
-
-
-def _star_rating(score: float | None) -> str:
-    """Konverter TMDB vote_average (0-10) til stjerner (0-5)."""
-    if not score:
-        return "–"
-    stars = round(score / 2)
-    return "⭐" * stars + "☆" * (5 - stars)
 
 
 def _esc(text: str) -> str:
@@ -47,7 +41,13 @@ def _esc(text: str) -> str:
 
 
 def _build_caption(details: dict) -> str:
-    """Byg rig MarkdownV2-caption til send_photo."""
+    """
+    Byg MarkdownV2-caption til send_photo.
+
+    Rating vises som numerisk score (⭐️ 8.6/10) — ikke stjerne-emojis.
+    Overview vises i fuld længde; kun afkortet hvis caption overskrider
+    Telegrams max på 1024 tegn.
+    """
     title    = details.get("title", "Ukendt")
     year     = (details.get("release_date") or details.get("first_air_date") or "")[:4]
     genres   = details.get("genres", [])[:3]
@@ -72,13 +72,14 @@ def _build_caption(details: dict) -> str:
 
     lines.append("")
 
-    # Genrer + rating
-    genre_str  = " · ".join(genres) if genres else ""
-    rating_str = _star_rating(rating)
+    # Genrer
+    genre_str = " · ".join(genres) if genres else ""
     if genre_str:
-        lines.append(f"🎭 {_esc(genre_str)}  {rating_str}")
-    else:
-        lines.append(rating_str)
+        lines.append(f"🎭 {_esc(genre_str)}")
+
+    # Rating som numerisk score
+    if rating:
+        lines.append(f"⭐️ {rating}/10")
 
     # Varighed / sæsoner
     if runtime:
@@ -92,13 +93,20 @@ def _build_caption(details: dict) -> str:
 
     lines.append("")
 
-    # Beskrivelse
-    desc = overview[:250]
-    if len(overview) > 250:
-        desc += "…"
-    lines.append(_esc(desc))
+    # Overview i fuld længde — kun afkortet hvis caption samlet er for lang
+    lines.append(_esc(overview))
 
-    return "\n".join(lines)
+    caption = "\n".join(lines)
+
+    # Telegram-grænse: afkort overview hvis nødvendigt
+    if len(caption) > _MAX_CAPTION:
+        # Find where overview starts og trim der
+        overhead   = len(caption) - _MAX_CAPTION + 3  # 3 til "…"
+        short_desc = overview[: max(0, len(overview) - overhead)] + "…"
+        lines[-1]  = _esc(short_desc)
+        caption    = "\n".join(lines)
+
+    return caption
 
 
 # ── Step 1: Vis søgeresultater som knapper ────────────────────────────────────
@@ -152,14 +160,18 @@ async def show_confirmation(
     plex_username: str | None,
 ) -> None:
     """
-    Hent fuld detaljer og vis Netflix-look med plakat og interaktive knapper.
+    Hent fuld detaljer og vis Netflix-look infokort.
 
-    trigger er enten en CallbackQuery eller en Message:
+    trigger er enten CallbackQuery eller Message:
       - CallbackQuery: trigger.message.chat.id / trigger.from_user.id
       - Message:       trigger.chat.id          / trigger.from_user.id
 
-    Besked slettes KUN ved CallbackQuery (vi kan ikke slette brugerens besked).
-    Sender altid via context.bot — ingen adapters, ingen hacks.
+    Knap-logik:
+      - PÅ PLEX med ratingKey+machineIdentifier → [▶️ Se på Plex] (deep-link)
+      - PÅ PLEX uden keys (ældre Plex) → [▶️ Se på Plex] (generisk URL)
+      - IKKE PÅ PLEX → [➕ Tilføj til Plex] (confirm:token)
+      - ALTID → [📌 Tilføj til Watchlist]
+      - HVIS trailer → [🎬 Se Trailer]
     """
     from telegram import CallbackQuery
 
@@ -196,7 +208,6 @@ async def show_confirmation(
         chat_id = trigger.message.chat.id
         user_id = trigger.from_user.id
     else:
-        # trigger er en Message
         chat_id = trigger.chat.id
         user_id = trigger.from_user.id
 
@@ -226,11 +237,15 @@ async def show_confirmation(
     # ── Byg knap-rækker ───────────────────────────────────────────────────────
     button_rows = []
 
-    if on_plex and rating_key and machine_id:
-        plex_url = (
-            f"https://app.plex.tv/desktop/#!/server/{machine_id}"
-            f"/details?key=/library/metadata/{rating_key}"
-        )
+    if on_plex:
+        if rating_key and machine_id:
+            plex_url = (
+                f"https://app.plex.tv/desktop/#!/server/{machine_id}"
+                f"/details?key=/library/metadata/{rating_key}"
+            )
+        else:
+            # Fallback: åbn Plex uden deep-link
+            plex_url = "https://app.plex.tv"
         button_rows.append([InlineKeyboardButton("▶️ Se på Plex", url=plex_url)])
     else:
         button_rows.append([
@@ -252,7 +267,7 @@ async def show_confirmation(
         try:
             await trigger.message.delete()
         except Exception:
-            pass  # Allerede slettet eller ingen adgang
+            pass
 
     # ── Send infokort via context.bot ─────────────────────────────────────────
     try:
@@ -273,7 +288,6 @@ async def show_confirmation(
             )
     except Exception as e:
         logger.error("show_confirmation send fejl: %s", e)
-        # Absolut fallback uden MarkdownV2
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -291,9 +305,7 @@ async def execute_order(
     token: str,
     plex_username: str | None,
 ) -> None:
-    """
-    Execute Radarr/Sonarr bestilling. Sender telegram_id som tg_-tag.
-    """
+    """Execute Radarr/Sonarr bestilling. Sender telegram_id som tg_-tag."""
     pending = await database.get_pending_request(token)
     if not pending:
         await query_callback.edit_message_text("Sessionen er udløbet — prøv igen.")

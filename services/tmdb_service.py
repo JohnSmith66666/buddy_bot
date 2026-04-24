@@ -2,10 +2,11 @@
 services/tmdb_service.py - TMDB API integration.
 
 CHANGES vs previous version:
-  - get_media_details: append_to_response udvidet til "videos,credits".
-  - Top 3 skuespillere udtrækkes fra credits.cast og returneres som "cast".
-  - poster_url bygges fra poster_path og returneres i dict'en.
-  - Engelsk trailer-fallback bevaret fra forrige version.
+  - Overview trunkering fjernet i get_media_details() for både film og TV.
+    Overview returneres nu i fuld længde fra TMDB. Evt. truncation til
+    Telegrams caption-grænse håndteres af _build_caption() i confirmation_service.
+  - append_to_response=videos,credits, cast, poster_url — uændret.
+  - Engelsk trailer-fallback — uændret.
 """
 
 import asyncio
@@ -230,7 +231,7 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
             "id":                data.get("id"),
             "title":             data.get("title") or data.get("original_title"),
             "tagline":           data.get("tagline"),
-            "overview":          (data.get("overview") or "Ingen beskrivelse.")[:300],
+            "overview":          data.get("overview") or "Ingen beskrivelse.",
             "release_date":      data.get("release_date", "Ukendt"),
             "runtime_minutes":   data.get("runtime"),
             "vote_average":      round(data.get("vote_average", 0), 1),
@@ -262,7 +263,7 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
         "id":                   data.get("id"),
         "title":                data.get("name") or data.get("original_name"),
         "tagline":              data.get("tagline"),
-        "overview":             (data.get("overview") or "Ingen beskrivelse.")[:300],
+        "overview":             data.get("overview") or "Ingen beskrivelse.",
         "first_air_date":       data.get("first_air_date", "Ukendt"),
         "number_of_seasons":    data.get("number_of_seasons"),
         "number_of_episodes":   data.get("number_of_episodes"),
