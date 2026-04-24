@@ -2,19 +2,23 @@
 ai_handler.py - Agentic loop for Buddy.
 
 CHANGES vs previous version:
+  - OPTIMERING 1 — Parallel tool execution: tool-kald eksekveres nu
+    parallelt via asyncio.gather() i stedet for sekventielt i en for-løkke.
+    Når Claude laver parallel tool calling (f.eks. 10 check_plex_library-kald),
+    sendes alle kald samtidigt og vi venter kun på det langsomste — ikke summen.
+    Speedup afhænger af antal samtidige tool-kald: 5 kald à 300ms → 300ms i stedet for 1500ms.
+  - OPTIMERING 2 — Reduceret historik: _MAX_HISTORY sænket fra 10 til 6
+    beskeder. Skærer ~400 uncached tokens per kald og reducerer kontekstvindue
+    uden at påvirke normal samtalekvalitet (de fleste spørgsmål er selvstændige).
+  - OPTIMERING 3 — Øget max_tokens: hævet fra 1024 til 1500 for at undgå
+    at Claude trunkerer lange svar og laver et ekstra API-kald for at afslutte.
   - Importeret ZoneInfo fra zoneinfo (med try/except fallback).
-  - _dansk_dato() bruger nu datetime.now(ZoneInfo("Europe/Copenhagen"))
-    for korrekt dansk tid på Railway (der kører UTC).
-  - _dansk_dato() returnerer ISO-datoen (YYYY-MM-DD) forrest, efterfulgt
-    af den danske tekst i parentes — uden klokkeslæt, da det er irrelevant
-    for dato-sammenligning med TMDB's release_date-felter.
-    Eksempel: '2026-04-24 (Fredag d. 24. april 2026)'
-  - dynamic_lines (Blok 1) indeholder nu en matematisk direkte instruktion:
-    Claude skal sammenligne release_date alfabetisk/numerisk med ISO-datoen.
-    Eksempel skæres ud i pap: '2025-12-17 < 2026-04-24 → filmen er udkommet'.
+  - _dansk_dato() bruger ZoneInfo("Europe/Copenhagen") og returnerer
+    ISO-format forrest for direkte sammenligning med TMDB release_date.
   - Alle øvrige funktioner er uændrede.
 """
 
+import asyncio
 import json
 import logging
 from collections import defaultdict
@@ -66,7 +70,7 @@ logger = logging.getLogger(__name__)
 _client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 _histories: dict[int, list[dict]] = defaultdict(list)
-_MAX_HISTORY = 10
+_MAX_HISTORY = 6          # Reduceret fra 10 → sparer ~400 uncached tokens per kald
 _MAX_TOOL_RESULT_CHARS = 2000
 
 # Signal som Claude returnerer for at trigge bestillingsflow i main.py
@@ -330,7 +334,7 @@ async def get_ai_response(
         while True:
             response = await _client.messages.create(
                 model=ANTHROPIC_MODEL,
-                max_tokens=1024,
+                max_tokens=1500,          # Hævet fra 1024 → undgår trunkeringer og ekstra API-kald
                 system=system_blocks,
                 tools=tools_with_cache,
                 messages=_histories[telegram_id],
@@ -355,22 +359,29 @@ async def get_ai_response(
                 _histories[telegram_id].append(
                     {"role": "assistant", "content": response.content}
                 )
-                tool_results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        logger.info("Tool call: %s(%s)", block.name, block.input)
-                        try:
-                            raw_result = await _dispatch(block.name, block.input, plex_username)
-                            result     = _trim_tool_result(raw_result)
-                        except Exception as e:
-                            logger.error("Tool dispatch error '%s': %s", block.name, e)
-                            result = json.dumps({"error": str(e)}, ensure_ascii=False)
-                        tool_results.append({
-                            "type":        "tool_result",
-                            "tool_use_id": block.id,
-                            "content":     result,
-                        })
-                _histories[telegram_id].append({"role": "user", "content": tool_results})
+
+                # ── Parallel tool execution via asyncio.gather ────────────────
+                # Alle tool-kald i samme runde eksekveres samtidigt.
+                # Speedup ved N parallelle kald: N×latens → max(latens).
+                tool_blocks = [b for b in response.content if b.type == "tool_use"]
+
+                async def _run_tool(block) -> dict:
+                    logger.info("Tool call: %s(%s)", block.name, block.input)
+                    try:
+                        raw_result = await _dispatch(block.name, block.input, plex_username)
+                        result     = _trim_tool_result(raw_result)
+                    except Exception as e:
+                        logger.error("Tool dispatch error '%s': %s", block.name, e)
+                        result = json.dumps({"error": str(e)}, ensure_ascii=False)
+                    return {
+                        "type":        "tool_result",
+                        "tool_use_id": block.id,
+                        "content":     result,
+                    }
+
+                tool_results = await asyncio.gather(*(_run_tool(b) for b in tool_blocks))
+
+                _histories[telegram_id].append({"role": "user", "content": list(tool_results)})
                 _trim(telegram_id)
                 continue
 
