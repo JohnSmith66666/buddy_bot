@@ -2,10 +2,9 @@
 ai_handler.py - Agentic loop for Buddy.
 
 CHANGES vs previous version:
-  - get_user_history routing sender nu tool_input.get("media_type") videre
-    til tautulli_service, så 'senest sete film' filtrerer korrekt.
-  - get_user_watch_stats og get_popular_on_plex sender days=0 direkte igennem
-    til tautulli_service som signalerer 'all-time' (time_range udelades).
+  - Importeret search_web fra services.web_service.
+  - Tilføjet dispatch-logik for search_web tool.
+    Resultatet køres igennem _trim_tool_result for token-økonomi.
   - SEARCH_SIGNAL konstant bevaret.
   - Prompt caching aktiveret på system prompt og tools.
 """
@@ -47,6 +46,7 @@ from services.tautulli_service import (
     get_user_history,
     get_user_watch_stats,
 )
+from services.web_service import search_web
 from tools import TOOLS
 
 logger = logging.getLogger(__name__)
@@ -110,6 +110,13 @@ def _trim_tool_result(result: str) -> str:
 
 async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None) -> str:
     j = lambda x: json.dumps(x, ensure_ascii=False)
+
+    # ── Web-søgning ───────────────────────────────────────────────────────────
+    if tool_name == "search_web":
+        return j(await search_web(
+            query=tool_input["query"],
+            search_depth=tool_input.get("search_depth", "basic"),
+        ))
 
     # ── TMDB ──────────────────────────────────────────────────────────────────
     if tool_name == "search_media":
@@ -176,35 +183,29 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
 
     # ── Tautulli ──────────────────────────────────────────────────────────────
     if tool_name == "get_popular_on_plex":
-        # days=0 sendes direkte igennem — tautulli_service udelader time_range ved 0
         days = tool_input.get("days", 30)
         return j(await get_popular_on_plex(
             stats_count=tool_input.get("stats_count", 10),
             time_range=days if days is not None else 30,
         ))
-
     if tool_name == "get_user_watch_stats":
         if not plex_username:
             return j({"error": "Intet Plex-brugernavn fundet."})
-        # days=0 → all-time; None → default 365
-        days = tool_input.get("days")
+        days       = tool_input.get("days")
         query_days = days if days is not None else 365
         return j(await get_user_watch_stats(
             plex_username,
             query_days=query_days,
         ))
-
     if tool_name == "get_user_history":
         if not plex_username:
             return j({"error": "Intet Plex-brugernavn fundet."})
-        # Sender media_type videre hvis Claude har specificeret det
         return j(await get_user_history(
             plex_username,
             length=tool_input.get("length", 25),
             query=tool_input.get("query"),
-            media_type=tool_input.get("media_type"),   # FIX: ny parameter
+            media_type=tool_input.get("media_type"),
         ))
-
     if tool_name == "get_recently_added":
         return j(await get_recently_added(count=tool_input.get("count", 10)))
 

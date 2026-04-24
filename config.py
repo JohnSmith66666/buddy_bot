@@ -1,6 +1,10 @@
 """
 config.py - Centralized configuration loaded from environment variables.
 The application will raise an error at startup if any required variable is missing.
+
+CHANGES vs previous version:
+  - Tilføjet TAVILY_API_KEY (valgfri — mangler den, er web-søgning deaktiveret
+    med en advarsel i web_service.py i stedet for en hård startup-fejl).
 """
 
 import os
@@ -56,6 +60,11 @@ ROOT_TV_STANDARD: str     = "/mnt/unionfs/Media/TV/Serier"
 # ── Tautulli ──────────────────────────────────────────────────────────────────
 TAUTULLI_URL:     str = _require("TAUTULLI_URL")
 TAUTULLI_API_KEY: str = _require("TAUTULLI_API_KEY")
+
+# ── Tavily (web-søgning) ──────────────────────────────────────────────────────
+# Valgfri — hvis ikke sat deaktiveres web-søgning med en advarsel,
+# men botten starter stadig normalt (ingen hård startup-fejl).
+TAVILY_API_KEY: str | None = os.getenv("TAVILY_API_KEY") or None
 
 # ── Optional / runtime settings ───────────────────────────────────────────────
 ENVIRONMENT: str       = os.getenv("ENVIRONMENT", "dev")

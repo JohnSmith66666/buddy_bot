@@ -2,13 +2,10 @@
 tools.py - Claude Tool Use definitions for Buddy.
 
 CHANGES vs previous version:
-  - get_user_watch_stats: days=0 betyder nu 'all time' / 'nogensinde'.
-    Beskrivelsen fortæller Claude præcist hvornår den skal sende 0.
-  - get_popular_on_plex: days=0 betyder nu 'all time'.
-    Beskrivelsen er opdateret tilsvarende.
-  - get_user_history: tilføjet media_type parameter så Claude kan
-    specificere 'movie' eller 'episode' direkte.
-  - Alle øvrige tools er uændrede.
+  - Tilføjet search_web tool til Tavily web-søgning.
+    Bruges til information om dansk TV-indhold, dokumentarer og nyheder
+    som ikke findes i TMDB (f.eks. 'Kontant', 'Toppen af poppen',
+    plot-resuméer af specifikke afsnit, anmeldelser osv.).
 """
 
 TOOLS = [
@@ -114,6 +111,46 @@ TOOLS = [
         "name": "get_upcoming",
         "description": "Hent de mest populaere kommende film der snart udkommer i biografen (dansk region).",
         "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "search_web",
+        "description": (
+            "Soeg paa internettet efter information der ikke findes i filmdata-basen. "
+            "Brug dette naar brugeren spørger om: "
+            "(1) Dansk TV-indhold som 'Kontant', 'Toppen af poppen', 'Nak & Aed', "
+            "'Dansker i verden', 'DR-dokumentarer' eller andre lokale programmer der "
+            "ikke er registreret i TMDB. "
+            "(2) Plot-resumeer eller handling af specifikke afsnit af en serie. "
+            "(3) Anmeldelser, baggrundsstof eller aktuelle nyheder om film og TV. "
+            "(4) Generel information Claude ikke kender til fra traening. "
+            "Formuler query som et naturligt dansk spoergsmaal for bedste resultat, "
+            "f.eks.: 'hvad handler TV-programmet Kontant paa DR1?' eller "
+            "'resumee af Sherlock Holmes afsnit 3 saeson 2'. "
+            "Returnerer answer (LLM-opsummering) og results (kildeliste med uddrag). "
+            "Brug IKKE dette til bestilling af film/serier eller Plex-relaterede spoergsmaal."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Sogeforesproegslen. Formuler som et naturligt spoergsmaal, "
+                        "f.eks. 'hvad handler Kontant paa DR?' eller "
+                        "'anmeldelse af filmen The Brutalist 2024'."
+                    ),
+                },
+                "search_depth": {
+                    "type": "string",
+                    "enum": ["basic", "advanced"],
+                    "description": (
+                        "Sogedybde. Brug 'basic' (standard, hurtig) til de fleste spoergsmaal. "
+                        "Brug 'advanced' kun til komplekse eller svare-at-finde emner."
+                    ),
+                },
+            },
+            "required": ["query"],
+        },
     },
 
     # ── Plex ──────────────────────────────────────────────────────────────────
