@@ -302,9 +302,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         plex_username=plex_username,
     )
 
+    # Rens backticks fra signaler — Buddy pakker dem nogle gange ind i Markdown
+    # Eksempel: `SHOW_INFO:157336:movie` → SHOW_INFO:157336:movie
+    # Det originale reply bruges stadig til normalt svar (bevarer Markdown)
+    clean_reply = reply.replace("`", "").strip()
+
     # ── Signal: bestillingsflow ───────────────────────────────────────────────
-    if reply.startswith(SEARCH_SIGNAL):
-        parts = reply[len(SEARCH_SIGNAL):].split(":", 1)
+    if clean_reply.startswith(SEARCH_SIGNAL):
+        parts = clean_reply[len(SEARCH_SIGNAL):].split(":", 1)
         query_term = parts[0].strip()
         media_type = parts[1].strip() if len(parts) > 1 else "both"
         await show_search_results(update.message, query_term, media_type)
@@ -312,8 +317,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # ── Signal: Netflix-look infokort ─────────────────────────────────────────
     # Format: SHOW_INFO:<tmdb_id>:<media_type>
-    if reply.startswith(INFO_SIGNAL):
-        payload = reply[len(INFO_SIGNAL):].strip()
+    if clean_reply.startswith(INFO_SIGNAL):
+        payload = clean_reply[len(INFO_SIGNAL):].strip()
         parts   = payload.split(":")
         if len(parts) >= 2:
             tmdb_id_str = parts[0].strip()
@@ -336,8 +341,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # ── Signal: trailer-knap ──────────────────────────────────────────────────
     # Format: SHOW_TRAILER:<beskedtekst>|<trailer_url>
-    if reply.startswith(TRAILER_SIGNAL):
-        payload = reply[len(TRAILER_SIGNAL):]
+    if clean_reply.startswith(TRAILER_SIGNAL):
+        payload  = clean_reply[len(TRAILER_SIGNAL):]
         # Del ved det SIDSTE pipe-tegn for at beskytte mod pipe i beskeden
         pipe_idx = payload.rfind("|")
         if pipe_idx != -1:
@@ -356,7 +361,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await database.log_message(user.id, "outgoing", besked_tekst)
             return
 
-    # ── Normalt svar ──────────────────────────────────────────────────────────
+    # ── Normalt svar — brug det originale reply med Markdown intakt ───────────
     safe_reply = escape_markdown(reply)
     await update.message.reply_text(safe_reply, parse_mode="Markdown")
     await database.log_message(user.id, "outgoing", reply)
