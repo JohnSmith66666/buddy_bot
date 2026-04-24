@@ -2,12 +2,15 @@
 services/confirmation_service.py - Inline keyboard bekræftelsesflow.
 
 CHANGES vs previous version:
-  - _build_caption(): overview trimmes FØR _esc() — ellers fejler
-    caption-truncation fordi escape-tegn tæller som ekstra chars.
-  - Plex deep-link URL bruger URL-encoded key-parameter:
-    %2Flibrary%2Fmetadata%2F{ratingKey} i stedet for rå path.
-  - Rating som ⭐️ {score}/10 — ingen stjerne-emojis.
-  - Alle andre ændringer fra forrige version bevaret.
+  - KRITISK FIX: MarkdownV2 → Markdown overalt i show_confirmation.
+    MarkdownV2 kræver at alle specialtegn (. ! ( ) - etc.) escapes —
+    dette crashede Telegram ved filmtitler og beskrivelser med punktum.
+    Markdown er mere tilgivende og kræver kun *fed* og _kursiv_ escaping.
+  - _build_caption() omskrevet til simpel Markdown uden _esc():
+    ingen kompleks escape-logik, ingen MarkdownV2 specialtegn.
+  - Caption inkluderer nu: titel, årstal, genrer, score, cast, overview.
+  - cast trækkes nu direkte fra details["cast"] (liste fra tmdb_service).
+  - execute_order() uændret.
 """
 
 import logging
@@ -31,67 +34,63 @@ def _make_token() -> str:
     return secrets.token_hex(8)
 
 
-def _esc(text: str) -> str:
-    """Escape MarkdownV2 specialtegn."""
-    for ch in r"\_*[]()~`>#+-=|{}.!":
-        text = text.replace(ch, f"\\{ch}")
-    return text
-
-
 def _build_caption(details: dict) -> str:
     """
-    Byg MarkdownV2-caption til send_photo.
+    Byg simpel Markdown-caption (ikke MarkdownV2) til send_photo.
 
-    Overview trimmes FØR _esc() for at caption-truncation
-    fungerer korrekt (escape-tegn tæller som ekstra chars).
-    Telegram max caption: 1024 tegn.
+    Bruger kun *fed* og intet andet af Markdown-syntaks for at undgå
+    parse-fejl ved filmtitler og beskrivelser med specialtegn.
+    Overview trimmes til Telegrams max caption-grænse på 1024 tegn.
     """
-    title    = details.get("title", "Ukendt")
+    title    = details.get("title") or "Ukendt"
     year     = (details.get("release_date") or details.get("first_air_date") or "")[:4]
     genres   = details.get("genres", [])[:3]
     rating   = details.get("vote_average")
     overview = (details.get("overview") or "Ingen beskrivelse.").strip()
-    cast     = details.get("cast", [])
+    cast     = details.get("cast") or []
     runtime  = details.get("runtime_minutes")
     seasons  = details.get("number_of_seasons")
-    tagline  = (details.get("tagline") or "").strip()
 
-    # Beregn tilgængeligt rum til overview
-    header_parts = []
-    title_line = f"*{_esc(title)}*"
+    lines = []
+
+    # Titel + årstal
+    header = f"*{title}*"
     if year:
-        title_line += f" \\({_esc(year)}\\)"
-    header_parts.append(title_line)
+        header += f" ({year})"
+    lines.append(header)
+    lines.append("")
 
-    if tagline:
-        header_parts.append(f"_{_esc(tagline)}_")
-    header_parts.append("")
+    # Genrer
+    if genres:
+        lines.append(f"🎬 {', '.join(genres)}")
 
-    genre_str = " · ".join(genres) if genres else ""
-    if genre_str:
-        header_parts.append(f"🎭 {_esc(genre_str)}")
-
+    # Score
     if rating:
-        header_parts.append(f"⭐️ {rating}/10")
+        lines.append(f"⭐️ {rating}/10")
 
+    # Varighed / sæsoner
     if runtime:
-        header_parts.append(f"⏱ {runtime} min")
+        lines.append(f"⏱ {runtime} min")
     elif seasons:
-        header_parts.append(f"📺 {seasons} sæson{'er' if seasons != 1 else ''}")
+        lines.append(f"📺 {seasons} sæson{'er' if seasons != 1 else ''}")
 
+    # Skuespillere
     if cast:
-        header_parts.append(f"🎬 {_esc(', '.join(cast))}")
+        cast_str = cast if isinstance(cast, str) else ", ".join(cast)
+        lines.append(f"🎭 {cast_str}")
 
-    header_parts.append("")
+    lines.append("")
 
-    header = "\n".join(header_parts)
-    # Tilgængeligt rum til overview (med newline + 3 chars til "…")
-    available = _MAX_CAPTION - len(header) - 3
+    header_text = "\n".join(lines)
 
-    if len(overview) > available and available > 0:
+    # Overview — trim så caption ikke overstiger 1024 tegn
+    available = _MAX_CAPTION - len(header_text) - 3
+    if available <= 0:
+        return header_text.strip()
+    if len(overview) > available:
         overview = overview[:available] + "…"
 
-    return header + _esc(overview)
+    return header_text + overview
 
 
 # ── Step 1: Vis søgeresultater som knapper ────────────────────────────────────
@@ -145,16 +144,15 @@ async def show_confirmation(
     plex_username: str | None,
 ) -> None:
     """
-    Hent fuld detaljer og vis Netflix-look infokort.
+    Hent fuld detaljer og vis Netflix-look infokort med plakat.
 
-    trigger er enten CallbackQuery eller Message:
-      - CallbackQuery: trigger.message.chat.id / trigger.from_user.id
-      - Message:       trigger.chat.id          / trigger.from_user.id
+    Bruger parse_mode="Markdown" (ikke MarkdownV2) for at undgå
+    crash ved specialtegn i filmtitler og beskrivelser.
 
     Knap-logik:
-      - PÅ PLEX med ratingKey+machineIdentifier → [▶️ Se på Plex] (deep-link)
-      - PÅ PLEX uden keys (ældre Plex) → [▶️ Se på Plex] (generisk URL)
-      - IKKE PÅ PLEX → [➕ Tilføj til Plex] (confirm:token)
+      - PÅ PLEX med keys → [▶️ Se på Plex] (deep-link URL-encoded)
+      - PÅ PLEX uden keys → [▶️ Se på Plex] (generisk)
+      - IKKE PÅ PLEX → [➕ Tilføj til Plex]
       - ALTID → [📌 Tilføj til Watchlist]
       - HVIS trailer → [🎬 Se Trailer]
     """
@@ -224,7 +222,6 @@ async def show_confirmation(
 
     if on_plex:
         if rating_key and machine_id:
-            # URL-encoded key-parameter — /library/metadata/ → %2Flibrary%2Fmetadata%2F
             plex_url = (
                 f"https://app.plex.tv/desktop/#!/server/{machine_id}"
                 f"/details?key=%2Flibrary%2Fmetadata%2F{rating_key}"
@@ -254,29 +251,31 @@ async def show_confirmation(
         except Exception:
             pass
 
-    # ── Send infokort via context.bot ─────────────────────────────────────────
+    # ── Send infokort via context.bot (Markdown — ikke MarkdownV2) ───────────
     try:
         if poster_url:
             await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=poster_url,
                 caption=caption,
-                parse_mode="MarkdownV2",
+                parse_mode="Markdown",
                 reply_markup=keyboard,
             )
         else:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=caption,
-                parse_mode="MarkdownV2",
+                parse_mode="Markdown",
                 reply_markup=keyboard,
             )
     except Exception as e:
         logger.error("show_confirmation send fejl: %s", e)
+        # Absolut fallback — ingen parse_mode
         try:
+            plain = f"{title} ({year})\n\n{details.get('overview', '')}"
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"{title} ({year})\n\n{details.get('overview', '')}",
+                text=plain,
                 reply_markup=keyboard,
             )
         except Exception as e2:
@@ -325,14 +324,14 @@ async def execute_order(
 
     if result.get("success"):
         await query_callback.edit_message_text(
-            f"✅ *{title}* er bestilt og søges nu\\! "
+            f"✅ *{title}* er bestilt og søges nu! "
             f"Du får besked når den er klar på Plex 🍿",
-            parse_mode="MarkdownV2",
+            parse_mode="Markdown",
         )
     else:
         status = result.get("status", "")
         if status == "already_exists":
-            msg = f"*{title}* er allerede i biblioteket\\!"
+            msg = f"*{title}* er allerede i biblioteket!"
         else:
-            msg = f"Noget gik galt med bestillingen af *{title}*\\. Prøv igen lidt senere\\."
-        await query_callback.edit_message_text(msg, parse_mode="MarkdownV2")
+            msg = f"Noget gik galt med bestillingen af *{title}*. Prøv igen lidt senere."
+        await query_callback.edit_message_text(msg, parse_mode="Markdown")

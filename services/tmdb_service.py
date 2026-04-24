@@ -3,11 +3,11 @@ services/tmdb_service.py - TMDB API integration.
 
 CHANGES vs previous version:
   - KRITISK BUG RETTET: "poster_url" var i _STRIP_FIELDS og blev slettet
-    af _strip() lige efter vi satte den — det forårsagede 400 Bad Request
-    i send_photo(). Rettet ved at fjerne "poster_url" fra _STRIP_FIELDS
-    og tilføje "poster_path" og "credits" i stedet (disse skal strippes).
-  - Overview trunkering fjernet — fuld tekst returneres fra TMDB.
-  - append_to_response=videos,credits, engelsk fallback — uændret.
+    af _strip() — nu er "poster_path" og "credits" i _STRIP_FIELDS i stedet.
+  - cast returneres som list[str] med de 3 øverste skuespillere fra credits.
+  - poster_url returneres som fuld https://image.tmdb.org/t/p/w500{path} URL.
+  - Overview trunkering fjernet — fuld tekst fra TMDB.
+  - Engelsk trailer-fallback og append_to_response=videos,credits — uændret.
 """
 
 import asyncio
