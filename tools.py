@@ -2,11 +2,11 @@
 tools.py - Claude Tool Use definitions for Buddy.
 
 CHANGES vs previous version:
-  - Fjernet add_movie og add_series — bestilling sker nu via Inline Keyboards.
-  - Claude trigger bestilling via SHOW_SEARCH_RESULTS-svar, ikke direkte tool-kald.
-  - get_trending returnerer nu altid præcis 5 film og 5 serier som en struktureret
-    dict: {"movies": [...], "tv": [...]}. Ingen media_type parameter — begge
-    kategorier hentes altid i ét kald via to parallelle interne API-kald.
+  - get_plex_collection omdøbt til check_franchise_status med ny beskrivelse.
+    Bruges når brugeren spørger efter franchises, samlinger eller film-serier
+    (Marvel, James Bond, Harry Potter osv.). Input: kun keyword.
+  - get_trending returnerer altid præcis 5 film og 5 serier som en struktureret
+    dict: {"movies": [...], "tv": [...]} via to parallelle interne API-kald.
 """
 
 TOOLS = [
@@ -45,8 +45,7 @@ TOOLS = [
             "Hent de mest trendende titler globalt denne uge. "
             "Returnerer ALTID praecis 5 film og 5 serier som en struktureret dict: "
             "{\"movies\": [5 film], \"tv\": [5 serier]}. "
-            "Begge kategorier hentes altid i eet kald — brug dette ene tool naar "
-            "brugeren vil se trending film og/eller serier. "
+            "Begge kategorier hentes altid i eet kald. "
             "Efter du modtager resultatet, SKAL du tjekke alle 10 titler i Plex "
             "via check_plex_library (se Plex-tjek reglen i system-prompten)."
         ),
@@ -131,15 +130,27 @@ TOOLS = [
         },
     },
     {
-        "name": "get_plex_collection",
-        "description": "Soeg i Plex efter alle titler der matcher et nogleord eller franchisenavn.",
+        "name": "check_franchise_status",
+        "description": (
+            "Avanceret franchise-søgning: finder den officielle samling fra TMDB "
+            "(f.eks. 'Marvel Cinematic Universe Collection', 'James Bond Collection', "
+            "'Harry Potter Collection') og krydstjekker ALLE film mod Plex. "
+            "Brug dette NÅR brugeren spørger efter en franchise, samling eller film-serie — "
+            "f.eks. 'hvilke Marvel-film har vi?', 'hvad mangler vi af Bond?', "
+            "'vis mig Harry Potter-samlingen'. "
+            "Returnerer: collection_name, found_on_plex (titler vi har), "
+            "missing_from_plex (titler vi mangler), found_count og missing_count. "
+            "Input: kun keyword (f.eks. 'Marvel', 'James Bond', 'Harry Potter')."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "keyword": {"type": "string"},
-                "media_type": {"type": "string", "enum": ["movie", "tv"]},
+                "keyword": {
+                    "type": "string",
+                    "description": "Franchise- eller samlingsnavn, f.eks. 'Marvel', 'James Bond', 'Jurassic Park'.",
+                },
             },
-            "required": ["keyword", "media_type"],
+            "required": ["keyword"],
         },
     },
     {
@@ -194,7 +205,10 @@ TOOLS = [
     },
     {
         "name": "get_missing_from_collection",
-        "description": "Find hvad der mangler af en samling eller franchise i Plex.",
+        "description": (
+            "Find hvad der mangler af en samling eller franchise i Plex via simpel TMDB-søgning. "
+            "Til avanceret franchise-krydstjek: brug check_franchise_status i stedet."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"collection_name": {"type": "string"}},

@@ -15,13 +15,14 @@ TOKEN OPTIMISATION (data-diæt):
     which is called explicitly when the user asks for them.
 
 CHANGES vs previous version:
-  - _clean_title() og _titles_match_fuzzy() tilføjet for robust TV-matching.
-    Fanger Plex-titler med regions-tags eller årstal i parentes
-    (f.eks. 'Euphoria (US)', 'Invincible (2021)').
-  - _check_sync bruger tre-lags matching: eksakt → renset → substring.
-  - _collection_sync opdelt i main_results og animated_results:
-    Returnerer {"results": [top 10 ikke-animation], "hidden_animation_count": N}
-    så Lego-film og tegnefilm ikke fortrænger blockbusters fra Marvel-søgninger.
+  - Tilføjet check_franchise_on_plex(keyword, plex_username):
+    Henter den fulde franchise-liste fra TMDB via get_tmdb_collection_movies(),
+    krydstjekker alle film mod Plex via _clean_title fuzzy-matching,
+    og returnerer {"collection_name", "found_on_plex", "missing_from_plex"}.
+  - _collection_sync returnerer nu animations-filtreret output:
+    {"results": [top 10 ikke-animation], "hidden_animation_count": N}.
+  - _clean_title og _titles_match_fuzzy: tre-lags fuzzy matching der fanger
+    Plex-titler med regions-tags eller årstal i parentes.
 """
 
 import asyncio
@@ -52,25 +53,21 @@ _MAX_RESULTS = 25
 _TMDB_BASE = "https://api.themoviedb.org/3"
 _TMDB_LANG = "da-DK"
 
-# Max år en series årstal må afvige og stadig godkendes.
-_TV_YEAR_TOLERANCE = 2
-
-# Antal ikke-animerede resultater der returneres fra get_plex_collection.
+_TV_YEAR_TOLERANCE   = 2
 _COLLECTION_MAX_MAIN = 10
+
+# Max antal titler i found_on_plex / missing_from_plex ved franchise-søgning.
+# Holdes lavt for at undgå token-overflow ved store franchises (MCU = 33+ film).
+_FRANCHISE_MAX_PER_LIST = 20
 
 
 # ── Lightweight item serialiser ───────────────────────────────────────────────
 
 def _slim(item) -> dict:
-    """
-    Convert a PlexAPI media object to a minimal dict for the AI.
-    Keeps ONLY: title, year, rating, genres (max 3), summary.
-    """
     genres  = [g.tag for g in getattr(item, "genres", [])][:3]
     summary = (getattr(item, "summary", "") or "").strip()
     if len(summary) > 200:
         summary = summary[:197] + "…"
-
     return {
         "title":   getattr(item, "title", "Ukendt"),
         "year":    getattr(item, "year", None),
@@ -81,7 +78,6 @@ def _slim(item) -> dict:
 
 
 def _is_animation(item) -> bool:
-    """Returnerer True hvis titlen har genren 'Animation' (case-insensitive)."""
     genres = [g.tag.lower() for g in getattr(item, "genres", [])]
     return "animation" in genres
 
@@ -89,11 +85,6 @@ def _is_animation(item) -> bool:
 # ── Title normalisation ───────────────────────────────────────────────────────
 
 def _normalise(title: str) -> str:
-    """
-    Normalise a title for fuzzy comparison.
-    Strips accents, lowercases, replaces hyphens, removes punctuation,
-    collapses spaces, and strips leading articles.
-    """
     nfkd      = unicodedata.normalize("NFKD", title)
     ascii_str = "".join(c for c in nfkd if not unicodedata.combining(c))
     s = ascii_str.lower()
@@ -106,19 +97,16 @@ def _normalise(title: str) -> str:
 
 def _clean_title(title: str) -> str:
     """
-    Aggressiv titel-rensning til fuzzy matching.
+    Aggressiv titel-rensning: fjerner parenteser, specialtegn og artikler.
+    Bruges til fuzzy matching — aldrig til at overskrive titler.
 
-    Fjerner indhold i parenteser (f.eks. '(US)', '(2021)'), specialtegn
-    og leading articles. Bruges KUN til sammenlignings-formål.
-
-    Eksempler:
-      'Euphoria (US)'     → 'euphoria'
-      'Invincible (2021)' → 'invincible'
-      'The Bear: S2'      → 'bear s2'
+    'Euphoria (US)'     → 'euphoria'
+    'Invincible (2021)' → 'invincible'
+    'Iron Man 3'        → 'iron man 3'
     """
     s = title.lower()
-    s = re.sub(r"\([^)]*\)", "", s)          # fjern alt i parenteser
-    s = re.sub(r"[^a-z0-9\s]", "", s)        # fjern specialtegn
+    s = re.sub(r"\([^)]*\)", "", s)
+    s = re.sub(r"[^a-z0-9\s]", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     s = re.sub(r"^(the|a|an|den|det|en|et)\s+", "", s)
     return s
@@ -132,32 +120,23 @@ def _titles_match(title_a: str, title_b: str) -> bool:
 def _titles_match_fuzzy(title_a: str, title_b: str) -> bool:
     """
     Lag 2 + 3 — fuzzy match via _clean_title.
-
-    Lag 2: Identiske rensede titler.
-    Lag 3: Den ene er substring af den anden (min. 4 tegn).
+    Lag 2: identiske rensede titler.
+    Lag 3: den ene er substring af den anden (min. 4 tegn).
     """
     clean_a = _clean_title(title_a)
     clean_b = _clean_title(title_b)
-
     if not clean_a or not clean_b:
         return False
-
     if clean_a == clean_b:
         return True
-
     min_len = 4
     if len(clean_a) >= min_len and len(clean_b) >= min_len:
         if clean_a in clean_b or clean_b in clean_a:
             return True
-
     return False
 
 
 def _year_ok_for_tv(item_year: int | None, query_year: int | None) -> bool:
-    """
-    Løs årstals-validering for TV-shows.
-    Godkender hvis årstal mangler, eller afviger max _TV_YEAR_TOLERANCE år.
-    """
     if item_year is None or query_year is None:
         return True
     return abs(item_year - query_year) <= _TV_YEAR_TOLERANCE
@@ -166,15 +145,6 @@ def _year_ok_for_tv(item_year: int | None, query_year: int | None) -> bool:
 # ── Plex connection helper ────────────────────────────────────────────────────
 
 def _connect(plex_username: str | None = None) -> PlexServer | dict:
-    """
-    Return a user-scoped PlexServer connection.
-
-    Priority order:
-      1. Server owner      → use admin token directly
-      2. Shared friend     → get token via account.user().get_token()
-      3. Managed home user → get token via switchHomeUser()
-      4. No match          → fall back to admin token with warning
-    """
     try:
         admin_plex = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=15)
     except Unauthorized:
@@ -192,17 +162,14 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
     try:
         account = admin_plex.myPlexAccount()
 
-        # ── 1. Server owner ───────────────────────────────────────────────────
         owner_names = {
             (account.username or "").lower(),
             (account.email or "").lower(),
             (account.title or "").lower(),
         }
         if norm in owner_names:
-            logger.debug("Plex connect: owner '%s'", plex_username)
             return admin_plex
 
-        # ── 2. Shared friend ──────────────────────────────────────────────────
         for user in account.users():
             user_names = {
                 (getattr(user, "username", "") or "").lower(),
@@ -214,15 +181,10 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
                     user_token = account.user(user.username).get_token(
                         admin_plex.machineIdentifier
                     )
-                    logger.debug("Plex connect: shared friend '%s'", plex_username)
                     return PlexServer(PLEX_URL, user_token, timeout=15)
                 except Exception as e:
-                    logger.warning(
-                        "get_token() failed for '%s': %s — trying switchHomeUser",
-                        plex_username, e,
-                    )
+                    logger.warning("get_token() failed for '%s': %s", plex_username, e)
 
-        # ── 3. Managed home user ──────────────────────────────────────────────
         try:
             home_users = account.homeUsers()
         except Exception:
@@ -237,19 +199,12 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
             if norm in user_names:
                 try:
                     switched = account.switchHomeUser(user)
-                    logger.debug("Plex connect: managed home user '%s'", plex_username)
                     return PlexServer(PLEX_URL, switched.authToken, timeout=15)
                 except Exception as e:
-                    logger.warning(
-                        "switchHomeUser() failed for '%s': %s — falling back to admin",
-                        plex_username, e,
-                    )
+                    logger.warning("switchHomeUser() failed for '%s': %s", plex_username, e)
                     return admin_plex
 
-        # ── 4. No match ───────────────────────────────────────────────────────
-        logger.warning(
-            "Plex user '%s' not found — falling back to admin", plex_username
-        )
+        logger.warning("Plex user '%s' not found — falling back to admin", plex_username)
         return admin_plex
 
     except Exception as e:
@@ -266,7 +221,6 @@ def _sections(plex: PlexServer, plex_type: str) -> list:
 
 
 def _safe_search(section, title: str) -> list:
-    """Search a section by first normalised word; return empty list on error."""
     try:
         first_word = _normalise(title).split()[0] if _normalise(title).split() else title
         return section.search(title=first_word)
@@ -278,11 +232,6 @@ def _safe_search(section, title: str) -> list:
 # ── Technical specs helper ────────────────────────────────────────────────────
 
 def _stream_info(media_item) -> dict:
-    """
-    Extract technical specs from a Plex media item.
-    NEVER returns raw file paths or directory names.
-    Only called by _metadata_sync.
-    """
     info = {
         "resolution": None, "hdr": False, "video_codec": None,
         "audio_codec": None, "audio_channels": None,
@@ -330,7 +279,6 @@ async def check_library(
     media_type: str,
     plex_username: str | None = None,
 ) -> dict:
-    """Check whether a specific title exists in Plex."""
     try:
         return await asyncio.to_thread(
             partial(_check_sync, title=title, year=year,
@@ -347,8 +295,8 @@ async def get_collection(
     plex_username: str | None = None,
 ) -> dict:
     """
-    Search Plex for all titles matching a keyword.
-    Returnerer top 10 ikke-animerede resultater + antal skjulte animerede titler.
+    Simpel Plex-tekstsøgning på keyword med animations-filter.
+    Til franchise-søgninger: brug check_franchise_on_plex() i stedet.
     """
     try:
         return await asyncio.to_thread(
@@ -360,8 +308,70 @@ async def get_collection(
         return {"status": STATUS_ERROR, "message": str(e)}
 
 
+async def check_franchise_on_plex(
+    keyword: str,
+    plex_username: str | None = None,
+) -> dict:
+    """
+    Avanceret franchise-søgning: henter autoritativ film-liste fra TMDB
+    og krydstjekker mod Plex via fuzzy matching.
+
+    Flow:
+      1. Kalder get_tmdb_collection_movies(keyword) for at hente den
+         komplette TMDB-samling (f.eks. alle 33 MCU-film).
+      2. For hvert film i samlingen: tjek om det findes i Plex via
+         _titles_match / _titles_match_fuzzy mod alle film-sektioner.
+      3. Returnerer:
+         {
+           "collection_name":    "Marvel Cinematic Universe Collection",
+           "total_in_franchise": 33,
+           "found_on_plex":      [{"title": ..., "year": ...}, ...],  # max 20
+           "missing_from_plex":  [{"title": ..., "release_date": ...}, ...],  # max 20
+           "found_count":        N,
+           "missing_count":      M,
+         }
+
+    Begge lister er begrænset til _FRANCHISE_MAX_PER_LIST (20) for at
+    undgå token-overflow ved store franchises. Counts afspejler det reelle tal.
+    """
+    # Import her for at undgå cirkulær import (tmdb_service ↔ plex_service)
+    from services.tmdb_service import get_tmdb_collection_movies
+
+    # Trin 1: hent TMDB-samlingen
+    collection = await get_tmdb_collection_movies(keyword)
+
+    if not collection:
+        return {
+            "status":  "not_found",
+            "message": (
+                f"Jeg kunne ikke finde en samling med navnet '{keyword}' i databasen. "
+                "Prøv et mere specifikt søgeord, f.eks. 'James Bond' eller "
+                "'Marvel Cinematic Universe'."
+            ),
+        }
+
+    collection_name = collection["collection_name"]
+    tmdb_movies     = collection["movies"]
+
+    logger.info(
+        "check_franchise_on_plex: '%s' → '%s' (%d film) — starter Plex-tjek",
+        keyword, collection_name, len(tmdb_movies),
+    )
+
+    # Trin 2: byg Plex-indeks én gang (alle film-sektioner)
+    # Vi kører dette i en thread da PlexAPI er synkront
+    result = await asyncio.to_thread(
+        partial(
+            _franchise_plex_check_sync,
+            collection_name=collection_name,
+            tmdb_movies=tmdb_movies,
+            plex_username=plex_username,
+        )
+    )
+    return result
+
+
 async def get_on_deck(plex_username: str | None = None) -> dict:
-    """Return the user's 'Continue Watching' list (up to 8 items)."""
     try:
         return await asyncio.to_thread(partial(_on_deck_sync, plex_username=plex_username))
     except Exception as e:
@@ -374,7 +384,6 @@ async def get_plex_metadata(
     year: int | None,
     plex_username: str | None = None,
 ) -> dict:
-    """Return technical specs for a title — never raw file paths."""
     try:
         return await asyncio.to_thread(
             partial(_metadata_sync, title=title, year=year, plex_username=plex_username)
@@ -389,7 +398,6 @@ async def find_unwatched(
     genre: str | None = None,
     plex_username: str | None = None,
 ) -> dict:
-    """Return up to 6 random unwatched titles, optionally filtered by genre."""
     try:
         return await asyncio.to_thread(
             partial(_unwatched_sync, media_type=media_type,
@@ -404,7 +412,6 @@ async def get_similar_in_library(
     title: str,
     plex_username: str | None = None,
 ) -> dict:
-    """Find titles in the Plex library similar to the given title."""
     try:
         return await asyncio.to_thread(
             partial(_similar_sync, title=title, plex_username=plex_username)
@@ -418,7 +425,6 @@ async def get_missing_from_collection(
     collection_name: str,
     plex_username: str | None = None,
 ) -> dict:
-    """Compare a Plex collection against TMDB to find missing titles."""
     try:
         return await asyncio.to_thread(
             partial(_missing_sync, collection_name=collection_name,
@@ -434,7 +440,6 @@ async def search_by_actor(
     media_type: str = "movie",
     plex_username: str | None = None,
 ) -> dict:
-    """Find titles in the Plex library featuring a specific actor or director."""
     try:
         return await asyncio.to_thread(
             partial(_actor_sync, actor_name=actor_name,
@@ -449,6 +454,105 @@ async def search_by_actor(
 # SYNC IMPLEMENTATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _franchise_plex_check_sync(
+    collection_name: str,
+    tmdb_movies: list[dict],
+    plex_username: str | None = None,
+) -> dict:
+    """
+    Synkron kerne af check_franchise_on_plex — kører i thread pool.
+
+    Strategi for at holde det hurtigt på store franchises (MCU = 33 film):
+      - Byg ét Plex-indeks over alle film-sektioner (søg med første ord af
+        hvert TMDB-filmnavn, deduplikér via set på item.ratingKey).
+      - For hvert TMDB-film: kør fuzzy match mod Plex-indekset lokalt
+        uden ekstra API-kald.
+
+    Dette giver O(N × M) sammenligninger lokalt frem for N × Plex API-kald.
+    """
+    plex = _connect(plex_username)
+    if isinstance(plex, dict):
+        return plex
+
+    sections = _sections(plex, _MOVIE_TYPE)
+    if not sections:
+        return {
+            "status":  STATUS_ERROR,
+            "message": "Ingen film-sektioner fundet i Plex.",
+        }
+
+    # Byg lokalt Plex-indeks: {ratingKey: (plex_title, plex_year)}
+    # Vi søger bredt (ingen titel-filter) for at dække hele biblioteket.
+    plex_index: dict[int, tuple[str, int | None]] = {}
+    for section in sections:
+        try:
+            for item in section.search():
+                key = getattr(item, "ratingKey", None)
+                if key and key not in plex_index:
+                    plex_index[key] = (
+                        getattr(item, "title", "") or "",
+                        getattr(item, "year", None),
+                    )
+        except Exception as e:
+            logger.warning("Franchise index error in '%s': %s", section.title, e)
+
+    logger.info(
+        "check_franchise_on_plex: Plex-indeks bygget (%d film) mod %d TMDB-film",
+        len(plex_index), len(tmdb_movies),
+    )
+
+    found_on_plex:     list[dict] = []
+    missing_from_plex: list[dict] = []
+
+    for tmdb_movie in tmdb_movies:
+        tmdb_title = tmdb_movie.get("title", "")
+        release    = tmdb_movie.get("release_date", "")
+        tmdb_year  = int(release[:4]) if release and release[:4].isdigit() else None
+
+        matched = False
+        for plex_title, plex_year in plex_index.values():
+            # Tre-lags titel-match
+            if not (_titles_match(plex_title, tmdb_title) or
+                    _titles_match_fuzzy(plex_title, tmdb_title)):
+                continue
+
+            # Løst årstals-tjek for film: max 1 år afvigelse, eller manglende år
+            if tmdb_year and plex_year and abs(plex_year - tmdb_year) > 1:
+                continue
+
+            matched = True
+            found_on_plex.append({
+                "title": tmdb_title,
+                "year":  tmdb_year,
+            })
+            break
+
+        if not matched:
+            missing_from_plex.append({
+                "title":        tmdb_title,
+                "release_date": release or "Ukendt",
+            })
+
+    found_count   = len(found_on_plex)
+    missing_count = len(missing_from_plex)
+
+    logger.info(
+        "check_franchise_on_plex '%s': %d/%d fundet, %d mangler",
+        collection_name, found_count, len(tmdb_movies), missing_count,
+    )
+
+    return {
+        "status":            "ok",
+        "collection_name":   collection_name,
+        "total_in_franchise": len(tmdb_movies),
+        "found_count":       found_count,
+        "missing_count":     missing_count,
+        # Lister begrænses for at undgå token-overflow
+        "found_on_plex":    found_on_plex[:_FRANCHISE_MAX_PER_LIST],
+        "missing_from_plex": missing_from_plex[:_FRANCHISE_MAX_PER_LIST],
+    }
+
+
 def _check_sync(
     title: str,
     year: int | None,
@@ -456,15 +560,9 @@ def _check_sync(
     plex_username: str | None = None,
 ) -> dict:
     """
-    check_library — tre-lags fuzzy titel-matching.
-
-    Lag 1: Eksakt normaliseret match (_titles_match).
-    Lag 2: Identiske rensede titler via _clean_title — fanger '(US)', '(2021)' osv.
-    Lag 3: Substring-match på rensede titler (min. 4 tegn begge veje).
-
-    TV-shows: løst årstals-match (+/- _TV_YEAR_TOLERANCE), kun show-eksistens tæller.
-    Film: strengt årstals-match (max 1 års afvigelse).
-    Alle sektioner af den givne type gennemsøges.
+    Tre-lags fuzzy titel-matching.
+    Lag 1: eksakt normaliseret. Lag 2: renset (_clean_title). Lag 3: substring.
+    TV: løst årstal (+/- 2 år). Film: strengt (max 1 år).
     """
     is_tv     = (media_type == "tv")
     plex_type = _TV_TYPE if is_tv else _MOVIE_TYPE
@@ -475,13 +573,9 @@ def _check_sync(
 
     sections = _sections(plex, plex_type)
     if not sections:
-        logger.warning("check_library: ingen sektioner af type '%s' fundet", plex_type)
+        logger.warning("check_library: ingen sektioner af type '%s'", plex_type)
 
     for section in sections:
-        logger.debug(
-            "check_library: søger i '%s' efter '%s' [%s]",
-            section.title, title, media_type,
-        )
         for item in _safe_search(section, title):
             item_title = getattr(item, "title", "") or ""
             item_year  = getattr(item, "year", None)
@@ -496,27 +590,18 @@ def _check_sync(
 
             if is_tv:
                 if not _year_ok_for_tv(item_year, year):
-                    logger.debug(
-                        "check_library: TV årstals-afvisning — item=%s query=%s",
-                        item_year, year,
-                    )
                     continue
             else:
                 if year and item_year and abs(item_year - year) > 1:
-                    logger.debug(
-                        "check_library: film årstals-afvisning — item=%s query=%s",
-                        item_year, year,
-                    )
                     continue
 
             logger.info(
-                "Plex HIT (lag %s): '%s' (%s) i '%s' [%s] — søgt på '%s' (%s)",
-                match_lag, item_title, item_year, section.title,
-                plex_type, title, year,
+                "Plex HIT (lag %s): '%s' (%s) i '%s' — søgt på '%s' (%s)",
+                match_lag, item_title, item_year, section.title, title, year,
             )
             return {"status": STATUS_FOUND, "title": item_title, "year": item_year}
 
-    logger.info("Plex MISS: '%s' (%s) ikke fundet i nogen %s-sektion", title, year, plex_type)
+    logger.info("Plex MISS: '%s' (%s) ikke fundet", title, year)
     return {"status": STATUS_MISSING}
 
 
@@ -526,52 +611,28 @@ def _collection_sync(
     plex_username: str | None = None,
 ) -> dict:
     """
-    get_plex_collection — søg efter franchise/keyword med animations-filter.
-
-    FIX: Resultater opdeles i to lister baseret på genre:
-      - main_results:     Titler der IKKE har genren 'Animation'.
-                          Sorteres efter år (nyeste først), derefter rating.
-                          Begrænses til _COLLECTION_MAX_MAIN (10) titler.
-      - animated_results: Titler der HAR genren 'Animation'.
-                          Tælles men returneres IKKE til AI'en — forhindrer
-                          Lego-film og tegnefilm i at fortrænge blockbusters
-                          ved franchise-søgninger (f.eks. 'Marvel', 'Star Wars').
-
-    Returnerer:
-      {
-        "status": "ok",
-        "keyword": "Marvel",
-        "results": [top 10 ikke-animerede titler],
-        "hidden_animation_count": 7   ← bruges af Buddy til at nævne animerede titler
-      }
-
-    Buddy-prompten instruerer Claude til at nævne hidden_animation_count
-    som en P.S.-note uden at opfinde titler.
+    Simpel Plex-tekstsøgning med animations-filter.
+    Returnerer {"results": [top 10 ikke-animation], "hidden_animation_count": N}.
     """
     plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
-    norm_keyword = _normalise(keyword)
+    norm_keyword     = _normalise(keyword)
     main_results     = []
     animated_results = []
 
     for section in _sections(plex, plex_type):
         for item in _safe_search(section, keyword):
             item_title = getattr(item, "title", "") or ""
-
-            # Tjek at titlen faktisk matcher keywordet
             if norm_keyword.split()[0] not in _normalise(item_title):
                 continue
-
-            # Opdel på animation-genre
             if _is_animation(item):
                 animated_results.append(item)
             else:
                 main_results.append(item)
 
-    # Sortér ikke-animerede: nyeste år først, derefter højest rating
     main_results.sort(
         key=lambda x: (
             getattr(x, "year", 0) or 0,
@@ -588,19 +649,17 @@ def _collection_sync(
     )
 
     return {
-        "status":                "ok",
-        "keyword":               keyword,
-        "results":               top_main,
+        "status":                 "ok",
+        "keyword":                keyword,
+        "results":                top_main,
         "hidden_animation_count": len(animated_results),
     }
 
 
 def _on_deck_sync(plex_username: str | None = None) -> dict:
-    """get_on_deck — slim items only, episodes get show/season/episode fields."""
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
-
     try:
         on_deck = plex.library.onDeck()[:8]
     except Exception as e:
@@ -617,7 +676,6 @@ def _on_deck_sync(plex_username: str | None = None) -> dict:
             entry["episode"]       = getattr(item, "index", None)
             entry["episode_title"] = getattr(item, "title", None)
         items.append(entry)
-
     return {"status": "ok", "on_deck": items, "count": len(items)}
 
 
@@ -626,7 +684,6 @@ def _metadata_sync(
     year: int | None,
     plex_username: str | None = None,
 ) -> dict:
-    """get_plex_metadata — the ONE function that returns technical specs."""
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
@@ -648,7 +705,6 @@ def _metadata_sync(
                     "type":   plex_type,
                     "specs":  _stream_info(item),
                 }
-
     return {"status": STATUS_MISSING, "message": f"'{title}' ikke fundet i Plex."}
 
 
@@ -657,7 +713,6 @@ def _unwatched_sync(
     genre: str | None,
     plex_username: str | None = None,
 ) -> dict:
-    """find_unwatched — slim items, capped at 6 random picks."""
     plex_type  = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
     plex       = _connect(plex_username)
     if isinstance(plex, dict):
@@ -675,7 +730,6 @@ def _unwatched_sync(
             except Exception as e:
                 logger.warning("Unwatched search error in '%s': %s", section.title, e)
                 continue
-
         for item in results:
             if getattr(item, "viewCount", 0) > 0:
                 continue
@@ -690,20 +744,18 @@ def _unwatched_sync(
 
 
 def _similar_sync(title: str, plex_username: str | None = None) -> dict:
-    """get_similar_in_library — slim items, capped at _MAX_RESULTS."""
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
-    source_item    = None
-    source_section = None
+    source_item = source_section = None
 
     for plex_type in (_MOVIE_TYPE, _TV_TYPE):
         for section in _sections(plex, plex_type):
             for item in _safe_search(section, title):
                 if (_titles_match(getattr(item, "title", ""), title) or
                         _titles_match_fuzzy(getattr(item, "title", ""), title)):
-                    source_item    = item
+                    source_item = item
                     source_section = section
                     break
             if source_item:
@@ -753,7 +805,6 @@ def _similar_sync(title: str, plex_username: str | None = None) -> dict:
 
 
 def _missing_sync(collection_name: str, plex_username: str | None = None) -> dict:
-    """get_missing_from_collection — find gaps between TMDB and Plex."""
     import httpx as _httpx
 
     try:
@@ -783,14 +834,14 @@ def _missing_sync(collection_name: str, plex_username: str | None = None) -> dic
     if isinstance(plex, dict):
         return plex
 
-    found_in_plex     = []
+    found_in_plex = []
     missing_from_plex = []
 
     for movie in relevant:
         tmdb_title = movie.get("title") or movie.get("original_title") or ""
         tmdb_year  = int((movie.get("release_date") or "0")[:4] or 0) or None
+        in_plex    = False
 
-        in_plex = False
         for section in _sections(plex, _MOVIE_TYPE):
             for item in _safe_search(section, tmdb_title):
                 item_title = getattr(item, "title", "") or ""
@@ -812,11 +863,11 @@ def _missing_sync(collection_name: str, plex_username: str | None = None) -> dic
             missing_from_plex.append(entry)
 
     return {
-        "status":          "ok",
-        "collection":      collection_name,
-        "found_in_plex":   found_in_plex[:_MAX_RESULTS],
+        "status":            "ok",
+        "collection":        collection_name,
+        "found_in_plex":     found_in_plex[:_MAX_RESULTS],
         "missing_from_plex": missing_from_plex[:_MAX_RESULTS],
-        "total_checked":   len(relevant),
+        "total_checked":     len(relevant),
     }
 
 
@@ -825,7 +876,6 @@ def _actor_sync(
     media_type: str = "movie",
     plex_username: str | None = None,
 ) -> dict:
-    """search_by_actor — find titles in Plex featuring a specific actor."""
     plex_type  = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
     plex       = _connect(plex_username)
     if isinstance(plex, dict):
@@ -836,8 +886,7 @@ def _actor_sync(
 
     for section in _sections(plex, plex_type):
         try:
-            results = section.search(actor=actor_name)
-            for item in results:
+            for item in section.search(actor=actor_name):
                 matches.append(_slim(item))
         except Exception:
             try:
@@ -849,7 +898,7 @@ def _actor_sync(
                             matches.append(_slim(item))
                             break
             except Exception as e:
-                logger.warning("Actor fallback search error in '%s': %s", section.title, e)
+                logger.warning("Actor fallback error in '%s': %s", section.title, e)
 
     matches.sort(key=lambda x: x.get("year") or 0, reverse=True)
     capped = matches[:_MAX_RESULTS]
@@ -860,14 +909,12 @@ def _actor_sync(
             "message": f"Ingen titler med '{actor_name}' fundet i Plex-biblioteket.",
             "actor":   actor_name,
         }
-
     return {"status": "ok", "actor": actor_name, "found": capped, "count": len(capped)}
 
 
 # ── Plex user validation ──────────────────────────────────────────────────────
 
 async def validate_plex_user(plex_username: str) -> dict:
-    """Check whether a Plex username exists as a shared user on this server."""
     try:
         return await asyncio.to_thread(
             partial(_validate_user_sync, plex_username=plex_username)
@@ -878,7 +925,6 @@ async def validate_plex_user(plex_username: str) -> dict:
 
 
 def _validate_user_sync(plex_username: str) -> dict:
-    """Synchronous Plex user validation — runs in thread pool."""
     try:
         admin_plex = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=15)
         account    = admin_plex.myPlexAccount()
@@ -932,12 +978,11 @@ def _validate_user_sync(plex_username: str) -> dict:
 
     return {
         "valid":   False,
-        "message": f"Brugernavnet '{plex_username}' blev ikke fundet — hverken som ven eller hjembruger.",
+        "message": f"Brugernavnet '{plex_username}' blev ikke fundet.",
     }
 
 
 async def get_plex_for_user(plex_username: str):
-    """Return a PlexServer instance scoped to a specific user."""
     try:
         return await asyncio.to_thread(
             partial(_get_user_server_sync, plex_username=plex_username)
@@ -948,15 +993,12 @@ async def get_plex_for_user(plex_username: str):
 
 
 def _get_user_server_sync(plex_username: str):
-    """Return a user-scoped PlexServer — runs in thread pool."""
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return None
-
     try:
         account    = plex.myPlexAccount()
         norm_input = plex_username.strip().lower()
-
         owner_names = {
             (account.username or "").lower(),
             (account.email or "").lower(),
@@ -964,7 +1006,6 @@ def _get_user_server_sync(plex_username: str):
         }
         if norm_input in owner_names:
             return plex
-
         for user in account.users():
             user_names = {
                 (getattr(user, "username", "") or "").lower(),
@@ -974,8 +1015,6 @@ def _get_user_server_sync(plex_username: str):
             if norm_input in user_names:
                 user_token = account.switchHomeUser(user).authToken
                 return PlexServer(PLEX_URL, user_token, timeout=15)
-
     except Exception as e:
         logger.error("User server switch error: %s", e)
-
     return None
