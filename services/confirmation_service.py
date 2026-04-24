@@ -2,11 +2,12 @@
 services/confirmation_service.py - Inline keyboard bekræftelsesflow.
 
 CHANGES vs previous version:
-  - handle_watchlist_callback() tilføjet — håndterer 📌-knappen direkte
-    her i stedet for i main.py, så al confirmation-logik er samlet.
-  - Plex deep-link URL bruger URL-encoded key: %2Flibrary%2Fmetadata%2F{ratingKey}.
-  - parse_mode="Markdown" overalt — ingen MarkdownV2.
-  - cast og ⭐️ score i caption — uændret fra forrige version.
+  - IMDb-rating hentes nu direkte fra Plex (item.rating) når filmen er på serveren.
+    Fallback til TMDB vote_average hvis Plex ikke har en rating (f.eks. ny titel).
+    Formatering: 🎬 IMDb: {score}/10 — vises i caption som hidtil.
+  - _build_caption() tager nu et valgfrit rating-argument.
+  - handle_watchlist_callback keyboard-opdatering — uændret.
+  - parse_mode="Markdown" overalt — uændret.
 """
 
 import logging
@@ -30,18 +31,19 @@ def _make_token() -> str:
     return secrets.token_hex(8)
 
 
-def _build_caption(details: dict) -> str:
+def _build_caption(details: dict, rating: float | None = None) -> str:
     """
     Byg simpel Markdown-caption (ikke MarkdownV2) til send_photo.
 
-    Bruger kun *fed* og intet andet af Markdown-syntaks for at undgå
-    parse-fejl ved filmtitler og beskrivelser med specialtegn.
+    rating: Plex IMDb-score (foretrukket) eller TMDB vote_average (fallback).
+    Vises som: 🎬 IMDb: {score}/10
+
     Overview trimmes til Telegrams max caption-grænse på 1024 tegn.
     """
     title    = details.get("title") or "Ukendt"
     year     = (details.get("release_date") or details.get("first_air_date") or "")[:4]
     genres   = details.get("genres", [])[:3]
-    rating   = details.get("vote_average")
+    score    = rating if rating is not None else details.get("vote_average")
     overview = (details.get("overview") or "Ingen beskrivelse.").strip()
     cast     = details.get("cast") or []
     runtime  = details.get("runtime_minutes")
@@ -60,9 +62,9 @@ def _build_caption(details: dict) -> str:
     if genres:
         lines.append(f"🎬 {', '.join(genres)}")
 
-    # Score
-    if rating:
-        lines.append(f"⭐️ {rating}/10")
+    # Score — Plex IMDb foretrukket, TMDB som fallback
+    if score:
+        lines.append(f"🎬 IMDb: {score}/10")
 
     # Varighed / sæsoner
     if runtime:
@@ -212,6 +214,7 @@ async def show_confirmation(
     on_plex    = plex_check.get("status") == STATUS_FOUND
     machine_id = plex_check.get("machineIdentifier", "")
     rating_key = plex_check.get("ratingKey", "")
+    plex_rating = plex_check.get("rating")  # IMDb-score fra Plex, None hvis ikke på serveren
 
     # ── Byg knap-rækker ───────────────────────────────────────────────────────
     button_rows = []
@@ -239,7 +242,7 @@ async def show_confirmation(
         button_rows.append([InlineKeyboardButton("🎬 Se Trailer", url=trailer_url)])
 
     keyboard = InlineKeyboardMarkup(button_rows)
-    caption  = _build_caption(details)
+    caption  = _build_caption(details, rating=plex_rating)
 
     # ── Slet trigger-besked KUN ved CallbackQuery ─────────────────────────────
     if isinstance(trigger, CallbackQuery):

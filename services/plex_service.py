@@ -15,10 +15,9 @@ TOKEN OPTIMISATION (data-diæt):
     which is called explicitly when the user asks for them.
 
 CHANGES vs previous version:
-  - _check_sync(): returnerer nu ratingKey og machineIdentifier ved STATUS_FOUND.
-    Bruges af confirmation_service til at bygge Plex deep-link URL.
-  - add_to_watchlist() og _add_to_watchlist_sync() tilføjet:
-    bruger myPlexAccount().searchDiscover() + addToWatchlist().
+  - _check_sync(): returnerer nu ratingKey, machineIdentifier og rating ved STATUS_FOUND.
+    rating = item.rating (IMDb-score fra Plex-agenten, typisk 0-10).
+  - add_to_watchlist() og _add_to_watchlist_sync() tilføjet — uændret.
   - Alle øvrige funktioner er uændrede.
 """
 
@@ -766,6 +765,7 @@ def _check_sync(
                 "year":              item_year,
                 "ratingKey":         item.ratingKey,
                 "machineIdentifier": plex.machineIdentifier,
+                "rating":            getattr(item, "rating", None),
             }
 
     return {"status": STATUS_MISSING}
