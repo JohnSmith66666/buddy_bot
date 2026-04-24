@@ -2,14 +2,17 @@
 services/tmdb_service.py - TMDB API integration.
 
 CHANGES vs previous version:
-  - get_person_filmography() bruger nu /person/{id}/movie_credits i stedet for
-    /person/{id}/combined_credits. Årsag: combined_credits returnerer kun ~20
-    resultater fra side 1, mens movie_credits returnerer ALLE film på én gang
-    som en komplet liste under 'cast'. Samuel L. Jackson: 20 → 180+ film.
-  - Filtrering: fjerner poster med 'uncredited' i character-feltet og poster
-    uden release_date (urealiserede projekter), da disse forurener statistikken.
+  - get_media_details() inkluderer nu append_to_response=videos i API-kaldet.
+    Parser YouTube-trailers fra data['videos']['results']:
+      1. Søger efter type="Trailer" og site="YouTube" — bedste match.
+      2. Fallback til type="Teaser" og site="YouTube" hvis ingen trailer.
+      3. Konstruerer fuldt YouTube-link: https://www.youtube.com/watch?v={key}
+      4. Returnerer trailer_url (None hvis ingen YouTube-video fundet).
+    Gælder både film og TV-serier.
+  - get_person_filmography() bruger /movie_credits endpoint (ikke combined_credits)
+    → ALLE film returneres. Filtrering: 'uncredited' og ingen release_date fjernes.
   - get_tmdb_collection_movies() returnerer tmdb_id, title, original_title.
-  - get_trending() laver to parallelle API-kald, returnerer 5+5 dict.
+  - get_trending() laver to parallelle kald, returnerer 5+5 dict.
   - get_now_playing() og get_upcoming() sorterer efter popularity, top 10.
 """
 
@@ -94,6 +97,46 @@ def _format_provider_list(providers: list[dict]) -> list[str]:
     return [p["provider_name"] for p in providers if "provider_name" in p]
 
 
+def _extract_trailer_url(data: dict) -> str | None:
+    """
+    Find den bedste YouTube-trailer fra TMDB's videos-respons.
+
+    Prioritetsorden:
+      1. type="Trailer" og site="YouTube"  — officiel trailer
+      2. type="Teaser"  og site="YouTube"  — teaser hvis ingen trailer
+
+    TMDB returnerer videoer på det originale sprog (ikke oversat til da-DK),
+    men append_to_response=videos hentes uden language-parameter for at
+    undgå at gå glip af engelske trailere pga. manglende dansk lokalisering.
+
+    Returnerer fuldt YouTube-URL eller None hvis ingen video fundet.
+    """
+    videos = data.get("videos", {})
+    results = videos.get("results", []) if isinstance(videos, dict) else []
+
+    if not results:
+        return None
+
+    # Trin 1: søg efter officiel trailer
+    for video in results:
+        if video.get("site") == "YouTube" and video.get("type") == "Trailer":
+            key = video.get("key")
+            if key:
+                logger.debug("TMDB trailer fundet: type=Trailer key=%s", key)
+                return f"https://www.youtube.com/watch?v={key}"
+
+    # Trin 2: fallback til teaser
+    for video in results:
+        if video.get("site") == "YouTube" and video.get("type") == "Teaser":
+            key = video.get("key")
+            if key:
+                logger.debug("TMDB trailer fallback: type=Teaser key=%s", key)
+                return f"https://www.youtube.com/watch?v={key}"
+
+    logger.debug("TMDB: ingen YouTube-trailer fundet i %d videoer", len(results))
+    return None
+
+
 async def search_media(query: str, media_type: str = "both") -> list[dict]:
     results: list[dict] = []
     async with httpx.AsyncClient(timeout=10) as client:
@@ -123,19 +166,42 @@ async def search_media(query: str, media_type: str = "both") -> list[dict]:
 
 
 async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
-    """Fetch full details for a film or TV show."""
+    """
+    Fetch full details for a film or TV show, including YouTube trailer URL.
+
+    FIX: Tilføjet append_to_response=videos til API-kaldet.
+    TMDB returnerer nu videoer (trailere, teasere osv.) i samme svar,
+    hvilket sparer et ekstra API-kald og reducerer latens.
+
+    trailer_url er None hvis:
+      - Ingen videos-data i svaret
+      - Ingen YouTube-video med type Trailer eller Teaser
+      - TMDB har ikke registreret trailere for titlen endnu
+
+    For TV-serier henter vi stadig external_ids i et separat kald for tvdb_id
+    (Sonarr kræver dette), men videos er inkluderet i hoved-kaldet.
+    """
     endpoint = "movie" if media_type == "movie" else "tv"
 
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             resp = await client.get(
-                f"{_BASE_URL}/{endpoint}/{tmdb_id}", params=_params()
+                f"{_BASE_URL}/{endpoint}/{tmdb_id}",
+                params=_params(append_to_response="videos"),  # ← trailer-fix
             )
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPError as e:
             logger.error("TMDB details error (id=%s type=%s): %s", tmdb_id, media_type, e)
             return None
+
+    # Udtræk trailer URL inden _strip() fjerner 'videos'-feltet
+    trailer_url = _extract_trailer_url(data)
+
+    if trailer_url:
+        logger.info("TMDB trailer: tmdb_id=%s → %s", tmdb_id, trailer_url)
+    else:
+        logger.debug("TMDB: ingen trailer for tmdb_id=%s", tmdb_id)
 
     if media_type == "movie":
         return _strip({
@@ -150,9 +216,11 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
             "genre_ids":         [g["id"] for g in data.get("genres", [])],
             "original_language": data.get("original_language"),
             "imdb_id":           data.get("imdb_id"),
+            "trailer_url":       trailer_url,   # ← ny nøgle
             "media_type":        "movie",
         })
 
+    # TV-serie: hent external_ids separat for tvdb_id (Sonarr kræver det)
     tvdb_id = None
     async with httpx.AsyncClient(timeout=10) as client:
         try:
@@ -162,6 +230,7 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
             )
             ext_resp.raise_for_status()
             tvdb_id = ext_resp.json().get("tvdb_id")
+            logger.info("TMDB external_ids for tmdb_id=%s: tvdb_id=%s", tmdb_id, tvdb_id)
         except httpx.HTTPError as e:
             logger.warning("Could not fetch external_ids for tmdb_id=%s: %s", tmdb_id, e)
 
@@ -184,6 +253,7 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
         "original_language":    data.get("original_language"),
         "status":               data.get("status"),
         "tvdb_id":              tvdb_id,
+        "trailer_url":          trailer_url,   # ← ny nøgle
         "media_type":           "tv",
     })
 
@@ -281,39 +351,15 @@ async def search_person(query: str) -> list[dict]:
 
 async def get_person_filmography(person_id: int) -> dict | None:
     """
-    Hent den FULDE filmografi for en person.
+    Hent den FULDE filmografi for en person via /movie_credits endpoint.
 
-    FIX: Bruger nu /person/{id}/movie_credits i stedet for /combined_credits.
-
-    Årsag til skiftet:
-      - /combined_credits returnerer kun ~20 resultater pga. intern paginering
-        på TMDB's side (side 1 af en blandet film+TV-liste).
-      - /movie_credits returnerer ALLE film på én gang som én komplet liste
-        under 'cast' — ingen paginering, ingen begrænsning.
-      - Samuel L. Jackson: combined_credits → 20 film, movie_credits → 180+ film.
-
-    Kører to parallelle kald via asyncio.gather:
-      1. /person/{id}               → biografi, navn, fødselsdato
-      2. /person/{id}/movie_credits → komplet film-cast liste
-
-    Filtrering (fjerner støj fra listen):
-      - 'uncredited' i character-feltet: statist-roller der ikke tæller karrieremæssigt.
-      - Ingen release_date: urealiserede/annoncerede projekter uden udgivelsesdato.
-        Disse forvrænger total_movies-tællingen i check_actor_on_plex.
-
-    Deduplikering på tmdb_id: TMDB kan liste samme film flere gange (f.eks.
-    skuespiller + stemme-rolle). Vi beholder posten med højest vote_count.
-
-    Hvert film-objekt indeholder:
-      tmdb_id, title, original_title, release_date, character,
-      vote_average, vote_count, popularity
-
-    Sorteret efter popularity (faldende) — bedste hits først.
-    TV-credits hentes stadig via combined_credits, men kun top 10.
+    Bruger /movie_credits (ikke /combined_credits) for at få ALLE film på én gang.
+    Filtrering: fjerner 'uncredited'-roller og poster uden release_date.
+    Deduplikering på tmdb_id — beholder posten med højest vote_count.
+    Sorteret efter popularity faldende.
     """
     async with httpx.AsyncClient(timeout=15) as client:
         try:
-            # Kald begge endpoints parallelt for minimal latens
             bio_resp, movie_credits_resp = await asyncio.gather(
                 client.get(f"{_BASE_URL}/person/{person_id}", params=_params()),
                 client.get(
@@ -323,13 +369,13 @@ async def get_person_filmography(person_id: int) -> dict | None:
             )
             bio_resp.raise_for_status()
             movie_credits_resp.raise_for_status()
-            bio          = bio_resp.json()
-            movie_data   = movie_credits_resp.json()
+            bio        = bio_resp.json()
+            movie_data = movie_credits_resp.json()
         except httpx.HTTPError as e:
             logger.error("TMDB filmography error (id=%s): %s", person_id, e)
             return None
 
-    # ── Hent TV-credits separat (bruger combined_credits kun til TV) ──────────
+    # TV-credits separat
     tv_credits_raw = []
     async with httpx.AsyncClient(timeout=10) as client:
         try:
@@ -342,30 +388,20 @@ async def get_person_filmography(person_id: int) -> dict | None:
         except httpx.HTTPError as e:
             logger.warning("TMDB TV credits error (id=%s): %s", person_id, e)
 
-    # ── Film-credits: komplet liste fra /movie_credits ────────────────────────
     raw_cast = movie_data.get("cast", [])
-
     logger.info(
-        "get_person_filmography: person_id=%s → %d rå film-credits fra /movie_credits",
+        "get_person_filmography: person_id=%s → %d rå film-credits",
         person_id, len(raw_cast),
     )
 
-    # Filtrér støj
-    filtered = []
-    for item in raw_cast:
-        # Fjern ukrediterede roller
-        character = (item.get("character") or "").strip().lower()
-        if "uncredited" in character:
-            continue
+    # Filtrér uncredited og uden release_date
+    filtered = [
+        item for item in raw_cast
+        if "uncredited" not in (item.get("character") or "").strip().lower()
+        and (item.get("release_date") or "").strip()
+    ]
 
-        # Fjern projekter uden udgivelsesdato (urealiserede)
-        release_date = (item.get("release_date") or "").strip()
-        if not release_date:
-            continue
-
-        filtered.append(item)
-
-    # Deduplikér på tmdb_id — behold posten med højest vote_count
+    # Deduplikér på tmdb_id
     seen: dict[int, dict] = {}
     for item in filtered:
         tid = item.get("id")
@@ -375,7 +411,6 @@ async def get_person_filmography(person_id: int) -> dict | None:
         if existing is None or (item.get("vote_count", 0) or 0) > (existing.get("vote_count", 0) or 0):
             seen[tid] = item
 
-    # Byg final film-liste
     movie_credits = []
     for item in seen.values():
         title          = item.get("title") or item.get("original_title") or ""
@@ -393,16 +428,13 @@ async def get_person_filmography(person_id: int) -> dict | None:
             "popularity":     round(item.get("popularity", 0) or 0, 2),
         })
 
-    # Sortér efter popularity faldende
     movie_credits.sort(key=lambda x: x["popularity"], reverse=True)
 
     logger.info(
-        "get_person_filmography: person_id=%s → %d unikke film efter filtrering/dedup "
-        "(fjernet %d råposter)",
-        person_id, len(movie_credits), len(raw_cast) - len(movie_credits),
+        "get_person_filmography: %d unikke film (fjernet %d råposter)",
+        len(movie_credits), len(raw_cast) - len(movie_credits),
     )
 
-    # ── TV-credits: top 10 kronologisk ───────────────────────────────────────
     tv_credits = sorted(
         [
             {
@@ -427,8 +459,8 @@ async def get_person_filmography(person_id: int) -> dict | None:
         "place_of_birth":       bio.get("place_of_birth"),
         "known_for_department": bio.get("known_for_department", "Ukendt"),
         "total_movie_credits":  len(movie_credits),
-        "movie_credits":        movie_credits,   # ALLE film, sorteret efter popularity
-        "tv_credits":           tv_credits,      # top 10, kronologisk
+        "movie_credits":        movie_credits,
+        "tv_credits":           tv_credits,
     }
 
 
