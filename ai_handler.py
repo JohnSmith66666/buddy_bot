@@ -2,16 +2,22 @@
 ai_handler.py - Agentic loop for Buddy.
 
 CHANGES vs previous version:
-  - Importeret search_web fra services.web_service.
-  - Tilføjet dispatch-logik for search_web tool.
-    Resultatet køres igennem _trim_tool_result for token-økonomi.
-  - SEARCH_SIGNAL konstant bevaret.
-  - Prompt caching aktiveret på system prompt og tools.
+  - Importeret datetime fra datetime.
+  - get_ai_response() injicerer nu den aktuelle dato som et separat,
+    IKKE-cachet system-blok efter den cachede SYSTEM_PROMPT.
+    Dette er arkitektonisk korrekt: datoen ændrer sig hvert minut og
+    måtte IKKE bages ind i den cachede blok — det ville invalidere
+    cachen ved hvert eneste kald og eliminere al caching-gevinst.
+    Løsningen er to blokke i system-arrayet:
+      [0] SYSTEM_PROMPT         → cache_control: ephemeral (caches stabilt)
+      [1] dato-kontekst + user  → ingen cache_control (altid frisk)
+  - Alle øvrige funktioner (_dispatch, _slim_data, _trim osv.) er uændrede.
 """
 
 import json
 import logging
 from collections import defaultdict
+from datetime import datetime
 
 import anthropic
 
@@ -59,6 +65,33 @@ _MAX_TOOL_RESULT_CHARS = 2000
 
 # Signal som Claude returnerer for at trigge bestillingsflow i main.py
 SEARCH_SIGNAL = "SHOW_SEARCH_RESULTS:"
+
+# Dansk mapning af engelske ugedags- og månedsnavne fra strftime
+_UGEDAGE = {
+    "Monday": "Mandag", "Tuesday": "Tirsdag", "Wednesday": "Onsdag",
+    "Thursday": "Torsdag", "Friday": "Fredag", "Saturday": "Lørdag",
+    "Sunday": "Søndag",
+}
+_MAANEDER = {
+    "January": "januar", "February": "februar", "March": "marts",
+    "April": "april", "May": "maj", "June": "juni",
+    "July": "juli", "August": "august", "September": "september",
+    "October": "oktober", "November": "november", "December": "december",
+}
+
+
+def _dansk_dato() -> str:
+    """
+    Returnerer den aktuelle dato og tid formateret på dansk.
+    Eksempel: 'Fredag d. 25. april 2025, kl. 14:37'
+
+    strftime er lokaliseret til engelsk på Railway — vi mapper manuelt
+    i stedet for at stole på locale-indstillinger i containerens miljø.
+    """
+    nu = datetime.now()
+    ugedag  = _UGEDAGE.get(nu.strftime("%A"), nu.strftime("%A"))
+    maaned  = _MAANEDER.get(nu.strftime("%B"), nu.strftime("%B"))
+    return f"{ugedag} d. {nu.day}. {maaned} {nu.year}, kl. {nu.strftime('%H:%M')}"
 
 
 def _trim(telegram_id: int) -> None:
@@ -159,6 +192,12 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
             keyword=tool_input["keyword"],
             plex_username=plex_username,
         ))
+    if tool_name == "get_plex_collection":
+        return j(await get_collection(
+            tool_input["keyword"],
+            tool_input.get("media_type", "movie"),
+            plex_username,
+        ))
     if tool_name == "search_plex_by_actor":
         return j(await check_actor_on_plex(
             actor_name=tool_input["actor_name"],
@@ -220,25 +259,45 @@ async def get_ai_response(
     """
     Run the full agentic loop and return Buddy's reply.
 
-    Prompt caching:
-      - system prompt caches med cache_control: {"type": "ephemeral"}
-      - tools-listen caches ligeledes
+    System-prompt arkitektur (to blokke):
+      Blok 0 — SYSTEM_PROMPT med cache_control: ephemeral
+               Indeholder alle stabile instruktioner. Caches af Anthropic
+               og genbruges på tværs af kald så længe indholdet er uændret.
+
+      Blok 1 — Dynamisk kontekst UDEN cache_control
+               Indeholder aktuel dato og plex_username. Denne blok ændrer
+               sig ved hvert kald (dato varierer) og må aldrig caches —
+               det ville invalidere cache-blok 0 ved hvert request.
     """
     _histories[telegram_id].append({"role": "user", "content": user_message})
     _trim(telegram_id)
 
-    system_text = SYSTEM_PROMPT
-    if plex_username:
-        system_text += f"\n\nDen aktuelle bruger hedder '{plex_username}' på Plex."
-
-    system_with_cache = [
+    # ── Blok 0: stabil, cachet system-prompt ──────────────────────────────────
+    system_blocks = [
         {
             "type": "text",
-            "text": system_text,
+            "text": SYSTEM_PROMPT,
             "cache_control": {"type": "ephemeral"},
         }
     ]
 
+    # ── Blok 1: dynamisk kontekst — aldrig cachet ─────────────────────────────
+    dynamic_lines = [
+        f"Intern system-info (MÅ IKKE NÆVNES FOR BRUGEREN): "
+        f"I dag er det {_dansk_dato()}. "
+        f"Brug udelukkende denne information til at vurdere, "
+        f"om film/serier er udkommet eller ligger i fremtiden."
+    ]
+    if plex_username:
+        dynamic_lines.append(f"Den aktuelle bruger hedder '{plex_username}' på Plex.")
+
+    system_blocks.append({
+        "type": "text",
+        "text": "\n\n".join(dynamic_lines),
+        # Ingen cache_control — denne blok er altid frisk
+    })
+
+    # ── Tools med cache på det sidste element ────────────────────────────────
     tools_with_cache = [dict(t) for t in TOOLS]
     if tools_with_cache:
         tools_with_cache[-1] = {
@@ -251,7 +310,7 @@ async def get_ai_response(
             response = await _client.messages.create(
                 model=ANTHROPIC_MODEL,
                 max_tokens=1024,
-                system=system_with_cache,
+                system=system_blocks,
                 tools=tools_with_cache,
                 messages=_histories[telegram_id],
             )
