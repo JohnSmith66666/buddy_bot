@@ -2,13 +2,12 @@
 services/confirmation_service.py - Inline keyboard bekræftelsesflow.
 
 CHANGES vs previous version:
-  - _star_rating() fjernet — rating vises nu som numerisk score: ⭐️ 8.6/10.
-  - Overview trunkering fjernet — vises i fuld længde fra TMDB.
-  - Telegram caption max er 1024 tegn — overview trimmes kun hvis caption
-    samlet set overstiger dette, ikke med en hardcodet grænse.
-  - Plex-tjek (check_library) er bekræftet aktiv og korrekt — uændret logik.
-  - send_photo() bruges altid når poster_url er tilgængeligt — uændret.
-  - execute_order() uændret.
+  - _build_caption(): overview trimmes FØR _esc() — ellers fejler
+    caption-truncation fordi escape-tegn tæller som ekstra chars.
+  - Plex deep-link URL bruger URL-encoded key-parameter:
+    %2Flibrary%2Fmetadata%2F{ratingKey} i stedet for rå path.
+  - Rating som ⭐️ {score}/10 — ingen stjerne-emojis.
+  - Alle andre ændringer fra forrige version bevaret.
 """
 
 import logging
@@ -25,8 +24,7 @@ from services.tmdb_service import get_media_details, search_media
 
 logger = logging.getLogger(__name__)
 
-# Telegram's max caption-længde for billeder
-_MAX_CAPTION = 1024
+_MAX_CAPTION = 1024  # Telegrams max caption-længde for billeder
 
 
 def _make_token() -> str:
@@ -44,69 +42,56 @@ def _build_caption(details: dict) -> str:
     """
     Byg MarkdownV2-caption til send_photo.
 
-    Rating vises som numerisk score (⭐️ 8.6/10) — ikke stjerne-emojis.
-    Overview vises i fuld længde; kun afkortet hvis caption overskrider
-    Telegrams max på 1024 tegn.
+    Overview trimmes FØR _esc() for at caption-truncation
+    fungerer korrekt (escape-tegn tæller som ekstra chars).
+    Telegram max caption: 1024 tegn.
     """
     title    = details.get("title", "Ukendt")
     year     = (details.get("release_date") or details.get("first_air_date") or "")[:4]
     genres   = details.get("genres", [])[:3]
     rating   = details.get("vote_average")
-    overview = details.get("overview") or "Ingen beskrivelse."
+    overview = (details.get("overview") or "Ingen beskrivelse.").strip()
     cast     = details.get("cast", [])
     runtime  = details.get("runtime_minutes")
     seasons  = details.get("number_of_seasons")
-    tagline  = details.get("tagline") or ""
+    tagline  = (details.get("tagline") or "").strip()
 
-    lines = []
-
-    # Titel + årstal
+    # Beregn tilgængeligt rum til overview
+    header_parts = []
     title_line = f"*{_esc(title)}*"
     if year:
         title_line += f" \\({_esc(year)}\\)"
-    lines.append(title_line)
+    header_parts.append(title_line)
 
-    # Tagline
     if tagline:
-        lines.append(f"_{_esc(tagline)}_")
+        header_parts.append(f"_{_esc(tagline)}_")
+    header_parts.append("")
 
-    lines.append("")
-
-    # Genrer
     genre_str = " · ".join(genres) if genres else ""
     if genre_str:
-        lines.append(f"🎭 {_esc(genre_str)}")
+        header_parts.append(f"🎭 {_esc(genre_str)}")
 
-    # Rating som numerisk score
     if rating:
-        lines.append(f"⭐️ {rating}/10")
+        header_parts.append(f"⭐️ {rating}/10")
 
-    # Varighed / sæsoner
     if runtime:
-        lines.append(f"⏱ {runtime} min")
+        header_parts.append(f"⏱ {runtime} min")
     elif seasons:
-        lines.append(f"📺 {seasons} sæson{'er' if seasons != 1 else ''}")
+        header_parts.append(f"📺 {seasons} sæson{'er' if seasons != 1 else ''}")
 
-    # Cast
     if cast:
-        lines.append(f"🎬 {_esc(', '.join(cast))}")
+        header_parts.append(f"🎬 {_esc(', '.join(cast))}")
 
-    lines.append("")
+    header_parts.append("")
 
-    # Overview i fuld længde — kun afkortet hvis caption samlet er for lang
-    lines.append(_esc(overview))
+    header = "\n".join(header_parts)
+    # Tilgængeligt rum til overview (med newline + 3 chars til "…")
+    available = _MAX_CAPTION - len(header) - 3
 
-    caption = "\n".join(lines)
+    if len(overview) > available and available > 0:
+        overview = overview[:available] + "…"
 
-    # Telegram-grænse: afkort overview hvis nødvendigt
-    if len(caption) > _MAX_CAPTION:
-        # Find where overview starts og trim der
-        overhead   = len(caption) - _MAX_CAPTION + 3  # 3 til "…"
-        short_desc = overview[: max(0, len(overview) - overhead)] + "…"
-        lines[-1]  = _esc(short_desc)
-        caption    = "\n".join(lines)
-
-    return caption
+    return header + _esc(overview)
 
 
 # ── Step 1: Vis søgeresultater som knapper ────────────────────────────────────
@@ -239,12 +224,12 @@ async def show_confirmation(
 
     if on_plex:
         if rating_key and machine_id:
+            # URL-encoded key-parameter — /library/metadata/ → %2Flibrary%2Fmetadata%2F
             plex_url = (
                 f"https://app.plex.tv/desktop/#!/server/{machine_id}"
-                f"/details?key=/library/metadata/{rating_key}"
+                f"/details?key=%2Flibrary%2Fmetadata%2F{rating_key}"
             )
         else:
-            # Fallback: åbn Plex uden deep-link
             plex_url = "https://app.plex.tv"
         button_rows.append([InlineKeyboardButton("▶️ Se på Plex", url=plex_url)])
     else:

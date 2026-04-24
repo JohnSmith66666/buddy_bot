@@ -2,11 +2,12 @@
 services/tmdb_service.py - TMDB API integration.
 
 CHANGES vs previous version:
-  - Overview trunkering fjernet i get_media_details() for både film og TV.
-    Overview returneres nu i fuld længde fra TMDB. Evt. truncation til
-    Telegrams caption-grænse håndteres af _build_caption() i confirmation_service.
-  - append_to_response=videos,credits, cast, poster_url — uændret.
-  - Engelsk trailer-fallback — uændret.
+  - KRITISK BUG RETTET: "poster_url" var i _STRIP_FIELDS og blev slettet
+    af _strip() lige efter vi satte den — det forårsagede 400 Bad Request
+    i send_photo(). Rettet ved at fjerne "poster_url" fra _STRIP_FIELDS
+    og tilføje "poster_path" og "credits" i stedet (disse skal strippes).
+  - Overview trunkering fjernet — fuld tekst returneres fra TMDB.
+  - append_to_response=videos,credits, engelsk fallback — uændret.
 """
 
 import asyncio
@@ -52,11 +53,12 @@ _TV_GENRES: dict[int, str] = {
 }
 
 _STRIP_FIELDS = {
-    "backdrop_path", "poster_url", "backdrop_url",
+    "backdrop_path", "poster_path", "backdrop_url",
     "profile_url", "profile_path", "still_path",
     "production_companies", "production_countries",
     "spoken_languages", "belongs_to_collection",
     "homepage", "adult", "video",
+    "credits",                        # fjernet efter cast-ekstraktion
 }
 
 

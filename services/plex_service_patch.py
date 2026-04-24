@@ -1,15 +1,9 @@
 """
 plex_service_patch.py — Præcise ændringer til services/plex_service.py på GitHub.
 
-CHANGES:
-  1. _check_sync(): returnerer nu ratingKey og machineIdentifier ved STATUS_FOUND.
-     Disse bruges af show_confirmation() til at bygge Plex deep-link URLs.
-  2. add_to_watchlist() og _add_to_watchlist_sync(): nye funktioner til
-     Plex Watchlist-integration via myPlexAccount().
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-ÆNDRING 1 — I _check_sync(), find denne return-linje ved STATUS_FOUND:
+ÆNDRING 1: _check_sync() — tilføj ratingKey + machineIdentifier ved STATUS_FOUND
+═══════════════════════════════════════════════════════════════════════════════════
+Find denne linje i _check_sync() (ca. linje 220 i din fil):
 
     return {"status": STATUS_FOUND, "title": item_title, "year": item_year}
 
@@ -23,14 +17,15 @@ Udskift den med:
         "machineIdentifier": getattr(plex, "machineIdentifier", None),
     }
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-ÆNDRING 2 — Tilføj disse to funktioner i bunden af plex_service.py:
+ÆNDRING 2: Tilføj add_to_watchlist og _add_to_watchlist_sync i bunden af filen
+═══════════════════════════════════════════════════════════════════════════════════
+Kopier disse to funktioner og sæt dem ind i bunden af plex_service.py:
 """
 
-from functools import partial
 import asyncio
 import logging
+from functools import partial
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +36,7 @@ async def add_to_watchlist(
 ) -> dict:
     """
     Tilføj en titel til Plex Watchlist via myPlexAccount.searchDiscover().
-    Bruger admin-kontoen (PLEX_TOKEN) til at finde og tilføje titlen.
+    Kører synkron PlexAPI i thread pool for at undgå blocking.
     """
     try:
         return await asyncio.to_thread(
@@ -53,7 +48,7 @@ async def add_to_watchlist(
 
 
 def _add_to_watchlist_sync(title: str) -> dict:
-    """Synkron implementering — kører i thread pool."""
+    """Synkron implementering — kører i thread pool via asyncio.to_thread."""
     from plexapi.server import PlexServer
     from config import PLEX_URL, PLEX_TOKEN
 
@@ -61,15 +56,14 @@ def _add_to_watchlist_sync(title: str) -> dict:
         admin_plex = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=15)
         account    = admin_plex.myPlexAccount()
     except Exception as e:
-        logger.error("Watchlist: kunne ikke forbinde til Plex: %s", e)
+        logger.error("Watchlist: forbindelsesfejl: %s", e)
         return {"success": False, "message": f"Forbindelsesfejl: {e}"}
 
     try:
-        # Søg i Plex Discover (online katalog)
+        # Søg i Plex Discover (online katalog) — prøv film først, derefter TV
         results = account.searchDiscover(title, libtype="movie") or []
         if not results:
             results = account.searchDiscover(title, libtype="show") or []
-
         if not results:
             return {
                 "success": False,
