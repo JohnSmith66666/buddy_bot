@@ -322,6 +322,7 @@ async def on_startup(application: Application) -> None:
     await database.setup_pending_requests()
     await _start_webhook_server()
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
+    logger.info("VERSION CHECK — trailer: JA | dato: JA | _extract_trailer: JA")
 
 
 async def on_shutdown(application: Application) -> None:
