@@ -2,11 +2,13 @@
 main.py - Buddy bot entry point.
 
 CHANGES vs previous version:
-  - Webhook secret token + global error handler fra forrige version bevaret.
-  - Ny /info_movie_<id> og /info_tv_<id> handler: fanger kommando-links
-    som Buddy skriver i lister, henter TMDB-detaljer og åbner Netflix-look.
-  - Ny watchlist: callback handler til 📌-knappen i show_confirmation.
-  - add_to_watchlist importeret fra plex_service.
+  - INFO_SIGNAL importeret fra ai_handler.
+  - handle_text: nyt SHOW_INFO signal — henter TMDB-detaljer, opretter token
+    og kalder show_confirmation(message, context, token, plex_username).
+  - handle_info_link: kalder show_confirmation direkte med Message og context.
+  - handle_pick_callback: sender context med til show_confirmation.
+  - show_confirmation signaturen er nu (trigger, context, token, plex_username).
+  - Webhook secret + global error handler bevaret fra forrige version.
 """
 
 import asyncio
@@ -29,14 +31,14 @@ from telegram.ext import (
 import config
 import database
 from admin_handlers import handle_approve_callback, notify_admin_new_user
-from ai_handler import SEARCH_SIGNAL, TRAILER_SIGNAL, clear_history, get_ai_response
+from ai_handler import INFO_SIGNAL, SEARCH_SIGNAL, TRAILER_SIGNAL, clear_history, get_ai_response
 from services.confirmation_service import (
     execute_order,
-    handle_info_command,
     show_confirmation,
     show_search_results,
 )
 from services.plex_service import validate_plex_user
+from services.tmdb_service import get_media_details
 from services.webhook_service import handle_radarr_webhook, handle_sonarr_webhook
 
 logging.basicConfig(
@@ -155,7 +157,7 @@ async def cmd_skift_plex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ── Inline Keyboard callbacks ─────────────────────────────────────────────────
 
 async def handle_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Bruger valgte et søgeresultat — vis detaljer + Bekræft/Annuller."""
+    """Bruger valgte et søgeresultat — vis Netflix-look infokort."""
     query = update.callback_query
     await query.answer()
 
@@ -164,7 +166,7 @@ async def handle_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     token = query.data.split(":", 1)[1]
     plex_username = await database.get_plex_username(query.from_user.id)
-    await show_confirmation(query, token, plex_username)
+    await show_confirmation(query, context, token, plex_username)
 
 
 async def handle_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -198,28 +200,45 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """
     Fanger /info_movie_<tmdb_id> og /info_tv_<tmdb_id> kommandoer.
     Fleksibelt regex fanger også varianter uden underscore (f.eks. /infomovie123).
-    Disse links oprettes automatisk af Buddy i lister og er klikbare i Telegram.
+    Kalder show_confirmation direkte med Message og context — ingen adapter.
     """
     if not await _guard(update):
         return
 
-    # context.matches indeholder regex-matches fra filters.Regex
-    # Gruppe 1 = movie|tv, Gruppe 2 = tmdb_id
     if context.matches:
         match = context.matches[0]
     else:
-        import re as _re
         text  = (update.message.text or "").strip()
-        match = _re.match(r"^/info_?(movie|tv)_?(\d+)$", text)
+        match = re.match(r"^/info_?(movie|tv)_?(\d+)$", text)
         if not match:
             return
 
     media_type    = match.group(1)
     tmdb_id       = int(match.group(2))
-    plex_username = await database.get_plex_username(update.effective_user.id)
+    user_id       = update.effective_user.id
+    plex_username = await database.get_plex_username(user_id)
 
     await update.message.chat.send_action("typing")
-    await handle_info_command(update, media_type, tmdb_id, plex_username)
+
+    details = await get_media_details(tmdb_id, media_type)
+    if not details:
+        await update.message.reply_text("Kunne ikke hente info — prøv igen.")
+        return
+
+    title = details.get("title") or "Ukendt"
+    year  = details.get("release_date", details.get("first_air_date", ""))[:4]
+
+    import secrets as _sec
+    token = _sec.token_hex(8)
+    await database.save_pending_request(token, user_id, {
+        "media_type": media_type,
+        "tmdb_id":    tmdb_id,
+        "title":      title,
+        "year":       int(year) if year else None,
+        "step":       "picked",
+    })
+
+    await show_confirmation(update.message, context, token, plex_username)
 
 
 # ── Watchlist callback ────────────────────────────────────────────────────────
@@ -290,6 +309,39 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         media_type = parts[1].strip() if len(parts) > 1 else "both"
         await show_search_results(update.message, query_term, media_type)
         return
+
+    # ── Signal: Netflix-look infokort ─────────────────────────────────────────
+    # Format: SHOW_INFO:<tmdb_id>:<media_type>
+    if reply.startswith(INFO_SIGNAL):
+        parts = reply[len(INFO_SIGNAL):].split(":", 1)
+        if len(parts) == 2:
+            try:
+                info_tmdb_id   = int(parts[0].strip())
+                info_media_type = parts[1].strip()
+            except ValueError:
+                info_tmdb_id = None
+
+            if info_tmdb_id:
+                await update.message.chat.send_action("typing")
+                info_details = await get_media_details(info_tmdb_id, info_media_type)
+                if info_details:
+                    info_title = info_details.get("title") or "Ukendt"
+                    info_year  = info_details.get(
+                        "release_date", info_details.get("first_air_date", "")
+                    )[:4]
+                    import secrets as _sec
+                    info_token = _sec.token_hex(8)
+                    await database.save_pending_request(info_token, user.id, {
+                        "media_type": info_media_type,
+                        "tmdb_id":    info_tmdb_id,
+                        "title":      info_title,
+                        "year":       int(info_year) if info_year else None,
+                        "step":       "picked",
+                    })
+                    await show_confirmation(update.message, context, info_token, plex_username)
+                    return
+        # Fallback: vis som normalt svar hvis parsing fejler
+        logger.warning("SHOW_INFO signal kunne ikke parses: %s", reply)
 
     # ── Signal: trailer-knap ──────────────────────────────────────────────────
     # Format: SHOW_TRAILER:<beskedtekst>|<trailer_url>

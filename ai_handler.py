@@ -2,12 +2,12 @@
 ai_handler.py - Agentic loop for Buddy.
 
 CHANGES vs previous version:
-  - max_tokens håndtering: hvis stop_reason == "max_tokens" returneres det
-    afhuggede svar med en kursiveret note i bunden, så brugeren ved at svaret
-    blev afkortet og kan bede om resten.
-  - Parallel tool execution via asyncio.gather() — uændret.
+  - INFO_SIGNAL = "SHOW_INFO:" tilføjet og eksporteret.
+    Format: SHOW_INFO:<tmdb_id>:<media_type>
+    Bruges af main.py til at åbne Netflix-look infokort direkte
+    når brugeren beder om at se en bestemt titel.
+  - max_tokens håndtering og parallel tool execution — uændret.
   - ZoneInfo dato-injektion — uændret.
-  - _MAX_HISTORY = 6, max_tokens = 1500 — uændret.
 """
 
 import asyncio
@@ -71,6 +71,10 @@ SEARCH_SIGNAL = "SHOW_SEARCH_RESULTS:"
 # Signal som Claude returnerer for at vise en trailer-knap i main.py
 # Format: SHOW_TRAILER:<beskedtekst>|<youtu.be-url>
 TRAILER_SIGNAL = "SHOW_TRAILER:"
+
+# Signal som Claude returnerer for at åbne Netflix-look infokort direkte
+# Format: SHOW_INFO:<tmdb_id>:<media_type>  f.eks. SHOW_INFO:157336:movie
+INFO_SIGNAL = "SHOW_INFO:"
 
 # Dansk mapning af engelske ugedags- og månedsnavne fra strftime
 _UGEDAGE = {
