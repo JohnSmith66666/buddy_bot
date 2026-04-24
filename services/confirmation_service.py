@@ -287,7 +287,8 @@ async def handle_watchlist_callback(
 ) -> None:
     """
     Håndterer 📌 Tilføj til Watchlist-knappen.
-    Henter pending data, kalder add_to_watchlist og svarer brugeren.
+    Ved success: redigerer keyboardet så knappen skifter til ✅ Tilføjet til Watchlist.
+    Ved fejl: viser en fejlbesked via show_alert.
     """
     from services.plex_service import add_to_watchlist
 
@@ -306,7 +307,28 @@ async def handle_watchlist_callback(
     try:
         success = await add_to_watchlist(title, plex_username)
         if success:
-            await query.answer(f"✅ '{title}' er tilføjet til din Watchlist!", show_alert=True)
+            # ── Opdater keyboard: skift watchlist-knappen til grøn bekræftelse ──
+            if current_keyboard := query.message.reply_markup:
+                new_keyboard = []
+                for row in current_keyboard.inline_keyboard:
+                    new_row = []
+                    for btn in row:
+                        if btn.callback_data and btn.callback_data.startswith("watchlist:"):
+                            new_row.append(InlineKeyboardButton(
+                                "✅ Tilføjet til Watchlist",
+                                callback_data=btn.callback_data,
+                            ))
+                        else:
+                            new_row.append(btn)
+                    new_keyboard.append(new_row)
+                try:
+                    await query.edit_message_reply_markup(
+                        reply_markup=InlineKeyboardMarkup(new_keyboard)
+                    )
+                except Exception as e:
+                    logger.warning("Kunne ikke opdatere keyboard: %s", e)
+
+            await query.answer("Filmen er gemt på din Watchlist! 🍿")
         else:
             await query.answer(
                 f"❌ Kunne ikke finde '{title}' i Plex Discover.", show_alert=True
