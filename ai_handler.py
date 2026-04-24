@@ -2,20 +2,12 @@
 ai_handler.py - Agentic loop for Buddy.
 
 CHANGES vs previous version:
-  - OPTIMERING 1 — Parallel tool execution: tool-kald eksekveres nu
-    parallelt via asyncio.gather() i stedet for sekventielt i en for-løkke.
-    Når Claude laver parallel tool calling (f.eks. 10 check_plex_library-kald),
-    sendes alle kald samtidigt og vi venter kun på det langsomste — ikke summen.
-    Speedup afhænger af antal samtidige tool-kald: 5 kald à 300ms → 300ms i stedet for 1500ms.
-  - OPTIMERING 2 — Reduceret historik: _MAX_HISTORY sænket fra 10 til 6
-    beskeder. Skærer ~400 uncached tokens per kald og reducerer kontekstvindue
-    uden at påvirke normal samtalekvalitet (de fleste spørgsmål er selvstændige).
-  - OPTIMERING 3 — Øget max_tokens: hævet fra 1024 til 1500 for at undgå
-    at Claude trunkerer lange svar og laver et ekstra API-kald for at afslutte.
-  - Importeret ZoneInfo fra zoneinfo (med try/except fallback).
-  - _dansk_dato() bruger ZoneInfo("Europe/Copenhagen") og returnerer
-    ISO-format forrest for direkte sammenligning med TMDB release_date.
-  - Alle øvrige funktioner er uændrede.
+  - max_tokens håndtering: hvis stop_reason == "max_tokens" returneres det
+    afhuggede svar med en kursiveret note i bunden, så brugeren ved at svaret
+    blev afkortet og kan bede om resten.
+  - Parallel tool execution via asyncio.gather() — uændret.
+  - ZoneInfo dato-injektion — uændret.
+  - _MAX_HISTORY = 6, max_tokens = 1500 — uændret.
 """
 
 import asyncio
@@ -384,6 +376,24 @@ async def get_ai_response(
                 _histories[telegram_id].append({"role": "user", "content": list(tool_results)})
                 _trim(telegram_id)
                 continue
+
+            # ── max_tokens: svar afhugget — returner hvad vi har + note ──────
+            if response.stop_reason == "max_tokens":
+                partial = next(
+                    (b.text for b in response.content if hasattr(b, "text")), ""
+                )
+                logger.warning(
+                    "max_tokens nået for telegram_id=%s (%d output tokens)",
+                    telegram_id, usage.output_tokens,
+                )
+                reply = (
+                    partial
+                    + "\n\n_(Svaret blev afbrudt for at spare plads — "
+                    "spørg endelig hvis du vil have resten med!)_"
+                )
+                _histories[telegram_id].append({"role": "assistant", "content": reply})
+                _trim(telegram_id)
+                return reply
 
             reply = next(
                 (b.text for b in response.content if hasattr(b, "text")),

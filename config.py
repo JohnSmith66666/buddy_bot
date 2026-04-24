@@ -1,16 +1,21 @@
 """
 config.py - Centralized configuration loaded from environment variables.
-The application will raise an error at startup if any required variable is missing.
 
 CHANGES vs previous version:
-  - Tilføjet TAVILY_API_KEY (valgfri — mangler den, er web-søgning deaktiveret
-    med en advarsel i web_service.py i stedet for en hård startup-fejl).
+  - Tilføjet WEBHOOK_SECRET (valgfri) til sikring af Radarr/Sonarr webhooks.
+    Mangler den, logges en advarsel ved startup og webhooks accepteres uden tjek.
+    Sæt den i Railway og i Radarr/Sonarr's webhook URL: ?token=DIN_KODE
+  - Tavily API key forbliver valgfri som tidligere.
 """
 
+import logging
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 def _require(key: str) -> str:
@@ -61,10 +66,13 @@ ROOT_TV_STANDARD: str     = "/mnt/unionfs/Media/TV/Serier"
 TAUTULLI_URL:     str = _require("TAUTULLI_URL")
 TAUTULLI_API_KEY: str = _require("TAUTULLI_API_KEY")
 
-# ── Tavily (web-søgning) ──────────────────────────────────────────────────────
-# Valgfri — hvis ikke sat deaktiveres web-søgning med en advarsel,
-# men botten starter stadig normalt (ingen hård startup-fejl).
+# ── Tavily (web-søgning) — valgfri ───────────────────────────────────────────
 TAVILY_API_KEY: str | None = os.getenv("TAVILY_API_KEY") or None
+
+# ── Webhook sikkerhed — valgfri ───────────────────────────────────────────────
+# Sæt denne i Railway og tilføj ?token=<værdi> i Radarr/Sonarrs webhook URL.
+# Mangler den, accepteres alle webhooks (advarsel logges ved startup).
+WEBHOOK_SECRET: str | None = os.getenv("WEBHOOK_SECRET") or None
 
 # ── Optional / runtime settings ───────────────────────────────────────────────
 ENVIRONMENT: str       = os.getenv("ENVIRONMENT", "dev")

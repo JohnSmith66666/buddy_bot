@@ -2,21 +2,21 @@
 main.py - Buddy bot entry point.
 
 CHANGES vs previous version:
-  - REDESIGN trailer-logik: fra regex-ekstraktion til signal-mønster.
-    Buddy returnerer nu SHOW_TRAILER:<url> som sit svar, præcis ligesom
-    SHOW_SEARCH_RESULTS-signalet. main.py fanger signalet, parser URL'en
-    og sender beskeden med InlineKeyboardButton("🎬 Se Trailer", url=...).
-    Den tidligere _extract_trailer() regex-tilgang fjernet — den virkede
-    ikke fordi prompten instruerede Buddy til ikke at skrive URL'en i teksten.
-  - TRAILER_SIGNAL konstant tilføjet, _TRAILER_RE og _extract_trailer() fjernet.
-  - VERSION CHECK log-linje bevaret til deployment-verifikation.
-  - escape_markdown() og _URL_RE bevaret til ordinære tekstbeskeder.
+  - Webhook secret token: _webhook_radarr og _webhook_sonarr tjekker nu
+    query-parameteren ?token= mod config.WEBHOOK_SECRET. Uautoriserede
+    requests afvises med HTTP 401. Mangler WEBHOOK_SECRET i env, logges
+    en advarsel og webhooks accepteres (bagudkompatibelt).
+  - Global error handler: handle_error() tilføjet og registreret med
+    app.add_error_handler(). Fanger alle uventede Telegram-fejl, logger
+    fuld traceback og sender en venlig besked til brugeren hvis muligt.
+  - Trailer-signal arkitektur og escape_markdown() er uændret.
 """
 
 import asyncio
 import logging
 import re
 import sys
+import traceback
 from aiohttp import web
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -260,6 +260,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ── Webhook HTTP server ───────────────────────────────────────────────────────
 
 async def _webhook_radarr(request: web.Request) -> web.Response:
+    # ── Secret token check ────────────────────────────────────────────────────
+    if config.WEBHOOK_SECRET:
+        token = request.rel_url.query.get("token", "")
+        if token != config.WEBHOOK_SECRET:
+            logger.warning("Radarr webhook: uautoriseret request fra %s", request.remote)
+            return web.Response(status=401, text="Unauthorized")
     try:
         payload = await request.json()
         logger.info("Radarr webhook received: eventType=%s", payload.get("eventType"))
@@ -271,6 +277,12 @@ async def _webhook_radarr(request: web.Request) -> web.Response:
 
 
 async def _webhook_sonarr(request: web.Request) -> web.Response:
+    # ── Secret token check ────────────────────────────────────────────────────
+    if config.WEBHOOK_SECRET:
+        token = request.rel_url.query.get("token", "")
+        if token != config.WEBHOOK_SECRET:
+            logger.warning("Sonarr webhook: uautoriseret request fra %s", request.remote)
+            return web.Response(status=401, text="Unauthorized")
     try:
         payload = await request.json()
         logger.info("Sonarr webhook received: eventType=%s", payload.get("eventType"))
@@ -292,12 +304,40 @@ async def _start_webhook_server() -> None:
     logger.info("Webhook server started on port 8080")
 
 
+# ── Global error handler ──────────────────────────────────────────────────────
+
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Catch-all handler for uventede Telegram-fejl.
+    Logger fuld traceback og sender en venlig besked til brugeren hvis muligt.
+    """
+    logger.error(
+        "Uventet fejl ved håndtering af update:\n%s",
+        "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__)),
+    )
+
+    # Forsøg at sende en venlig besked til brugeren
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "Hov, jeg fik vist popcorn galt i halsen! 🍿\n"
+                "Noget gik uventet galt i maskinrummet. Prøv igen om lidt."
+            )
+        except Exception as e:
+            logger.error("Kunne ikke sende fejlbesked til bruger: %s", e)
+
+
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 async def on_startup(application: Application) -> None:
     await database.setup_db()
     await database.setup_pending_requests()
     await _start_webhook_server()
+    if not config.WEBHOOK_SECRET:
+        logger.warning(
+            "WEBHOOK_SECRET er ikke sat — webhooks accepteres uden token-tjek! "
+            "Sæt WEBHOOK_SECRET i Railway for at sikre endpointene."
+        )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info("VERSION CHECK — TRAILER_SIGNAL: JA | dato: JA | signal-arkitektur: JA")
 
@@ -330,6 +370,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_cancel_callback,  pattern=r"^cancel:"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(handle_error)
 
     logger.info("Starting polling …")
     app.run_polling(
