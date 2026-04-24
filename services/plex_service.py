@@ -15,14 +15,11 @@ TOKEN OPTIMISATION (data-diæt):
     which is called explicitly when the user asks for them.
 
 CHANGES vs previous version:
-  - Ny check_actor_on_plex(actor_name, plex_username) bridge-funktion:
-    1. Finder skuespillerens TMDB ID via search_person().
-    2. Henter top 20 film via get_person_filmography().
-    3. Henter Plex-film med skuespilleren via _actor_sync().
-    4. Krydstjekker: GUID-match (primær) → fuzzy titel-match (fallback).
-    5. Returnerer found_on_plex + missing_top_movies.
-  - _franchise_plex_check_sync bruger GUID-matching som primær metode.
-  - _extract_tmdb_id_from_guids() hjælpefunktion til Plex GUID-parsing.
+  - _check_sync(): returnerer nu ratingKey og machineIdentifier ved STATUS_FOUND.
+    Bruges af confirmation_service til at bygge Plex deep-link URL.
+  - add_to_watchlist() og _add_to_watchlist_sync() tilføjet:
+    bruger myPlexAccount().searchDiscover() + addToWatchlist().
+  - Alle øvrige funktioner er uændrede.
 """
 
 import asyncio
@@ -763,7 +760,13 @@ def _check_sync(
                 "Plex HIT (lag %s): '%s' (%s) i '%s' — søgt på '%s' (%s)",
                 match_lag, item_title, item_year, section.title, title, year,
             )
-            return {"status": STATUS_FOUND, "title": item_title, "year": item_year}
+            return {
+                "status":            STATUS_FOUND,
+                "title":             item_title,
+                "year":              item_year,
+                "ratingKey":         item.ratingKey,
+                "machineIdentifier": plex.machineIdentifier,
+            }
 
     return {"status": STATUS_MISSING}
 
@@ -1154,3 +1157,46 @@ def _get_user_server_sync(plex_username: str):
     except Exception as e:
         logger.error("User server switch error: %s", e)
     return None
+
+# ── Watchlist ─────────────────────────────────────────────────────────────────
+
+async def add_to_watchlist(
+    title: str,
+    plex_username: str | None = None,
+) -> bool:
+    """
+    Tilføj en titel til Plex Watchlist via myPlexAccount.searchDiscover().
+    Returnerer True ved success, False hvis titlen ikke kunne findes.
+    Kører synkron PlexAPI i thread pool for at undgå blocking.
+    """
+    try:
+        return await asyncio.to_thread(
+            partial(_add_to_watchlist_sync, title=title, plex_username=plex_username)
+        )
+    except Exception as e:
+        logger.error("add_to_watchlist error: %s", e)
+        return False
+
+
+def _add_to_watchlist_sync(title: str, plex_username: str | None = None) -> bool:
+    """Synkron implementering — kører i thread pool via asyncio.to_thread."""
+    plex = _connect(plex_username)
+    if isinstance(plex, dict):
+        logger.error("add_to_watchlist: kunne ikke forbinde: %s", plex)
+        return False
+
+    try:
+        account = plex.myPlexAccount()
+        results = account.searchDiscover(title)
+        if not results:
+            logger.warning("Watchlist: ingen resultater for '%s' i Discover", title)
+            return False
+
+        item = results[0]
+        account.addToWatchlist(item)
+        logger.info("Watchlist: '%s' tilføjet ('%s')", title, getattr(item, "title", title))
+        return True
+
+    except Exception as e:
+        logger.error("Watchlist add error for '%s': %s", title, e)
+        return False
