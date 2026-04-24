@@ -2,19 +2,19 @@
 services/tmdb_service.py - TMDB API integration.
 
 CHANGES vs previous version:
-  - get_person_filmography() returnerer nu top 20 film (var 10) sorteret efter
-    en popularitets-score (vote_average × log(vote_count + 1)) fremfor
-    udelukkende release_date. Giver de reelle "biggest hits" frem for nyeste.
-    Returnerer nu også 'original_title' og 'tmdb_id' per film til brug i
-    check_actor_on_plex() krydstjek.
-  - get_tmdb_collection_movies() returnerer 'tmdb_id', 'title', 'original_title'.
+  - get_person_filmography() bruger nu /person/{id}/movie_credits i stedet for
+    /person/{id}/combined_credits. Årsag: combined_credits returnerer kun ~20
+    resultater fra side 1, mens movie_credits returnerer ALLE film på én gang
+    som en komplet liste under 'cast'. Samuel L. Jackson: 20 → 180+ film.
+  - Filtrering: fjerner poster med 'uncredited' i character-feltet og poster
+    uden release_date (urealiserede projekter), da disse forurener statistikken.
+  - get_tmdb_collection_movies() returnerer tmdb_id, title, original_title.
   - get_trending() laver to parallelle API-kald, returnerer 5+5 dict.
   - get_now_playing() og get_upcoming() sorterer efter popularity, top 10.
 """
 
 import asyncio
 import logging
-import math
 
 import httpx
 
@@ -94,20 +94,6 @@ def _format_provider_list(providers: list[dict]) -> list[str]:
     return [p["provider_name"] for p in providers if "provider_name" in p]
 
 
-def _popularity_score(item: dict) -> float:
-    """
-    Kombinations-score til sortering af filmografi:
-      vote_average × log(vote_count + 1)
-
-    Formålet er at løfte film med høj rating OG mange stemmer
-    (de reelle "biggest hits") over nyere film med få stemmer.
-    log() dæmper effekten af ekstreme vote_count-tal.
-    """
-    avg   = item.get("vote_average", 0) or 0
-    count = item.get("vote_count", 0) or 0
-    return avg * math.log(count + 1)
-
-
 async def search_media(query: str, media_type: str = "both") -> list[dict]:
     results: list[dict] = []
     async with httpx.AsyncClient(timeout=10) as client:
@@ -137,10 +123,7 @@ async def search_media(query: str, media_type: str = "both") -> list[dict]:
 
 
 async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
-    """
-    Fetch full details for a film or TV show.
-    For TV-serier kalder vi også /external_ids for at hente tvdb_id.
-    """
+    """Fetch full details for a film or TV show."""
     endpoint = "movie" if media_type == "movie" else "tv"
 
     async with httpx.AsyncClient(timeout=10) as client:
@@ -179,7 +162,6 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
             )
             ext_resp.raise_for_status()
             tvdb_id = ext_resp.json().get("tvdb_id")
-            logger.info("TMDB external_ids for tmdb_id=%s: tvdb_id=%s", tmdb_id, tvdb_id)
         except httpx.HTTPError as e:
             logger.warning("Could not fetch external_ids for tmdb_id=%s: %s", tmdb_id, e)
 
@@ -207,15 +189,11 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
 
 
 async def get_tmdb_collection_movies(keyword: str) -> dict | None:
-    """
-    Søg efter en TMDB-samling via keyword og returner alle film i samlingen.
-    Returnerer 'tmdb_id', 'title', 'original_title' og 'release_date' per film.
-    """
+    """Søg efter en TMDB-samling og returner alle film med tmdb_id, title, original_title."""
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             search_resp = await client.get(
-                f"{_BASE_URL}/search/collection",
-                params=_params(query=keyword),
+                f"{_BASE_URL}/search/collection", params=_params(query=keyword)
             )
             search_resp.raise_for_status()
             search_results = search_resp.json().get("results", [])
@@ -224,22 +202,17 @@ async def get_tmdb_collection_movies(keyword: str) -> dict | None:
             return None
 
         if not search_results:
-            logger.info("TMDB collection search: ingen resultater for '%s'", keyword)
             return None
 
         top             = search_results[0]
         collection_id   = top.get("id")
         collection_name = top.get("name") or top.get("original_name") or keyword
 
-        logger.info(
-            "TMDB collection search: '%s' → '%s' (id=%s)",
-            keyword, collection_name, collection_id,
-        )
+        logger.info("TMDB collection: '%s' → '%s' (id=%s)", keyword, collection_name, collection_id)
 
         try:
             detail_resp = await client.get(
-                f"{_BASE_URL}/collection/{collection_id}",
-                params=_params(),
+                f"{_BASE_URL}/collection/{collection_id}", params=_params()
             )
             detail_resp.raise_for_status()
             detail = detail_resp.json()
@@ -263,7 +236,6 @@ async def get_tmdb_collection_movies(keyword: str) -> dict | None:
         })
 
     movies.sort(key=lambda x: x["release_date"])
-
     logger.info("TMDB collection '%s': %d film fundet", collection_name, len(movies))
 
     return {
@@ -309,62 +281,142 @@ async def search_person(query: str) -> list[dict]:
 
 async def get_person_filmography(person_id: int) -> dict | None:
     """
-    Hent filmografi for en person.
+    Hent den FULDE filmografi for en person.
 
-    FIX: Returnerer nu TOP 20 film sorteret efter popularitets-score
-    (vote_average × log(vote_count + 1)) fremfor udelukkende release_date.
-    Dette giver de reelle "biggest hits" — f.eks. Iron Man højere end en
-    nyere B-film med få anmeldelser.
+    FIX: Bruger nu /person/{id}/movie_credits i stedet for /combined_credits.
 
-    Returnerer nu BÅDE 'title' (oversat, da-DK), 'original_title' og 'tmdb_id'
-    per film, så check_actor_on_plex() kan lave GUID- og titel-matching.
+    Årsag til skiftet:
+      - /combined_credits returnerer kun ~20 resultater pga. intern paginering
+        på TMDB's side (side 1 af en blandet film+TV-liste).
+      - /movie_credits returnerer ALLE film på én gang som én komplet liste
+        under 'cast' — ingen paginering, ingen begrænsning.
+      - Samuel L. Jackson: combined_credits → 20 film, movie_credits → 180+ film.
 
-    TV-credits er stadig sorteret efter release_date (kronologisk).
+    Kører to parallelle kald via asyncio.gather:
+      1. /person/{id}               → biografi, navn, fødselsdato
+      2. /person/{id}/movie_credits → komplet film-cast liste
+
+    Filtrering (fjerner støj fra listen):
+      - 'uncredited' i character-feltet: statist-roller der ikke tæller karrieremæssigt.
+      - Ingen release_date: urealiserede/annoncerede projekter uden udgivelsesdato.
+        Disse forvrænger total_movies-tællingen i check_actor_on_plex.
+
+    Deduplikering på tmdb_id: TMDB kan liste samme film flere gange (f.eks.
+    skuespiller + stemme-rolle). Vi beholder posten med højest vote_count.
+
+    Hvert film-objekt indeholder:
+      tmdb_id, title, original_title, release_date, character,
+      vote_average, vote_count, popularity
+
+    Sorteret efter popularity (faldende) — bedste hits først.
+    TV-credits hentes stadig via combined_credits, men kun top 10.
     """
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=15) as client:
         try:
-            bio_resp = await client.get(
-                f"{_BASE_URL}/person/{person_id}", params=_params()
+            # Kald begge endpoints parallelt for minimal latens
+            bio_resp, movie_credits_resp = await asyncio.gather(
+                client.get(f"{_BASE_URL}/person/{person_id}", params=_params()),
+                client.get(
+                    f"{_BASE_URL}/person/{person_id}/movie_credits",
+                    params={"api_key": TMDB_API_KEY, "language": _LANGUAGE},
+                ),
             )
             bio_resp.raise_for_status()
-            bio = bio_resp.json()
-            credits_resp = await client.get(
-                f"{_BASE_URL}/person/{person_id}/combined_credits", params=_params()
-            )
-            credits_resp.raise_for_status()
-            credits = credits_resp.json()
+            movie_credits_resp.raise_for_status()
+            bio          = bio_resp.json()
+            movie_data   = movie_credits_resp.json()
         except httpx.HTTPError as e:
             logger.error("TMDB filmography error (id=%s): %s", person_id, e)
             return None
 
-    # Film-credits: sortér efter popularitets-score, tag top 20
-    raw_movie_cast = [
-        i for i in credits.get("cast", []) if i.get("media_type") == "movie"
-    ]
-    raw_movie_cast.sort(key=_popularity_score, reverse=True)
+    # ── Hent TV-credits separat (bruger combined_credits kun til TV) ──────────
+    tv_credits_raw = []
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            tv_resp = await client.get(
+                f"{_BASE_URL}/person/{person_id}/tv_credits",
+                params={"api_key": TMDB_API_KEY, "language": _LANGUAGE},
+            )
+            tv_resp.raise_for_status()
+            tv_credits_raw = tv_resp.json().get("cast", [])
+        except httpx.HTTPError as e:
+            logger.warning("TMDB TV credits error (id=%s): %s", person_id, e)
 
+    # ── Film-credits: komplet liste fra /movie_credits ────────────────────────
+    raw_cast = movie_data.get("cast", [])
+
+    logger.info(
+        "get_person_filmography: person_id=%s → %d rå film-credits fra /movie_credits",
+        person_id, len(raw_cast),
+    )
+
+    # Filtrér støj
+    filtered = []
+    for item in raw_cast:
+        # Fjern ukrediterede roller
+        character = (item.get("character") or "").strip().lower()
+        if "uncredited" in character:
+            continue
+
+        # Fjern projekter uden udgivelsesdato (urealiserede)
+        release_date = (item.get("release_date") or "").strip()
+        if not release_date:
+            continue
+
+        filtered.append(item)
+
+    # Deduplikér på tmdb_id — behold posten med højest vote_count
+    seen: dict[int, dict] = {}
+    for item in filtered:
+        tid = item.get("id")
+        if not tid:
+            continue
+        existing = seen.get(tid)
+        if existing is None or (item.get("vote_count", 0) or 0) > (existing.get("vote_count", 0) or 0):
+            seen[tid] = item
+
+    # Byg final film-liste
     movie_credits = []
-    for i in raw_movie_cast[:20]:
-        title          = i.get("title") or i.get("original_title") or ""
-        original_title = i.get("original_title") or title
+    for item in seen.values():
+        title          = item.get("title") or item.get("original_title") or ""
+        original_title = item.get("original_title") or title
+        if not title:
+            continue
         movie_credits.append({
-            "tmdb_id":        i.get("id"),
+            "tmdb_id":        item.get("id"),
             "title":          title,
             "original_title": original_title,
-            "release_date":   (i.get("release_date") or "")[:4] or "Ukendt",
-            "character":      i.get("character"),
-            "vote_average":   round(i.get("vote_average", 0), 1),
-            "vote_count":     i.get("vote_count", 0),
+            "release_date":   (item.get("release_date") or "")[:4] or "Ukendt",
+            "character":      item.get("character") or "",
+            "vote_average":   round(item.get("vote_average", 0) or 0, 1),
+            "vote_count":     item.get("vote_count", 0) or 0,
+            "popularity":     round(item.get("popularity", 0) or 0, 2),
         })
 
-    # TV-credits: kronologisk, top 10
+    # Sortér efter popularity faldende
+    movie_credits.sort(key=lambda x: x["popularity"], reverse=True)
+
+    logger.info(
+        "get_person_filmography: person_id=%s → %d unikke film efter filtrering/dedup "
+        "(fjernet %d råposter)",
+        person_id, len(movie_credits), len(raw_cast) - len(movie_credits),
+    )
+
+    # ── TV-credits: top 10 kronologisk ───────────────────────────────────────
     tv_credits = sorted(
-        [{"id": i.get("id"), "title": i.get("name") or i.get("original_name"),
-          "first_air_date": i.get("first_air_date", "")[:4] or "Ukendt",
-          "character": i.get("character"),
-          "vote_average": round(i.get("vote_average", 0), 1)}
-         for i in credits.get("cast", []) if i.get("media_type") == "tv"],
-        key=lambda x: x["first_air_date"], reverse=True,
+        [
+            {
+                "id":             i.get("id"),
+                "title":          i.get("name") or i.get("original_name"),
+                "first_air_date": (i.get("first_air_date") or "")[:4] or "Ukendt",
+                "character":      i.get("character"),
+                "vote_average":   round(i.get("vote_average", 0) or 0, 1),
+            }
+            for i in tv_credits_raw
+            if i.get("name") or i.get("original_name")
+        ],
+        key=lambda x: x["first_air_date"],
+        reverse=True,
     )[:10]
 
     return {
@@ -374,26 +426,21 @@ async def get_person_filmography(person_id: int) -> dict | None:
         "birthday":             bio.get("birthday"),
         "place_of_birth":       bio.get("place_of_birth"),
         "known_for_department": bio.get("known_for_department", "Ukendt"),
-        "movie_credits":        movie_credits,   # top 20, sorteret efter popularitet
+        "total_movie_credits":  len(movie_credits),
+        "movie_credits":        movie_credits,   # ALLE film, sorteret efter popularity
         "tv_credits":           tv_credits,      # top 10, kronologisk
     }
 
 
 async def get_trending() -> dict:
-    """
-    Laver to separate, parallelle API-kald:
-      - /trending/movie/week → top 5 film
-      - /trending/tv/week   → top 5 serier
-    Returnerer {"movies": [5 film], "tv": [5 serier]}.
-    """
+    """Laver to parallelle kald. Returnerer {"movies": [5 film], "tv": [5 serier]}."""
     _TOP_N = 5
 
     async def _fetch(endpoint_type: str) -> list[dict]:
         async with httpx.AsyncClient(timeout=10) as client:
             try:
                 resp = await client.get(
-                    f"{_BASE_URL}/trending/{endpoint_type}/week",
-                    params=_params(),
+                    f"{_BASE_URL}/trending/{endpoint_type}/week", params=_params()
                 )
                 resp.raise_for_status()
                 return resp.json().get("results", [])[:_TOP_N]
@@ -402,7 +449,6 @@ async def get_trending() -> dict:
                 return []
 
     movie_raw, tv_raw = await asyncio.gather(_fetch("movie"), _fetch("tv"))
-
     return {
         "movies": [_format_movie_result(i) for i in movie_raw],
         "tv":     [_format_tv_result(i)    for i in tv_raw],
@@ -465,7 +511,6 @@ async def get_now_playing() -> list[dict]:
             except httpx.HTTPError as e:
                 logger.error("TMDB now_playing error (page %d): %s", page, e)
                 break
-
     raw.sort(key=lambda x: x.get("popularity", 0), reverse=True)
     return [_format_movie_result(i) for i in raw[:_MAX_RESULTS]]
 
@@ -485,7 +530,6 @@ async def get_upcoming() -> list[dict]:
             except httpx.HTTPError as e:
                 logger.error("TMDB upcoming error (page %d): %s", page, e)
                 break
-
     raw.sort(key=lambda x: x.get("popularity", 0), reverse=True)
     top10 = raw[:_MAX_RESULTS]
     top10.sort(key=lambda x: x.get("release_date") or "")
