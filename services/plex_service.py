@@ -15,12 +15,16 @@ TOKEN OPTIMISATION (data-diæt):
     which is called explicitly when the user asks for them.
 
 CHANGES vs previous version:
-  - check_library / _check_sync er omskrevet for at fikse falske negativer på
-    TV-serier (f.eks. 'Euphoria' markeret som 'ikke på Plex'):
-    1. For TV-serier bruges løsere årstals-match (+/- 2 år) — eller ingen
-       årstals-validering ved eksakt titel-match.
-    2. Tjekker kun om Show-objektet eksisterer — antal afsnit er irrelevant.
-    3. Itererer korrekt over ALLE tv-sektioner (dækker opdelte biblioteker).
+  - Tilføjet _clean_title() hjælpefunktion:
+    Fjerner indhold i parenteser (f.eks. '(US)', '(2021)'), specialtegn og
+    ekstra mellemrum inden sammenligning. Løser falske negativer for serier
+    som 'Euphoria (US)' og 'Invincible (2021)'.
+  - _check_sync bruger nu tre-lags matching:
+    Lag 1: Eksakt normaliseret match (_titles_match) — hurtigst, bruges altid.
+    Lag 2: Renset titel-match (_clean_title) — fanger regions-tags og årstals-suffiks.
+    Lag 3: Substring-match på rensede titler — fanger delvise matches begge veje.
+  - _year_ok_for_tv() tolerance sat til 2 år for shows.
+  - Søger korrekt i alle TV-sektioner (dækker opdelte biblioteker).
 """
 
 import asyncio
@@ -46,14 +50,12 @@ STATUS_ERROR   = "error"
 
 _MOVIE_TYPE  = "movie"
 _TV_TYPE     = "show"
-_MAX_RESULTS = 25      # Hard cap on all list responses sent to the AI.
+_MAX_RESULTS = 25
 
 _TMDB_BASE = "https://api.themoviedb.org/3"
 _TMDB_LANG = "da-DK"
 
-# Maks antal år en serie må afvige fra TMDB-årstallet og stadig godkendes.
-# Sættes til 2 fordi TMDB og Plex-metadata ikke altid er enige om præcist
-# hvilket år en serie "begyndte" (pilot-år vs. første sæson-år osv.).
+# Max år en series årstal må afvige og stadig godkendes.
 _TV_YEAR_TOLERANCE = 2
 
 
@@ -62,14 +64,10 @@ _TV_YEAR_TOLERANCE = 2
 def _slim(item) -> dict:
     """
     Convert a PlexAPI media object to a minimal dict for the AI.
-
     Keeps ONLY: title, year, rating, genres (max 3), summary.
-    Everything else — file paths, codecs, artwork URLs, GUIDs — is dropped.
-    This is the single choke-point for token reduction in Plex responses.
     """
-    genres = [g.tag for g in getattr(item, "genres", [])][:3]
+    genres  = [g.tag for g in getattr(item, "genres", [])][:3]
     summary = (getattr(item, "summary", "") or "").strip()
-    # Truncate long summaries — the AI doesn't need the full synopsis.
     if len(summary) > 200:
         summary = summary[:197] + "…"
 
@@ -90,7 +88,7 @@ def _normalise(title: str) -> str:
     Strips accents, lowercases, replaces hyphens, removes punctuation,
     collapses spaces, and strips leading articles.
     """
-    nfkd = unicodedata.normalize("NFKD", title)
+    nfkd      = unicodedata.normalize("NFKD", title)
     ascii_str = "".join(c for c in nfkd if not unicodedata.combining(c))
     s = ascii_str.lower()
     s = re.sub(r"[-_]", " ", s)
@@ -100,23 +98,80 @@ def _normalise(title: str) -> str:
     return s
 
 
+def _clean_title(title: str) -> str:
+    """
+    Aggressiv titel-rensning til fuzzy matching.
+
+    Formål: fange tilfælde hvor Plex har tilføjet regions-tags eller årstal
+    direkte i show-titlen, f.eks.:
+      'Euphoria (US)'   → 'euphoria'
+      'Invincible (2021)' → 'invincible'
+      'The Bear: Season 2' → 'bear season 2'
+
+    Trin:
+      1. Fjern alt indhold i parenteser inkl. parenteserne selv.
+      2. Fjern specialtegn (kolon, komma, bindestreg, punktum osv.).
+      3. Lowercase + kollaps mellemrum.
+      4. Strip leading articles (the, a, an, den, det, en, et).
+
+    Returnerer en simpel lowercase-streng uden parenteser eller tegnsætning.
+    Bruges KUN til sammenlignings-formål — aldrig til at overskrive titler.
+    """
+    s = title.lower()
+    # Fjern alt i parenteser: (US), (2021), (UK), osv.
+    s = re.sub(r"\([^)]*\)", "", s)
+    # Fjern specialtegn — behold bogstaver, tal og mellemrum
+    s = re.sub(r"[^a-z0-9\s]", "", s)
+    # Kollaps mellemrum
+    s = re.sub(r"\s+", " ", s).strip()
+    # Strip leading articles
+    s = re.sub(r"^(the|a|an|den|det|en|et)\s+", "", s)
+    return s
+
+
 def _titles_match(title_a: str, title_b: str) -> bool:
+    """Eksakt normaliseret match (Lag 1)."""
     return _normalise(title_a) == _normalise(title_b)
+
+
+def _titles_match_fuzzy(title_a: str, title_b: str) -> bool:
+    """
+    Fuzzy match via _clean_title (Lag 2 + 3).
+
+    Lag 2: Identiske rensede titler.
+    Lag 3: Den ene er en direkte substring af den anden.
+            Eksempel: 'invincible' er substring af 'invincible 2021'
+            eller 'euphoria' er substring af 'euphoria us'.
+
+    Substring-tjekket er bevidst asymmetrisk — begge retninger tjekkes,
+    så både kortere Plex-titler og kortere TMDB-titler kan matche.
+    Minimumslængde på 4 tegn for substring-match for at undgå falske positiver
+    på meget korte ord (f.eks. 'er', 'in', 'it').
+    """
+    clean_a = _clean_title(title_a)
+    clean_b = _clean_title(title_b)
+
+    if not clean_a or not clean_b:
+        return False
+
+    # Lag 2: identiske rensede titler
+    if clean_a == clean_b:
+        return True
+
+    # Lag 3: substring begge veje (med minimumslængde)
+    min_len = 4
+    if len(clean_a) >= min_len and len(clean_b) >= min_len:
+        if clean_a in clean_b or clean_b in clean_a:
+            return True
+
+    return False
 
 
 def _year_ok_for_tv(item_year: int | None, query_year: int | None) -> bool:
     """
-    Loose year check for TV shows.
-
-    Rules (in priority order):
-      1. If either year is missing → accept (don't penalise missing metadata).
-      2. If years are within _TV_YEAR_TOLERANCE → accept.
-      3. Otherwise → reject.
-
-    We intentionally do NOT require an exact year match for shows, because:
-      - TMDB may use the pilot/announcement year while Plex uses the
-        first full season year (or vice versa).
-      - Metadata providers disagree by 1-2 years surprisingly often.
+    Løs årstals-validering for TV-shows.
+    Godkender match hvis årstallet mangler i enten Plex eller TMDB,
+    eller hvis afvigelsen er inden for _TV_YEAR_TOLERANCE (2 år).
     """
     if item_year is None or query_year is None:
         return True
@@ -162,7 +217,7 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
             logger.debug("Plex connect: owner '%s'", plex_username)
             return admin_plex
 
-        # ── 2. Shared friend (has own Plex account) ───────────────────────────
+        # ── 2. Shared friend ──────────────────────────────────────────────────
         for user in account.users():
             user_names = {
                 (getattr(user, "username", "") or "").lower(),
@@ -178,11 +233,11 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
                     return PlexServer(PLEX_URL, user_token, timeout=15)
                 except Exception as e:
                     logger.warning(
-                        "get_token() failed for shared user '%s': %s — trying switchHomeUser",
+                        "get_token() failed for '%s': %s — trying switchHomeUser",
                         plex_username, e,
                     )
 
-        # ── 3. Managed home user (no own Plex account) ───────────────────────
+        # ── 3. Managed home user ──────────────────────────────────────────────
         try:
             home_users = account.homeUsers()
         except Exception:
@@ -208,8 +263,7 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
 
         # ── 4. No match ───────────────────────────────────────────────────────
         logger.warning(
-            "Plex user '%s' not found in friends or home users — falling back to admin",
-            plex_username,
+            "Plex user '%s' not found — falling back to admin", plex_username
         )
         return admin_plex
 
@@ -236,30 +290,23 @@ def _safe_search(section, title: str) -> list:
         return []
 
 
-# ── Technical specs helper (only used by get_plex_metadata) ──────────────────
+# ── Technical specs helper ────────────────────────────────────────────────────
 
 def _stream_info(media_item) -> dict:
     """
     Extract technical specs from a Plex media item.
     NEVER returns raw file paths or directory names.
-    Only called by _metadata_sync — never included in list responses.
+    Only called by _metadata_sync.
     """
     info = {
-        "resolution": None,
-        "hdr": False,
-        "video_codec": None,
-        "audio_codec": None,
-        "audio_channels": None,
-        "bitrate_kbps": None,
-        "container": None,
-        "duration_minutes": None,
+        "resolution": None, "hdr": False, "video_codec": None,
+        "audio_codec": None, "audio_channels": None,
+        "bitrate_kbps": None, "container": None, "duration_minutes": None,
     }
-
     try:
         media = media_item.media[0] if media_item.media else None
         if not media:
             return info
-
         info["resolution"]       = getattr(media, "videoResolution", None)
         info["bitrate_kbps"]     = getattr(media, "bitrate", None)
         info["container"]        = getattr(media, "container", None)
@@ -267,12 +314,11 @@ def _stream_info(media_item) -> dict:
             round(getattr(media_item, "duration", 0) / 60000)
             if getattr(media_item, "duration", None) else None
         )
-
         part = media.parts[0] if media.parts else None
         if part:
             for stream in getattr(part, "streams", []):
                 stype = getattr(stream, "streamType", None)
-                if stype == 1:  # video
+                if stype == 1:
                     info["video_codec"] = getattr(stream, "codec", None)
                     color_trc = getattr(stream, "colorTrc", "") or ""
                     dv = getattr(stream, "DOVIPresent", False)
@@ -281,12 +327,11 @@ def _stream_info(media_item) -> dict:
                         or "smpte2084" in color_trc.lower()
                         or "arib-std-b67" in color_trc.lower()
                     )
-                elif stype == 2 and not info["audio_codec"]:  # first audio track
+                elif stype == 2 and not info["audio_codec"]:
                     info["audio_codec"]    = getattr(stream, "codec", None)
                     info["audio_channels"] = getattr(stream, "channels", None)
     except Exception as e:
         logger.warning("Stream info error: %s", e)
-
     return info
 
 
@@ -303,7 +348,8 @@ async def check_library(
     """Check whether a specific title exists in Plex."""
     try:
         return await asyncio.to_thread(
-            partial(_check_sync, title=title, year=year, media_type=media_type, plex_username=plex_username)
+            partial(_check_sync, title=title, year=year,
+                    media_type=media_type, plex_username=plex_username)
         )
     except Exception as e:
         logger.error("check_library error: %s", e)
@@ -318,7 +364,8 @@ async def get_collection(
     """Search Plex for all titles matching a keyword. Capped at 25 results."""
     try:
         return await asyncio.to_thread(
-            partial(_collection_sync, keyword=keyword, media_type=media_type, plex_username=plex_username)
+            partial(_collection_sync, keyword=keyword,
+                    media_type=media_type, plex_username=plex_username)
         )
     except Exception as e:
         logger.error("get_collection error: %s", e)
@@ -357,7 +404,8 @@ async def find_unwatched(
     """Return up to 6 random unwatched titles, optionally filtered by genre."""
     try:
         return await asyncio.to_thread(
-            partial(_unwatched_sync, media_type=media_type, genre=genre, plex_username=plex_username)
+            partial(_unwatched_sync, media_type=media_type,
+                    genre=genre, plex_username=plex_username)
         )
     except Exception as e:
         logger.error("find_unwatched error: %s", e)
@@ -382,13 +430,11 @@ async def get_missing_from_collection(
     collection_name: str,
     plex_username: str | None = None,
 ) -> dict:
-    """
-    Compare a Plex collection against TMDB to find missing titles.
-    Uses TMDB search to find the collection, then checks each title against Plex.
-    """
+    """Compare a Plex collection against TMDB to find missing titles."""
     try:
         return await asyncio.to_thread(
-            partial(_missing_sync, collection_name=collection_name, plex_username=plex_username)
+            partial(_missing_sync, collection_name=collection_name,
+                    plex_username=plex_username)
         )
     except Exception as e:
         logger.error("get_missing_from_collection error: %s", e)
@@ -400,13 +446,11 @@ async def search_by_actor(
     media_type: str = "movie",
     plex_username: str | None = None,
 ) -> dict:
-    """
-    Find titles in the Plex library featuring a specific actor or director.
-    Uses PlexAPI's actor filter — NOT title search.
-    """
+    """Find titles in the Plex library featuring a specific actor or director."""
     try:
         return await asyncio.to_thread(
-            partial(_actor_sync, actor_name=actor_name, media_type=media_type, plex_username=plex_username)
+            partial(_actor_sync, actor_name=actor_name,
+                    media_type=media_type, plex_username=plex_username)
         )
     except Exception as e:
         logger.error("search_by_actor error: %s", e)
@@ -424,28 +468,33 @@ def _check_sync(
     plex_username: str | None = None,
 ) -> dict:
     """
-    check_library — robust title lookup for both movies and TV shows.
+    check_library — tre-lags fuzzy titel-matching.
 
-    FIX for TV-serier (tre forbedringer):
+    Lag 1 — Eksakt normaliseret match (_titles_match):
+      Den hurtige vej. Normaliserer begge titler (lowercase, strip accenter,
+      fjern punktuation, strip artikel) og sammenligner direkte.
+      Matcher f.eks. 'Euphoria' mod 'euphoria' eller 'The Bear' mod 'bear'.
 
-    1. Løsere årstals-match for shows:
-       - Ved eksakt titel-match (efter normalisering) bruges _year_ok_for_tv(),
-         som godkender match hvis årstallet afviger med højst _TV_YEAR_TOLERANCE (2) år,
-         eller hvis et af årstallene mangler.
-       - Film beholder det strenge match (max 1 års afvigelse).
+    Lag 2 — Renset titel-match (_clean_title, identiske strenge):
+      Fjerner derudover alt indhold i parenteser inden sammenligning.
+      Matcher f.eks. 'Euphoria' mod 'Euphoria (US)' eller
+      'Invincible' mod 'Invincible (2021)'.
 
-    2. Serieniveau-tjek:
-       - For shows kigger vi KUN på om Show-objektet eksisterer.
-       - Vi tæller ALDRIG afsnit eller checker episodeFileCount.
-       - Enhver serie der er lagt ind i Plex — også dem der mangler afsnit —
-         returnerer STATUS_FOUND.
+    Lag 3 — Substring-match på rensede titler:
+      Godkender hvis den ene rensede titel er en direkte substring af den anden.
+      Matcher f.eks. 'Invincible' mod 'Invincible 2021' (uden parentes),
+      eller 'Euphoria' mod 'Euphoria US'.
+      Minimumslængde på 4 tegn forhindrer falske positiver på korte ord.
 
-    3. Søg i alle sektioner:
-       - _sections() returnerer alle biblioteker af den pågældende type.
-       - Koden itererer over dem alle, så opdelte biblioteker
-         (f.eks. "TV - Dansk" og "TV - Serier") begge gennemsøges.
+    For TV-shows:
+      - Årstals-match er løst: +/- _TV_YEAR_TOLERANCE år eller manglende år.
+      - Antal afsnit/filer tælles IKKE — Show-objektets eksistens er nok.
+      - Alle TV-sektioner gennemsøges (dækker opdelte biblioteker).
+
+    For film:
+      - Årstals-match er strengt: max 1 års afvigelse.
     """
-    is_tv    = (media_type == "tv")
+    is_tv     = (media_type == "tv")
     plex_type = _TV_TYPE if is_tv else _MOVIE_TYPE
 
     plex = _connect(plex_username)
@@ -455,12 +504,12 @@ def _check_sync(
     sections = _sections(plex, plex_type)
     if not sections:
         logger.warning(
-            "check_library: no sections of type '%s' found on server", plex_type
+            "check_library: ingen sektioner af type '%s' fundet", plex_type
         )
 
     for section in sections:
         logger.debug(
-            "check_library: searching section '%s' for '%s' (%s)",
+            "check_library: søger i '%s' efter '%s' [%s]",
             section.title, title, media_type,
         )
 
@@ -468,32 +517,40 @@ def _check_sync(
             item_title = getattr(item, "title", "") or ""
             item_year  = getattr(item, "year", None)
 
-            # ── Titel-match ───────────────────────────────────────────────────
-            if not _titles_match(item_title, title):
+            # ── Titel-matching (tre lag) ───────────────────────────────────────
+            lag1 = _titles_match(item_title, title)
+            lag2_or_3 = _titles_match_fuzzy(item_title, title)
+
+            if not (lag1 or lag2_or_3):
+                logger.debug(
+                    "check_library: ingen match — plex='%s' query='%s'",
+                    item_title, title,
+                )
                 continue
 
-            # ── Årstals-validering ────────────────────────────────────────────
+            match_lag = 1 if lag1 else "2/3"
+
+            # ── Årstals-validering ─────────────────────────────────────────────
             if is_tv:
-                # TV-serier: løst match — +/- _TV_YEAR_TOLERANCE år eller manglende år
                 if not _year_ok_for_tv(item_year, year):
                     logger.debug(
-                        "check_library: TV year mismatch — item=%s query=%s tolerance=%s",
+                        "check_library: TV årstals-afvisning — item=%s query=%s tolerance=%s",
                         item_year, year, _TV_YEAR_TOLERANCE,
                     )
                     continue
             else:
-                # Film: strengt match — max 1 års afvigelse
                 if year and item_year and abs(item_year - year) > 1:
                     logger.debug(
-                        "check_library: movie year mismatch — item=%s query=%s",
+                        "check_library: film årstals-afvisning — item=%s query=%s",
                         item_year, year,
                     )
                     continue
 
-            # ── Match fundet ──────────────────────────────────────────────────
+            # ── Match fundet ───────────────────────────────────────────────────
             logger.info(
-                "Plex HIT: '%s' (%s) in section '%s' [%s]",
-                item_title, item_year, section.title, plex_type,
+                "Plex HIT (lag %s): '%s' (%s) i '%s' [%s] — søgt på '%s' (%s)",
+                match_lag, item_title, item_year, section.title,
+                plex_type, title, year,
             )
             return {
                 "status": STATUS_FOUND,
@@ -502,7 +559,7 @@ def _check_sync(
             }
 
     logger.info(
-        "Plex MISS: '%s' (%s) not found in any %s section",
+        "Plex MISS: '%s' (%s) ikke fundet i nogen %s-sektion",
         title, year, plex_type,
     )
     return {"status": STATUS_MISSING}
@@ -564,10 +621,7 @@ def _metadata_sync(
     year: int | None,
     plex_username: str | None = None,
 ) -> dict:
-    """
-    get_plex_metadata — the ONE function that returns technical specs.
-    Never called as part of list responses.
-    """
+    """get_plex_metadata — the ONE function that returns technical specs."""
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
@@ -577,7 +631,7 @@ def _metadata_sync(
             for item in _safe_search(section, title):
                 item_title = getattr(item, "title", "") or ""
                 item_year  = getattr(item, "year", None)
-                if not _titles_match(item_title, title):
+                if not (_titles_match(item_title, title) or _titles_match_fuzzy(item_title, title)):
                     continue
                 if year and item_year and abs(item_year - year) > 1:
                     continue
@@ -603,7 +657,7 @@ def _unwatched_sync(
     if isinstance(plex, dict):
         return plex
 
-    unwatched = []
+    unwatched  = []
     norm_genre = _normalise(genre) if genre else None
 
     for section in _sections(plex, plex_type):
@@ -642,7 +696,8 @@ def _similar_sync(title: str, plex_username: str | None = None) -> dict:
     for plex_type in (_MOVIE_TYPE, _TV_TYPE):
         for section in _sections(plex, plex_type):
             for item in _safe_search(section, title):
-                if _titles_match(getattr(item, "title", ""), title):
+                if _titles_match(getattr(item, "title", ""), title) or \
+                   _titles_match_fuzzy(getattr(item, "title", ""), title):
                     source_item    = item
                     source_section = section
                     break
@@ -671,7 +726,6 @@ def _similar_sync(title: str, plex_username: str | None = None) -> dict:
     except Exception as e:
         logger.warning("Plex related() failed, falling back to genre match: %s", e)
 
-    # Fallback: genre overlap within the same section.
     source_genres = {_normalise(g.tag) for g in getattr(source_item, "genres", [])}
     if not source_genres:
         return {"status": "ok", "source": getattr(source_item, "title", title), "similar": []}
@@ -694,10 +748,7 @@ def _similar_sync(title: str, plex_username: str | None = None) -> dict:
 
 
 def _missing_sync(collection_name: str, plex_username: str | None = None) -> dict:
-    """
-    get_missing_from_collection — find gaps between TMDB and Plex.
-    Returns only title/year/tmdb_id — no heavy metadata.
-    """
+    """get_missing_from_collection — find gaps between TMDB and Plex."""
     import httpx as _httpx
 
     try:
@@ -715,7 +766,7 @@ def _missing_sync(collection_name: str, plex_username: str | None = None) -> dic
     if not tmdb_results:
         return {"status": "ok", "found_in_plex": [], "missing_from_plex": [], "total": 0}
 
-    norm_kw = _normalise(collection_name).split()[0]
+    norm_kw  = _normalise(collection_name).split()[0]
     relevant = [
         r for r in tmdb_results
         if norm_kw in _normalise(r.get("title") or r.get("original_title") or "")
@@ -739,7 +790,8 @@ def _missing_sync(collection_name: str, plex_username: str | None = None) -> dic
             for item in _safe_search(section, tmdb_title):
                 item_title = getattr(item, "title", "") or ""
                 item_year  = getattr(item, "year", None)
-                if not _titles_match(item_title, tmdb_title):
+                if not (_titles_match(item_title, tmdb_title) or
+                        _titles_match_fuzzy(item_title, tmdb_title)):
                     continue
                 if tmdb_year and item_year and abs(item_year - tmdb_year) > 1:
                     continue
@@ -759,7 +811,7 @@ def _missing_sync(collection_name: str, plex_username: str | None = None) -> dic
         "collection": collection_name,
         "found_in_plex":     found_in_plex[:_MAX_RESULTS],
         "missing_from_plex": missing_from_plex[:_MAX_RESULTS],
-        "total_checked": len(relevant),
+        "total_checked":     len(relevant),
     }
 
 
@@ -768,28 +820,21 @@ def _actor_sync(
     media_type: str = "movie",
     plex_username: str | None = None,
 ) -> dict:
-    """
-    search_by_actor — find titles in Plex featuring a specific actor.
-
-    Bruger PlexAPI's section.search(actor=...) filter som søger i metadata,
-    ikke i titler. Det er den korrekte måde at finde film med en bestemt skuespiller.
-    """
-    plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
-    plex = _connect(plex_username)
+    """search_by_actor — find titles in Plex featuring a specific actor."""
+    plex_type  = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
+    plex       = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
-    matches = []
+    matches    = []
     norm_actor = _normalise(actor_name)
 
     for section in _sections(plex, plex_type):
         try:
-            # Primær metode: brug PlexAPI's indbyggede actor-filter
             results = section.search(actor=actor_name)
             for item in results:
                 matches.append(_slim(item))
         except Exception:
-            # Fallback: manuel scanning af rollebesætning
             try:
                 for item in section.search():
                     roles = getattr(item, "roles", []) or []
@@ -806,26 +851,18 @@ def _actor_sync(
 
     if not capped:
         return {
-            "status": "not_found",
+            "status":  "not_found",
             "message": f"Ingen titler med '{actor_name}' fundet i Plex-biblioteket.",
-            "actor": actor_name,
+            "actor":   actor_name,
         }
 
-    return {
-        "status": "ok",
-        "actor": actor_name,
-        "found": capped,
-        "count": len(capped),
-    }
+    return {"status": "ok", "actor": actor_name, "found": capped, "count": len(capped)}
 
 
 # ── Plex user validation ──────────────────────────────────────────────────────
 
 async def validate_plex_user(plex_username: str) -> dict:
-    """
-    Check whether a Plex username exists as a shared user on this server.
-    Works for both the server owner and managed/shared users.
-    """
+    """Check whether a Plex username exists as a shared user on this server."""
     try:
         return await asyncio.to_thread(
             partial(_validate_user_sync, plex_username=plex_username)
@@ -845,7 +882,6 @@ def _validate_user_sync(plex_username: str) -> dict:
 
     norm = plex_username.strip().lower()
 
-    # 1. Server owner
     owner_names = {
         (account.username or "").lower(),
         (account.email or "").lower(),
@@ -855,7 +891,6 @@ def _validate_user_sync(plex_username: str) -> dict:
         display = account.title or account.username or plex_username
         return {"valid": True, "username": display, "user_type": "owner"}
 
-    # 2. Shared friends
     try:
         for user in account.users():
             user_names = {
@@ -873,7 +908,6 @@ def _validate_user_sync(plex_username: str) -> dict:
     except Exception as e:
         logger.warning("Could not check shared users: %s", e)
 
-    # 3. Managed home users
     try:
         for user in account.homeUsers():
             user_names = {
@@ -892,7 +926,7 @@ def _validate_user_sync(plex_username: str) -> dict:
         logger.warning("Could not check home users: %s", e)
 
     return {
-        "valid": False,
+        "valid":   False,
         "message": f"Brugernavnet '{plex_username}' blev ikke fundet — hverken som ven eller hjembruger.",
     }
 
