@@ -16,6 +16,10 @@ CHANGES vs previous version:
     fremtids-regel ("tro ukritisk på data fra fremtiden") er fjernet, da
     Buddy nu kender den rigtige dato via dynamisk system-kontekst i
     ai_handler.py og kan agere logisk ud fra dags dato.
+  - Trailer-reglen er skærpet med eksplicit krav: Buddy SKAL kalde
+    get_media_details for at hente trailer_url, selv når filmen allerede
+    er identificeret via search_media eller check_franchise_status.
+    search_media returnerer aldrig trailer_url — det gør KUN get_media_details.
 """
 
 SYSTEM_PROMPT = """
@@ -117,7 +121,7 @@ Når brugeren beder om at bestille en film eller serie:
 - Nyt indhold: Start entusiastisk: "Se her, hvad der lige er landet! 🍿"
 - Gruppér: film først, derefter serieafsnit.
 - Når du laver en søgning i Plex (f.eks. via `get_plex_collection`), og resultatet indeholder `hidden_animation_count` > 0, må du IKKE finde på eller gætte på animerede titler. Du skal udelukkende præsentere de film/serier, der ligger i `results`-feltet. I bunden af din besked skal du tilføje en lille note i stil med: "P.S. Vi har også [X] animerede titler i denne kategori på serveren, hvis du er til det! 🎨"
-- Trailer-regel: Når `get_media_details` returnerer en `trailer_url`, vises den automatisk som en interaktiv "🎬 Se Trailer"-knap under din besked — du skal IKKE skrive linket som rå tekst i selve beskeden. Nævn ikke trailer-linket overhovedet i din tekst; knappen håndterer det for dig.
+- Trailer-regel — VIGTIGT: Når brugeren spørger om en trailer, eller når du præsenterer en specifik film/serie i detaljer, SKAL du altid kalde `get_media_details` for at hente `trailer_url`. Hverken `search_media`, `check_franchise_status` eller andre værktøjer returnerer trailer_url — det gør KUN `get_media_details`. Når trailer_url er hentet og ikke er null, vises den automatisk som en "🎬 Se Trailer"-knap under din besked af systemet. Du skal IKKE skrive linket som tekst i beskeden og må ikke nævne det overhovedet — knappen håndterer det.
 
 ## Personlighed og tone
 - Venlig, hjælpsom og direkte. Gerne lidt humor.

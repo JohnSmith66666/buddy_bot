@@ -1,116 +1,371 @@
 """
-admin_handlers.py - Admin approval logic for Buddy.
+ai_handler.py - Agentic loop for Buddy.
 
 CHANGES vs previous version:
-  - Removed the circular import of `_awaiting_plex_username` from main.py.
-    Onboarding state is now written to the DB via database.approve_user(),
-    which sets onboarding_state = 'awaiting_plex' atomically with the
-    whitelist approval. No in-memory state needed.
+  - Importeret datetime fra datetime.
+  - get_ai_response() injicerer nu den aktuelle dato som et separat,
+    IKKE-cachet system-blok efter den cachede SYSTEM_PROMPT.
+    Dette er arkitektonisk korrekt: datoen ændrer sig hvert minut og
+    måtte IKKE bages ind i den cachede blok — det ville invalidere
+    cachen ved hvert eneste kald og eliminere al caching-gevinst.
+    Løsningen er to blokke i system-arrayet:
+      [0] SYSTEM_PROMPT         → cache_control: ephemeral (caches stabilt)
+      [1] dato-kontekst + user  → ingen cache_control (altid frisk)
+  - Alle øvrige funktioner (_dispatch, _slim_data, _trim osv.) er uændrede.
 """
 
+import json
 import logging
+from collections import defaultdict
+from datetime import datetime
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ContextTypes
+import anthropic
 
-import database
-from config import ADMIN_TELEGRAM_ID
+from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+from prompts import SYSTEM_PROMPT
+from services.plex_service import (
+    check_actor_on_plex,
+    check_franchise_on_plex,
+    check_library,
+    find_unwatched,
+    get_collection,
+    get_missing_from_collection,
+    get_on_deck,
+    get_plex_metadata,
+    get_similar_in_library,
+    search_by_actor,
+)
+from services.tmdb_service import (
+    get_media_details,
+    get_now_playing,
+    get_person_filmography,
+    get_recommendations,
+    get_trending,
+    get_upcoming,
+    get_watch_providers,
+    search_media,
+    search_person,
+)
+from services.tautulli_service import (
+    get_popular_on_plex,
+    get_recently_added,
+    get_user_history,
+    get_user_watch_stats,
+)
+from services.web_service import search_web
+from tools import TOOLS
 
 logger = logging.getLogger(__name__)
 
+_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
-async def notify_admin_new_user(update: Update) -> None:
+_histories: dict[int, list[dict]] = defaultdict(list)
+_MAX_HISTORY = 10
+_MAX_TOOL_RESULT_CHARS = 2000
+
+# Signal som Claude returnerer for at trigge bestillingsflow i main.py
+SEARCH_SIGNAL = "SHOW_SEARCH_RESULTS:"
+
+# Dansk mapning af engelske ugedags- og månedsnavne fra strftime
+_UGEDAGE = {
+    "Monday": "Mandag", "Tuesday": "Tirsdag", "Wednesday": "Onsdag",
+    "Thursday": "Torsdag", "Friday": "Fredag", "Saturday": "Lørdag",
+    "Sunday": "Søndag",
+}
+_MAANEDER = {
+    "January": "januar", "February": "februar", "March": "marts",
+    "April": "april", "May": "maj", "June": "juni",
+    "July": "juli", "August": "august", "September": "september",
+    "October": "oktober", "November": "november", "December": "december",
+}
+
+
+def _dansk_dato() -> str:
     """
-    Send the admin a notification with an approval button when an
-    unknown user tries to use Buddy.
-    Plain text only — no parse_mode — to avoid Markdown errors.
+    Returnerer den aktuelle dato og tid formateret på dansk.
+    Eksempel: 'Fredag d. 25. april 2025, kl. 14:37'
+
+    strftime er lokaliseret til engelsk på Railway — vi mapper manuelt
+    i stedet for at stole på locale-indstillinger i containerens miljø.
     """
-    user = update.effective_user
-    if user is None:
-        return
-
-    display = f"@{user.username}" if user.username else (user.first_name or "Ukendt")
-    text = (
-        f"🔔 Ny bruger ønsker adgang til Buddy\n\n"
-        f"Navn: {display}\n"
-        f"Telegram ID: {user.id}\n\n"
-        f"Vil du godkende denne bruger?"
-    )
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "Godkend ✅",
-            callback_data=f"approve_user:{user.id}",
-        )
-    ]])
-
-    try:
-        await update.get_bot().send_message(
-            chat_id=ADMIN_TELEGRAM_ID,
-            text=text,
-            reply_markup=keyboard,
-        )
-        logger.info("Admin notified about new user telegram_id=%s", user.id)
-    except Exception as e:
-        logger.error("Failed to notify admin: %s", e)
+    nu = datetime.now()
+    ugedag  = _UGEDAGE.get(nu.strftime("%A"), nu.strftime("%A"))
+    maaned  = _MAANEDER.get(nu.strftime("%B"), nu.strftime("%B"))
+    return f"{ugedag} d. {nu.day}. {maaned} {nu.year}, kl. {nu.strftime('%H:%M')}"
 
 
-async def handle_approve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def _trim(telegram_id: int) -> None:
+    h = _histories[telegram_id]
+    if len(h) > _MAX_HISTORY:
+        _histories[telegram_id] = h[-_MAX_HISTORY:]
+
+
+def _slim_data(data, max_list_items: int = 10):
     """
-    Handle the 'Godkend' button press from the admin.
-
-    - Whitelists the user in the database and sets onboarding_state = 'awaiting_plex'.
-    - Deletes the approval message from the Buddy chat.
-    - Sends a confirmation DM to the admin.
-    - Sends a plain-text welcome to the new user asking for Plex username.
-
-    No circular imports needed — state is fully DB-driven.
+    Rekursivt trim data-strukturen FØR JSON-serialisering.
+    Lister cappes til max_list_items — aldrig hård string-truncation.
+    Garanterer altid gyldig JSON output.
     """
-    query = update.callback_query
-    await query.answer()
+    if isinstance(data, list):
+        trimmed = data[:max_list_items]
+        result  = [_slim_data(item, max_list_items) for item in trimmed]
+        if len(data) > max_list_items:
+            result.append({"_truncated": f"{len(data) - max_list_items} flere elementer udeladt"})
+        return result
+    if isinstance(data, dict):
+        return {k: _slim_data(v, max_list_items) for k, v in data.items()}
+    if isinstance(data, str) and len(data) > 300:
+        return data[:297] + "..."
+    return data
 
-    if query.from_user.id != ADMIN_TELEGRAM_ID:
-        await query.answer("Du har ikke adgang til at godkende brugere.", show_alert=True)
-        return
+
+def _trim_tool_result(result: str) -> str:
+    """
+    Trim tool result til gyldig, kompakt JSON via strukturel trimming.
+    To pas: max 10 items, derefter max 5 hvis stadig for lang.
+    """
+    if len(result) <= _MAX_TOOL_RESULT_CHARS:
+        return result
+
+    logger.debug("Trimming tool result from %d chars", len(result))
+    try:
+        data    = json.loads(result)
+        slimmed = _slim_data(data)
+        compact = json.dumps(slimmed, ensure_ascii=False, separators=(",", ":"))
+        if len(compact) <= _MAX_TOOL_RESULT_CHARS:
+            return compact
+        slimmed2 = _slim_data(data, max_list_items=5)
+        return json.dumps(slimmed2, ensure_ascii=False, separators=(",", ":"))
+    except (json.JSONDecodeError, Exception) as e:
+        logger.warning("Could not parse tool result as JSON: %s", e)
+        return result
+
+
+async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None) -> str:
+    j = lambda x: json.dumps(x, ensure_ascii=False)
+
+    # ── Web-søgning ───────────────────────────────────────────────────────────
+    if tool_name == "search_web":
+        return j(await search_web(
+            query=tool_input["query"],
+            search_depth=tool_input.get("search_depth", "basic"),
+        ))
+
+    # ── TMDB ──────────────────────────────────────────────────────────────────
+    if tool_name == "search_media":
+        return j(await search_media(
+            tool_input["query"], tool_input.get("media_type", "both")
+        ))
+    if tool_name == "get_media_details":
+        return j(await get_media_details(
+            tool_input["tmdb_id"], tool_input["media_type"]
+        ))
+    if tool_name == "get_trending":
+        return j(await get_trending())
+    if tool_name == "get_recommendations":
+        return j(await get_recommendations(
+            tool_input["tmdb_id"], tool_input["media_type"]
+        ))
+    if tool_name == "get_watch_providers":
+        return j(await get_watch_providers(
+            tool_input["tmdb_id"], tool_input["media_type"]
+        ))
+    if tool_name == "search_person":
+        return j(await search_person(tool_input["query"]))
+    if tool_name == "get_person_filmography":
+        return j(await get_person_filmography(tool_input["person_id"]))
+    if tool_name == "get_now_playing":
+        return j(await get_now_playing())
+    if tool_name == "get_upcoming":
+        return j(await get_upcoming())
+
+    # ── Plex ──────────────────────────────────────────────────────────────────
+    if tool_name == "check_plex_library":
+        return j(await check_library(
+            tool_input["title"],
+            tool_input.get("year"),
+            tool_input["media_type"],
+            plex_username,
+        ))
+    if tool_name == "check_franchise_status":
+        return j(await check_franchise_on_plex(
+            keyword=tool_input["keyword"],
+            plex_username=plex_username,
+        ))
+    if tool_name == "get_plex_collection":
+        return j(await get_collection(
+            tool_input["keyword"],
+            tool_input.get("media_type", "movie"),
+            plex_username,
+        ))
+    if tool_name == "search_plex_by_actor":
+        return j(await check_actor_on_plex(
+            actor_name=tool_input["actor_name"],
+            plex_username=plex_username,
+        ))
+    if tool_name == "get_on_deck":
+        return j(await get_on_deck(plex_username))
+    if tool_name == "get_plex_metadata":
+        return j(await get_plex_metadata(
+            tool_input["title"], tool_input.get("year"), plex_username
+        ))
+    if tool_name == "find_unwatched":
+        return j(await find_unwatched(
+            tool_input["media_type"], tool_input.get("genre"), plex_username
+        ))
+    if tool_name == "get_similar_in_library":
+        return j(await get_similar_in_library(tool_input["title"], plex_username))
+    if tool_name == "get_missing_from_collection":
+        return j(await get_missing_from_collection(
+            tool_input["collection_name"], plex_username
+        ))
+
+    # ── Tautulli ──────────────────────────────────────────────────────────────
+    if tool_name == "get_popular_on_plex":
+        days = tool_input.get("days", 30)
+        return j(await get_popular_on_plex(
+            stats_count=tool_input.get("stats_count", 10),
+            time_range=days if days is not None else 30,
+        ))
+    if tool_name == "get_user_watch_stats":
+        if not plex_username:
+            return j({"error": "Intet Plex-brugernavn fundet."})
+        days       = tool_input.get("days")
+        query_days = days if days is not None else 365
+        return j(await get_user_watch_stats(
+            plex_username,
+            query_days=query_days,
+        ))
+    if tool_name == "get_user_history":
+        if not plex_username:
+            return j({"error": "Intet Plex-brugernavn fundet."})
+        return j(await get_user_history(
+            plex_username,
+            length=tool_input.get("length", 25),
+            query=tool_input.get("query"),
+            media_type=tool_input.get("media_type"),
+        ))
+    if tool_name == "get_recently_added":
+        return j(await get_recently_added(count=tool_input.get("count", 10)))
+
+    return j({"error": f"Ukendt vaerktoej: {tool_name}"})
+
+
+async def get_ai_response(
+    telegram_id: int,
+    user_message: str,
+    plex_username: str | None = None,
+) -> str:
+    """
+    Run the full agentic loop and return Buddy's reply.
+
+    System-prompt arkitektur (to blokke):
+      Blok 0 — SYSTEM_PROMPT med cache_control: ephemeral
+               Indeholder alle stabile instruktioner. Caches af Anthropic
+               og genbruges på tværs af kald så længe indholdet er uændret.
+
+      Blok 1 — Dynamisk kontekst UDEN cache_control
+               Indeholder aktuel dato og plex_username. Denne blok ændrer
+               sig ved hvert kald (dato varierer) og må aldrig caches —
+               det ville invalidere cache-blok 0 ved hvert request.
+    """
+    _histories[telegram_id].append({"role": "user", "content": user_message})
+    _trim(telegram_id)
+
+    # ── Blok 0: stabil, cachet system-prompt ──────────────────────────────────
+    system_blocks = [
+        {
+            "type": "text",
+            "text": SYSTEM_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+    # ── Blok 1: dynamisk kontekst — aldrig cachet ─────────────────────────────
+    dynamic_lines = [
+        f"Intern system-info (MÅ IKKE NÆVNES FOR BRUGEREN): "
+        f"I dag er det {_dansk_dato()}. "
+        f"Brug udelukkende denne information til at vurdere, "
+        f"om film/serier er udkommet eller ligger i fremtiden."
+    ]
+    if plex_username:
+        dynamic_lines.append(f"Den aktuelle bruger hedder '{plex_username}' på Plex.")
+
+    system_blocks.append({
+        "type": "text",
+        "text": "\n\n".join(dynamic_lines),
+        # Ingen cache_control — denne blok er altid frisk
+    })
+
+    # ── Tools med cache på det sidste element ────────────────────────────────
+    tools_with_cache = [dict(t) for t in TOOLS]
+    if tools_with_cache:
+        tools_with_cache[-1] = {
+            **tools_with_cache[-1],
+            "cache_control": {"type": "ephemeral"},
+        }
 
     try:
-        new_user_id = int(query.data.split(":")[1])
-    except (IndexError, ValueError):
-        logger.error("Malformed callback_data: %s", query.data)
-        return
+        while True:
+            response = await _client.messages.create(
+                model=ANTHROPIC_MODEL,
+                max_tokens=1024,
+                system=system_blocks,
+                tools=tools_with_cache,
+                messages=_histories[telegram_id],
+            )
 
-    # approve_user() now sets is_whitelisted=TRUE and onboarding_state='awaiting_plex'
-    # in a single DB call, so no in-memory registration is needed.
-    await database.approve_user(new_user_id)
+            usage = response.usage
+            if hasattr(usage, "cache_read_input_tokens") and usage.cache_read_input_tokens:
+                logger.info(
+                    "Cache HIT: %d cached, %d uncached, %d output tokens",
+                    usage.cache_read_input_tokens,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                )
+            else:
+                logger.info(
+                    "Cache MISS: %d input, %d output tokens",
+                    usage.input_tokens,
+                    usage.output_tokens,
+                )
 
-    user_row = await database.get_user(new_user_id)
-    display = user_row.get("telegram_name") or str(new_user_id) if user_row else str(new_user_id)
+            if response.stop_reason == "tool_use":
+                _histories[telegram_id].append(
+                    {"role": "assistant", "content": response.content}
+                )
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        logger.info("Tool call: %s(%s)", block.name, block.input)
+                        try:
+                            raw_result = await _dispatch(block.name, block.input, plex_username)
+                            result     = _trim_tool_result(raw_result)
+                        except Exception as e:
+                            logger.error("Tool dispatch error '%s': %s", block.name, e)
+                            result = json.dumps({"error": str(e)}, ensure_ascii=False)
+                        tool_results.append({
+                            "type":        "tool_result",
+                            "tool_use_id": block.id,
+                            "content":     result,
+                        })
+                _histories[telegram_id].append({"role": "user", "content": tool_results})
+                _trim(telegram_id)
+                continue
 
-    try:
-        await query.delete_message()
-    except Exception:
-        pass
+            reply = next(
+                (b.text for b in response.content if hasattr(b, "text")),
+                "Av, noget gik galt — prøv igen om lidt! 🔧",
+            )
+            _histories[telegram_id].append({"role": "assistant", "content": reply})
+            _trim(telegram_id)
+            return reply
 
-    try:
-        await context.bot.send_message(
-            chat_id=ADMIN_TELEGRAM_ID,
-            text=f"✅ {display} er nu godkendt og kan bruge Buddy.",
-        )
-    except Exception as e:
-        logger.error("Could not send admin confirmation: %s", e)
+    except anthropic.APIError as e:
+        logger.error("Anthropic error for user %s: %s", telegram_id, e)
+        _histories.pop(telegram_id, None)
+        return "Av, noget gik galt hos mig — prøv igen om lidt! 🔧"
 
-    welcome = (
-        "🎩 Du er nu godkendt!\n\n"
-        "For at jeg kan give dig personlige svar, skal jeg kende dit "
-        "Plex-brugernavn.\n\n"
-        "Skriv det herunder - jeg tjekker det med det samme 🎬"
-    )
-    try:
-        await context.bot.send_message(
-            chat_id=new_user_id,
-            text=welcome,
-        )
-    except Exception as e:
-        logger.error("Could not send welcome to user %s: %s", new_user_id, e)
 
-    logger.info("User %s approved by admin.", new_user_id)
+def clear_history(telegram_id: int) -> None:
+    _histories.pop(telegram_id, None)
