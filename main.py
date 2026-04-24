@@ -2,14 +2,19 @@
 main.py - Buddy bot entry point.
 
 CHANGES vs previous version:
-  - Tilføjet hjælpefunktion escape_markdown(text) der automatisk escaper
-    underscores inde i URL'er, så Telegrams Markdown-parser ikke krasjer
-    med 'Can't parse entities' på YouTube-links med underscores i video-ID'et.
-    Funktionen bruger re.sub med en URL-matching gruppe, og rammer KUN tegn
-    inde i URL'er — al anden Markdown-formatering forbliver uændret.
-  - escape_markdown() kaldes i handle_text() på Buddys svar, inden
-    update.message.reply_text() afsender beskeden.
-  - Alle øvrige handlers, webhook-server og lifecycle-hooks er uændrede.
+  - BUGFIX SyntaxWarning: docstring-eksemplet med invalid escape sequence
+    er erstattet med en beskrivende tekst. Python 3.12+ advarer om
+    backslash-sekvenser selv i docstrings og kommentarer.
+  - BUGFIX Trailer-knap i chat: handle_text() detekterer nu om Buddys
+    svar indeholder en youtu.be-URL (trailer fra get_media_details).
+    Hvis ja, strippes URL'en fra beskedteksten og sendes i stedet som
+    en separat InlineKeyboardButton ("🎬 Se Trailer") under beskeden.
+    Dette giver samme knap-oplevelse som i bestillingsflowet, uanset
+    om brugeren spørger direkte i chat eller via bestillingsknapper.
+  - _extract_trailer() hjælpefunktion tilføjet til URL-detektion og
+    tekstoprydning. Bruger raw strings korrekt i alle regex-patterns.
+  - escape_markdown() er bevaret og bruger raw string replacement
+    internt for at undgå SyntaxWarning i Python 3.12+.
 """
 
 import asyncio
@@ -18,7 +23,7 @@ import re
 import sys
 from aiohttp import web
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -47,26 +52,47 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Matches http(s):// URLs — captures the full URL as group 1.
+# Matcher youtu.be kort-URL'er — bruges til at detektere trailer-links i Buddys svar
+_TRAILER_RE = re.compile(r"https://youtu\.be/[A-Za-z0-9_\-]+")
+
+# Matcher alle http(s)-URL'er — bruges til escape af underscores i tekst-beskeder
 _URL_RE = re.compile(r"(https?://[^\s)\]>\"]+)")
 
 
 def escape_markdown(text: str) -> str:
     """
-    Escape underscores inside URLs so Telegram's Markdown parser doesn't
-    misinterpret them as italic markers and crash with 'Can't parse entities'.
+    Escaper underscores inde i URL'er saa Telegrams Markdown-parser ikke
+    misfortolker dem som kursiv-markoerer og kraesjer med 'Can't parse entities'.
 
-    Only characters *inside* a URL are touched — all other Markdown formatting
-    (bold, italic, inline code, etc.) in the surrounding text is left intact.
-
-    Example:
-        "🎬 Se traileren her: https://www.youtube.com/watch?v=ioKYnkD9_IM"
-        →  "🎬 Se traileren her: https://www.youtube.com/watch?v=ioKYnkD9\_IM"
+    Kun tegn inde i URL'er beroeres - al anden Markdown-formatering
+    (fed, kursiv, inline code osv.) i den omgivende tekst er uaendret.
+    Backslash-escapingen sker via raw string replacement internt.
     """
     def _escape_url(match: re.Match) -> str:
         return match.group(1).replace("_", r"\_")
 
     return _URL_RE.sub(_escape_url, text)
+
+
+def _extract_trailer(reply: str) -> tuple[str, str | None]:
+    """
+    Detekter og ekstraher en youtu.be trailer-URL fra Buddys svar.
+
+    Returnerer (renset_tekst, trailer_url) hvor:
+      - renset_tekst er svaret uden linjen der indeholder URL'en
+      - trailer_url er den fundne URL, eller None hvis ingen trailer fundet
+    """
+    match = _TRAILER_RE.search(reply)
+    if not match:
+        return reply, None
+
+    trailer_url = match.group(0)
+
+    # Fjern hele linjen der indeholder URL'en (inkl. evt. "Se trailer her:"-prefix)
+    cleaned = re.sub(r"[^\n]*" + re.escape(trailer_url) + r"[^\n]*\n?", "", reply)
+    cleaned = cleaned.rstrip()
+
+    return cleaned, trailer_url
 
 
 # ── Guards ────────────────────────────────────────────────────────────────────
@@ -225,17 +251,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Tjek om Claude returnerer et søge-signal
     if reply.startswith(SEARCH_SIGNAL):
-        # Format: SHOW_SEARCH_RESULTS:<query>:<media_type>
         parts = reply[len(SEARCH_SIGNAL):].split(":", 1)
         query_term = parts[0].strip()
         media_type = parts[1].strip() if len(parts) > 1 else "both"
         await show_search_results(update.message, query_term, media_type)
         return
 
-    # Escape underscores inde i URL'er så Telegrams Markdown-parser ikke krasjer
-    safe_reply = escape_markdown(reply)
+    # Detekter trailer-URL i svaret — send som knap i stedet for raa tekst
+    clean_reply, trailer_url = _extract_trailer(reply)
 
-    await update.message.reply_text(safe_reply, parse_mode="Markdown")
+    if trailer_url:
+        # Send tekstbesked uden URL + trailer-knap nedenunder
+        safe_reply = escape_markdown(clean_reply)
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🎬 Se Trailer", url=trailer_url)
+        ]])
+        await update.message.reply_text(
+            safe_reply,
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        logger.info("Trailer-knap sendt: %s", trailer_url)
+    else:
+        # Normalt svar uden trailer
+        safe_reply = escape_markdown(reply)
+        await update.message.reply_text(safe_reply, parse_mode="Markdown")
+
     await database.log_message(user.id, "outgoing", reply)
 
 
