@@ -216,6 +216,13 @@ async def show_confirmation(
     rating_key = plex_check.get("ratingKey", "")
     plex_rating = plex_check.get("rating")  # IMDb-score fra Plex, None hvis ikke på serveren
 
+    logger.info(
+        "Rating — Plex: %s, TMDB: %s, bruger: %s",
+        plex_rating,
+        details.get("vote_average"),
+        "Plex" if plex_rating is not None else "TMDB (fallback)",
+    )
+
     # ── Byg knap-rækker ───────────────────────────────────────────────────────
     button_rows = []
 
