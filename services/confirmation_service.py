@@ -210,20 +210,21 @@ async def show_confirmation(
         title, int(year) if year else None, media_type, plex_username
     )
     on_plex    = plex_check.get("status") == STATUS_FOUND
-    rating_key = plex_check.get("ratingKey")
-    machine_id = plex_check.get("machineIdentifier")
+    machine_id = plex_check.get("machineIdentifier", "")
+    rating_key = plex_check.get("ratingKey", "")
 
     # ── Byg knap-rækker ───────────────────────────────────────────────────────
     button_rows = []
 
     if on_plex:
-        if rating_key and machine_id:
-            plex_url = (
-                f"https://app.plex.tv/desktop/#!/server/{machine_id}"
-                f"/details?key=%2Flibrary%2Fmetadata%2F{rating_key}"
-            )
-        else:
-            plex_url = "https://app.plex.tv"
+        plex_url = (
+            f"https://app.plex.tv/desktop/#!/server/{machine_id}"
+            f"/details?key=%2Flibrary%2Fmetadata%2F{rating_key}"
+        )
+        logger.info(
+            "Plex URL genereret — machineId=%r ratingKey=%r url=%s",
+            machine_id, rating_key, plex_url,
+        )
         button_rows.append([InlineKeyboardButton("▶️ Se på Plex", url=plex_url)])
     else:
         button_rows.append([
