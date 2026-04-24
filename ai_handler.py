@@ -2,22 +2,29 @@
 ai_handler.py - Agentic loop for Buddy.
 
 CHANGES vs previous version:
-  - Importeret datetime fra datetime.
-  - get_ai_response() injicerer nu den aktuelle dato som et separat,
-    IKKE-cachet system-blok efter den cachede SYSTEM_PROMPT.
-    Dette er arkitektonisk korrekt: datoen ændrer sig hvert minut og
-    måtte IKKE bages ind i den cachede blok — det ville invalidere
-    cachen ved hvert eneste kald og eliminere al caching-gevinst.
-    Løsningen er to blokke i system-arrayet:
-      [0] SYSTEM_PROMPT         → cache_control: ephemeral (caches stabilt)
-      [1] dato-kontekst + user  → ingen cache_control (altid frisk)
-  - Alle øvrige funktioner (_dispatch, _slim_data, _trim osv.) er uændrede.
+  - Importeret ZoneInfo fra zoneinfo (med try/except fallback).
+  - _dansk_dato() bruger nu datetime.now(ZoneInfo("Europe/Copenhagen"))
+    for korrekt dansk tid på Railway (der kører UTC).
+  - _dansk_dato() returnerer nu ISO-datoen (YYYY-MM-DD) forrest i strengen,
+    efterfulgt af den danske tekst i parentes.
+    Eksempel: '2026-04-24 (Fredag d. 24. april 2026, kl. 19:42)'
+    Dette gør det muligt for Claude at sammenligne direkte med TMDB's
+    release_date-felter (som også er YYYY-MM-DD) uden konvertering.
+  - dynamic_lines (Blok 1) indeholder nu en eksplicit instruktion om at
+    sammenligne release_date med ISO-datoen for at afgøre om en film
+    er udkommet eller ej.
+  - Alle øvrige funktioner er uændrede.
 """
 
 import json
 import logging
 from collections import defaultdict
 from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo
+    _TZ_COPENHAGEN = ZoneInfo("Europe/Copenhagen")
+except Exception:
+    _TZ_COPENHAGEN = None
 
 import anthropic
 
@@ -86,16 +93,25 @@ _MAANEDER = {
 
 def _dansk_dato() -> str:
     """
-    Returnerer den aktuelle dato og tid formateret på dansk.
-    Eksempel: 'Fredag d. 25. april 2025, kl. 14:37'
+    Returnerer den aktuelle dato og tid i Copenhagen-tidszone formateret på dansk.
 
-    strftime er lokaliseret til engelsk på Railway — vi mapper manuelt
-    i stedet for at stole på locale-indstillinger i containerens miljø.
+    Output-format: '2026-04-24 (Fredag d. 24. april 2026, kl. 19:42)'
+    ISO-datoen (YYYY-MM-DD) placeres forrest så Claude kan sammenligne den
+    direkte med TMDB's release_date-felter uden konvertering.
+
+    Bruger ZoneInfo("Europe/Copenhagen") for korrekt dansk tid på Railway
+    (der kører UTC). Falder tilbage til datetime.now() hvis zoneinfo fejler.
+    strftime-output er engelsk på Railway — vi mapper manuelt til dansk.
     """
-    nu = datetime.now()
+    try:
+        nu = datetime.now(_TZ_COPENHAGEN) if _TZ_COPENHAGEN else datetime.now()
+    except Exception:
+        nu = datetime.now()
+    iso     = nu.strftime("%Y-%m-%d")
     ugedag  = _UGEDAGE.get(nu.strftime("%A"), nu.strftime("%A"))
     maaned  = _MAANEDER.get(nu.strftime("%B"), nu.strftime("%B"))
-    return f"{ugedag} d. {nu.day}. {maaned} {nu.year}, kl. {nu.strftime('%H:%M')}"
+    dansk   = f"{ugedag} d. {nu.day}. {maaned} {nu.year}, kl. {nu.strftime('%H:%M')}"
+    return f"{iso} ({dansk})"
 
 
 def _trim(telegram_id: int) -> None:
@@ -287,10 +303,10 @@ async def get_ai_response(
 
     # ── Blok 1: dynamisk kontekst — aldrig cachet ─────────────────────────────
     dynamic_lines = [
-        f"Intern system-info (MÅ IKKE NÆVNES FOR BRUGEREN): "
-        f"I dag er det {_dansk_dato()}. "
-        f"Brug udelukkende denne information til at vurdere, "
-        f"om film/serier er udkommet eller ligger i fremtiden."
+        f"Intern system-info (MÅ IKKE NÆVNES FOR BRUGEREN):\n"
+        f"Dags dato er: {_dansk_dato()}.\n"
+        f"Når du vurderer om en film er udkommet, SKAL du sammenligne filmens "
+        f"'release_date' (YYYY-MM-DD) direkte med ISO-datoen ovenfor."
     ]
     if plex_username:
         dynamic_lines.append(f"Den aktuelle bruger hedder '{plex_username}' på Plex.")
