@@ -15,16 +15,13 @@ TOKEN OPTIMISATION (data-diæt):
     which is called explicitly when the user asks for them.
 
 CHANGES vs previous version:
-  - Tilføjet _clean_title() hjælpefunktion:
-    Fjerner indhold i parenteser (f.eks. '(US)', '(2021)'), specialtegn og
-    ekstra mellemrum inden sammenligning. Løser falske negativer for serier
-    som 'Euphoria (US)' og 'Invincible (2021)'.
-  - _check_sync bruger nu tre-lags matching:
-    Lag 1: Eksakt normaliseret match (_titles_match) — hurtigst, bruges altid.
-    Lag 2: Renset titel-match (_clean_title) — fanger regions-tags og årstals-suffiks.
-    Lag 3: Substring-match på rensede titler — fanger delvise matches begge veje.
-  - _year_ok_for_tv() tolerance sat til 2 år for shows.
-  - Søger korrekt i alle TV-sektioner (dækker opdelte biblioteker).
+  - _clean_title() og _titles_match_fuzzy() tilføjet for robust TV-matching.
+    Fanger Plex-titler med regions-tags eller årstal i parentes
+    (f.eks. 'Euphoria (US)', 'Invincible (2021)').
+  - _check_sync bruger tre-lags matching: eksakt → renset → substring.
+  - _collection_sync opdelt i main_results og animated_results:
+    Returnerer {"results": [top 10 ikke-animation], "hidden_animation_count": N}
+    så Lego-film og tegnefilm ikke fortrænger blockbusters fra Marvel-søgninger.
 """
 
 import asyncio
@@ -58,6 +55,9 @@ _TMDB_LANG = "da-DK"
 # Max år en series årstal må afvige og stadig godkendes.
 _TV_YEAR_TOLERANCE = 2
 
+# Antal ikke-animerede resultater der returneres fra get_plex_collection.
+_COLLECTION_MAX_MAIN = 10
+
 
 # ── Lightweight item serialiser ───────────────────────────────────────────────
 
@@ -78,6 +78,12 @@ def _slim(item) -> dict:
         "genres":  genres,
         "summary": summary or None,
     }
+
+
+def _is_animation(item) -> bool:
+    """Returnerer True hvis titlen har genren 'Animation' (case-insensitive)."""
+    genres = [g.tag.lower() for g in getattr(item, "genres", [])]
+    return "animation" in genres
 
 
 # ── Title normalisation ───────────────────────────────────────────────────────
@@ -102,51 +108,33 @@ def _clean_title(title: str) -> str:
     """
     Aggressiv titel-rensning til fuzzy matching.
 
-    Formål: fange tilfælde hvor Plex har tilføjet regions-tags eller årstal
-    direkte i show-titlen, f.eks.:
-      'Euphoria (US)'   → 'euphoria'
+    Fjerner indhold i parenteser (f.eks. '(US)', '(2021)'), specialtegn
+    og leading articles. Bruges KUN til sammenlignings-formål.
+
+    Eksempler:
+      'Euphoria (US)'     → 'euphoria'
       'Invincible (2021)' → 'invincible'
-      'The Bear: Season 2' → 'bear season 2'
-
-    Trin:
-      1. Fjern alt indhold i parenteser inkl. parenteserne selv.
-      2. Fjern specialtegn (kolon, komma, bindestreg, punktum osv.).
-      3. Lowercase + kollaps mellemrum.
-      4. Strip leading articles (the, a, an, den, det, en, et).
-
-    Returnerer en simpel lowercase-streng uden parenteser eller tegnsætning.
-    Bruges KUN til sammenlignings-formål — aldrig til at overskrive titler.
+      'The Bear: S2'      → 'bear s2'
     """
     s = title.lower()
-    # Fjern alt i parenteser: (US), (2021), (UK), osv.
-    s = re.sub(r"\([^)]*\)", "", s)
-    # Fjern specialtegn — behold bogstaver, tal og mellemrum
-    s = re.sub(r"[^a-z0-9\s]", "", s)
-    # Kollaps mellemrum
+    s = re.sub(r"\([^)]*\)", "", s)          # fjern alt i parenteser
+    s = re.sub(r"[^a-z0-9\s]", "", s)        # fjern specialtegn
     s = re.sub(r"\s+", " ", s).strip()
-    # Strip leading articles
     s = re.sub(r"^(the|a|an|den|det|en|et)\s+", "", s)
     return s
 
 
 def _titles_match(title_a: str, title_b: str) -> bool:
-    """Eksakt normaliseret match (Lag 1)."""
+    """Lag 1 — eksakt normaliseret match."""
     return _normalise(title_a) == _normalise(title_b)
 
 
 def _titles_match_fuzzy(title_a: str, title_b: str) -> bool:
     """
-    Fuzzy match via _clean_title (Lag 2 + 3).
+    Lag 2 + 3 — fuzzy match via _clean_title.
 
     Lag 2: Identiske rensede titler.
-    Lag 3: Den ene er en direkte substring af den anden.
-            Eksempel: 'invincible' er substring af 'invincible 2021'
-            eller 'euphoria' er substring af 'euphoria us'.
-
-    Substring-tjekket er bevidst asymmetrisk — begge retninger tjekkes,
-    så både kortere Plex-titler og kortere TMDB-titler kan matche.
-    Minimumslængde på 4 tegn for substring-match for at undgå falske positiver
-    på meget korte ord (f.eks. 'er', 'in', 'it').
+    Lag 3: Den ene er substring af den anden (min. 4 tegn).
     """
     clean_a = _clean_title(title_a)
     clean_b = _clean_title(title_b)
@@ -154,11 +142,9 @@ def _titles_match_fuzzy(title_a: str, title_b: str) -> bool:
     if not clean_a or not clean_b:
         return False
 
-    # Lag 2: identiske rensede titler
     if clean_a == clean_b:
         return True
 
-    # Lag 3: substring begge veje (med minimumslængde)
     min_len = 4
     if len(clean_a) >= min_len and len(clean_b) >= min_len:
         if clean_a in clean_b or clean_b in clean_a:
@@ -170,8 +156,7 @@ def _titles_match_fuzzy(title_a: str, title_b: str) -> bool:
 def _year_ok_for_tv(item_year: int | None, query_year: int | None) -> bool:
     """
     Løs årstals-validering for TV-shows.
-    Godkender match hvis årstallet mangler i enten Plex eller TMDB,
-    eller hvis afvigelsen er inden for _TV_YEAR_TOLERANCE (2 år).
+    Godkender hvis årstal mangler, eller afviger max _TV_YEAR_TOLERANCE år.
     """
     if item_year is None or query_year is None:
         return True
@@ -361,7 +346,10 @@ async def get_collection(
     media_type: str,
     plex_username: str | None = None,
 ) -> dict:
-    """Search Plex for all titles matching a keyword. Capped at 25 results."""
+    """
+    Search Plex for all titles matching a keyword.
+    Returnerer top 10 ikke-animerede resultater + antal skjulte animerede titler.
+    """
     try:
         return await asyncio.to_thread(
             partial(_collection_sync, keyword=keyword,
@@ -470,29 +458,13 @@ def _check_sync(
     """
     check_library — tre-lags fuzzy titel-matching.
 
-    Lag 1 — Eksakt normaliseret match (_titles_match):
-      Den hurtige vej. Normaliserer begge titler (lowercase, strip accenter,
-      fjern punktuation, strip artikel) og sammenligner direkte.
-      Matcher f.eks. 'Euphoria' mod 'euphoria' eller 'The Bear' mod 'bear'.
+    Lag 1: Eksakt normaliseret match (_titles_match).
+    Lag 2: Identiske rensede titler via _clean_title — fanger '(US)', '(2021)' osv.
+    Lag 3: Substring-match på rensede titler (min. 4 tegn begge veje).
 
-    Lag 2 — Renset titel-match (_clean_title, identiske strenge):
-      Fjerner derudover alt indhold i parenteser inden sammenligning.
-      Matcher f.eks. 'Euphoria' mod 'Euphoria (US)' eller
-      'Invincible' mod 'Invincible (2021)'.
-
-    Lag 3 — Substring-match på rensede titler:
-      Godkender hvis den ene rensede titel er en direkte substring af den anden.
-      Matcher f.eks. 'Invincible' mod 'Invincible 2021' (uden parentes),
-      eller 'Euphoria' mod 'Euphoria US'.
-      Minimumslængde på 4 tegn forhindrer falske positiver på korte ord.
-
-    For TV-shows:
-      - Årstals-match er løst: +/- _TV_YEAR_TOLERANCE år eller manglende år.
-      - Antal afsnit/filer tælles IKKE — Show-objektets eksistens er nok.
-      - Alle TV-sektioner gennemsøges (dækker opdelte biblioteker).
-
-    For film:
-      - Årstals-match er strengt: max 1 års afvigelse.
+    TV-shows: løst årstals-match (+/- _TV_YEAR_TOLERANCE), kun show-eksistens tæller.
+    Film: strengt årstals-match (max 1 års afvigelse).
+    Alle sektioner af den givne type gennemsøges.
     """
     is_tv     = (media_type == "tv")
     plex_type = _TV_TYPE if is_tv else _MOVIE_TYPE
@@ -503,39 +475,30 @@ def _check_sync(
 
     sections = _sections(plex, plex_type)
     if not sections:
-        logger.warning(
-            "check_library: ingen sektioner af type '%s' fundet", plex_type
-        )
+        logger.warning("check_library: ingen sektioner af type '%s' fundet", plex_type)
 
     for section in sections:
         logger.debug(
             "check_library: søger i '%s' efter '%s' [%s]",
             section.title, title, media_type,
         )
-
         for item in _safe_search(section, title):
             item_title = getattr(item, "title", "") or ""
             item_year  = getattr(item, "year", None)
 
-            # ── Titel-matching (tre lag) ───────────────────────────────────────
-            lag1 = _titles_match(item_title, title)
+            lag1      = _titles_match(item_title, title)
             lag2_or_3 = _titles_match_fuzzy(item_title, title)
 
             if not (lag1 or lag2_or_3):
-                logger.debug(
-                    "check_library: ingen match — plex='%s' query='%s'",
-                    item_title, title,
-                )
                 continue
 
             match_lag = 1 if lag1 else "2/3"
 
-            # ── Årstals-validering ─────────────────────────────────────────────
             if is_tv:
                 if not _year_ok_for_tv(item_year, year):
                     logger.debug(
-                        "check_library: TV årstals-afvisning — item=%s query=%s tolerance=%s",
-                        item_year, year, _TV_YEAR_TOLERANCE,
+                        "check_library: TV årstals-afvisning — item=%s query=%s",
+                        item_year, year,
                     )
                     continue
             else:
@@ -546,22 +509,14 @@ def _check_sync(
                     )
                     continue
 
-            # ── Match fundet ───────────────────────────────────────────────────
             logger.info(
                 "Plex HIT (lag %s): '%s' (%s) i '%s' [%s] — søgt på '%s' (%s)",
                 match_lag, item_title, item_year, section.title,
                 plex_type, title, year,
             )
-            return {
-                "status": STATUS_FOUND,
-                "title":  item_title,
-                "year":   item_year,
-            }
+            return {"status": STATUS_FOUND, "title": item_title, "year": item_year}
 
-    logger.info(
-        "Plex MISS: '%s' (%s) ikke fundet i nogen %s-sektion",
-        title, year, plex_type,
-    )
+    logger.info("Plex MISS: '%s' (%s) ikke fundet i nogen %s-sektion", title, year, plex_type)
     return {"status": STATUS_MISSING}
 
 
@@ -570,24 +525,74 @@ def _collection_sync(
     media_type: str,
     plex_username: str | None = None,
 ) -> dict:
-    """get_collection — returns slim items, capped at _MAX_RESULTS."""
+    """
+    get_plex_collection — søg efter franchise/keyword med animations-filter.
+
+    FIX: Resultater opdeles i to lister baseret på genre:
+      - main_results:     Titler der IKKE har genren 'Animation'.
+                          Sorteres efter år (nyeste først), derefter rating.
+                          Begrænses til _COLLECTION_MAX_MAIN (10) titler.
+      - animated_results: Titler der HAR genren 'Animation'.
+                          Tælles men returneres IKKE til AI'en — forhindrer
+                          Lego-film og tegnefilm i at fortrænge blockbusters
+                          ved franchise-søgninger (f.eks. 'Marvel', 'Star Wars').
+
+    Returnerer:
+      {
+        "status": "ok",
+        "keyword": "Marvel",
+        "results": [top 10 ikke-animerede titler],
+        "hidden_animation_count": 7   ← bruges af Buddy til at nævne animerede titler
+      }
+
+    Buddy-prompten instruerer Claude til at nævne hidden_animation_count
+    som en P.S.-note uden at opfinde titler.
+    """
     plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
     norm_keyword = _normalise(keyword)
-    matches = []
+    main_results     = []
+    animated_results = []
 
     for section in _sections(plex, plex_type):
         for item in _safe_search(section, keyword):
             item_title = getattr(item, "title", "") or ""
-            if norm_keyword.split()[0] in _normalise(item_title):
-                matches.append(_slim(item))
 
-    matches.sort(key=lambda x: x.get("year") or 0)
-    capped = matches[:_MAX_RESULTS]
-    return {"status": "ok", "found": capped, "count": len(capped)}
+            # Tjek at titlen faktisk matcher keywordet
+            if norm_keyword.split()[0] not in _normalise(item_title):
+                continue
+
+            # Opdel på animation-genre
+            if _is_animation(item):
+                animated_results.append(item)
+            else:
+                main_results.append(item)
+
+    # Sortér ikke-animerede: nyeste år først, derefter højest rating
+    main_results.sort(
+        key=lambda x: (
+            getattr(x, "year", 0) or 0,
+            getattr(x, "audienceRating", 0) or 0,
+        ),
+        reverse=True,
+    )
+
+    top_main = [_slim(i) for i in main_results[:_COLLECTION_MAX_MAIN]]
+
+    logger.info(
+        "get_plex_collection '%s': %d ikke-animerede (viser %d), %d animerede (skjult)",
+        keyword, len(main_results), len(top_main), len(animated_results),
+    )
+
+    return {
+        "status":                "ok",
+        "keyword":               keyword,
+        "results":               top_main,
+        "hidden_animation_count": len(animated_results),
+    }
 
 
 def _on_deck_sync(plex_username: str | None = None) -> dict:
@@ -631,7 +636,8 @@ def _metadata_sync(
             for item in _safe_search(section, title):
                 item_title = getattr(item, "title", "") or ""
                 item_year  = getattr(item, "year", None)
-                if not (_titles_match(item_title, title) or _titles_match_fuzzy(item_title, title)):
+                if not (_titles_match(item_title, title) or
+                        _titles_match_fuzzy(item_title, title)):
                     continue
                 if year and item_year and abs(item_year - year) > 1:
                     continue
@@ -652,8 +658,8 @@ def _unwatched_sync(
     plex_username: str | None = None,
 ) -> dict:
     """find_unwatched — slim items, capped at 6 random picks."""
-    plex_type = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
-    plex = _connect(plex_username)
+    plex_type  = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
+    plex       = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
 
@@ -680,8 +686,7 @@ def _unwatched_sync(
             unwatched.append(_slim(item))
 
     random.shuffle(unwatched)
-    suggestions = unwatched[:6]
-    return {"status": "ok", "suggestions": suggestions, "total_unwatched": len(unwatched)}
+    return {"status": "ok", "suggestions": unwatched[:6], "total_unwatched": len(unwatched)}
 
 
 def _similar_sync(title: str, plex_username: str | None = None) -> dict:
@@ -696,8 +701,8 @@ def _similar_sync(title: str, plex_username: str | None = None) -> dict:
     for plex_type in (_MOVIE_TYPE, _TV_TYPE):
         for section in _sections(plex, plex_type):
             for item in _safe_search(section, title):
-                if _titles_match(getattr(item, "title", ""), title) or \
-                   _titles_match_fuzzy(getattr(item, "title", ""), title):
+                if (_titles_match(getattr(item, "title", ""), title) or
+                        _titles_match_fuzzy(getattr(item, "title", ""), title)):
                     source_item    = item
                     source_section = section
                     break
@@ -807,11 +812,11 @@ def _missing_sync(collection_name: str, plex_username: str | None = None) -> dic
             missing_from_plex.append(entry)
 
     return {
-        "status": "ok",
-        "collection": collection_name,
-        "found_in_plex":     found_in_plex[:_MAX_RESULTS],
+        "status":          "ok",
+        "collection":      collection_name,
+        "found_in_plex":   found_in_plex[:_MAX_RESULTS],
         "missing_from_plex": missing_from_plex[:_MAX_RESULTS],
-        "total_checked":     len(relevant),
+        "total_checked":   len(relevant),
     }
 
 
