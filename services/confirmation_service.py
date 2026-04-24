@@ -1,9 +1,19 @@
 """
 services/confirmation_service.py - Inline keyboard bekræftelsesflow.
 
+CHANGES vs previous version:
+  - show_confirmation() gemmer nu trailer_url fra TMDB-detaljerne i
+    pending-data (new_token), så den er tilgængelig til knappen.
+  - Keyboard i show_confirmation() har fået en "🎬 Se Trailer"-knap
+    øverst som en url_button (InlineKeyboardButton med url=trailer_url).
+    Knappen vises kun hvis trailer_url ikke er None.
+  - Buddys system prompt instrueres om IKKE at skrive trailer-linket
+    som rå tekst, da det nu håndteres via knappen.
+  - Alle øvrige handlers (show_search_results, execute_order) er uændrede.
+
 Håndterer:
 1. Præsentation af søgeresultater som Inline Buttons
-2. Visning af medie-detaljer med Bekræft/Annuller knapper
+2. Visning af medie-detaljer med Trailer/Bestil/Annuller knapper
 3. Selve bestillingen til Radarr eller Sonarr ved bekræftelse
 
 Callback data format (max 64 bytes):
@@ -53,21 +63,20 @@ async def show_search_results(
     top = results[:5]
     buttons = []
     for item in top:
-        title = item.get("title") or "Ukendt"
-        year  = (item.get("release_date") or item.get("first_air_date") or "")[:4]
-        mtype = item.get("media_type", media_type if media_type != "both" else "movie")
+        title   = item.get("title") or "Ukendt"
+        year    = (item.get("release_date") or item.get("first_air_date") or "")[:4]
+        mtype   = item.get("media_type", media_type if media_type != "both" else "movie")
         tmdb_id = item.get("id")
 
         label = f"{title} ({year})" if year else title
 
-        # Gem en lille token i callback_data: "pick:<token>"
         token = _make_token()
         await database.save_pending_request(token, message.chat_id, {
             "media_type": mtype,
-            "tmdb_id": tmdb_id,
-            "title": title,
-            "year": int(year) if year else None,
-            "step": "picked",
+            "tmdb_id":    tmdb_id,
+            "title":      title,
+            "year":       int(year) if year else None,
+            "step":       "picked",
         })
 
         buttons.append([InlineKeyboardButton(label, callback_data=f"pick:{token}")])
@@ -82,7 +91,7 @@ async def show_search_results(
     return True
 
 
-# ── Step 2: Vis detaljer + Bekræft/Annuller ───────────────────────────────────
+# ── Step 2: Vis detaljer + Trailer / Bestil / Annuller ────────────────────────
 
 async def show_confirmation(
     query_callback,  # telegram CallbackQuery object
@@ -90,7 +99,11 @@ async def show_confirmation(
     plex_username: str | None,
 ) -> None:
     """
-    Fetch full details for the picked title and show confirm/cancel buttons.
+    Fetch full details for the picked title and show action buttons.
+
+    Keyboard-rækkefølge (øverst til nederst):
+      [🎬 Se Trailer]          ← kun hvis trailer_url er tilgængelig
+      [✅ Bestil]  [❌ Annuller]
     """
     # Hent den gemte partial data
     pending = await database.get_pending_request(token)
@@ -107,25 +120,27 @@ async def show_confirmation(
         await query_callback.edit_message_text("Kunne ikke hente detaljer — prøv igen.")
         return
 
-    title    = details.get("title") or pending["title"]
-    year     = details.get("release_date", details.get("first_air_date", ""))[:4]
-    overview = details.get("overview") or "Ingen beskrivelse."
-    genres   = details.get("genres", [])
-    orig_lang = details.get("original_language", "en")
-    tvdb_id  = details.get("tvdb_id")
-    seasons  = details.get("season_numbers", [])
+    title       = details.get("title") or pending["title"]
+    year        = details.get("release_date", details.get("first_air_date", ""))[:4]
+    overview    = details.get("overview") or "Ingen beskrivelse."
+    genres      = details.get("genres", [])
+    orig_lang   = details.get("original_language", "en")
+    tvdb_id     = details.get("tvdb_id")
+    seasons     = details.get("season_numbers", [])
+    trailer_url = details.get("trailer_url")  # kan være None
 
-    # Gem fuld data til bekræftelse
+    # Gem fuld data til bekræftelse — inkl. trailer_url til evt. genbrug
     new_token = _make_token()
     await database.save_pending_request(new_token, query_callback.from_user.id, {
-        "media_type":         media_type,
-        "tmdb_id":            tmdb_id,
-        "tvdb_id":            tvdb_id,
-        "title":              title,
-        "year":               int(year) if year else None,
-        "genres":             genres,
-        "original_language":  orig_lang,
-        "season_numbers":     seasons,
+        "media_type":        media_type,
+        "tmdb_id":           tmdb_id,
+        "tvdb_id":           tvdb_id,
+        "title":             title,
+        "year":              int(year) if year else None,
+        "genres":            genres,
+        "original_language": orig_lang,
+        "season_numbers":    seasons,
+        "trailer_url":       trailer_url,
     })
 
     # Byg beskeden
@@ -142,17 +157,23 @@ async def show_confirmation(
     if media_type == "tv" and seasons:
         text += f"\n\n📺 {len(seasons)} sæson{'er' if len(seasons) != 1 else ''}"
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Bestil", callback_data=f"confirm:{new_token}"),
-            InlineKeyboardButton("❌ Annuller", callback_data=f"cancel:{new_token}"),
-        ]
+    # Byg keyboard — trailer-knap øverst, kun hvis URL er tilgængelig
+    button_rows = []
+
+    if trailer_url:
+        button_rows.append([
+            InlineKeyboardButton("🎬 Se Trailer", url=trailer_url)
+        ])
+
+    button_rows.append([
+        InlineKeyboardButton("✅ Bestil",    callback_data=f"confirm:{new_token}"),
+        InlineKeyboardButton("❌ Annuller",  callback_data=f"cancel:{new_token}"),
     ])
 
     await query_callback.edit_message_text(
         text,
         parse_mode="Markdown",
-        reply_markup=keyboard,
+        reply_markup=InlineKeyboardMarkup(button_rows),
     )
 
 

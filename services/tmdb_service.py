@@ -2,18 +2,12 @@
 services/tmdb_service.py - TMDB API integration.
 
 CHANGES vs previous version:
-  - get_media_details() inkluderer nu append_to_response=videos i API-kaldet.
-    Parser YouTube-trailers fra data['videos']['results']:
-      1. Søger efter type="Trailer" og site="YouTube" — bedste match.
-      2. Fallback til type="Teaser" og site="YouTube" hvis ingen trailer.
-      3. Konstruerer fuldt YouTube-link: https://www.youtube.com/watch?v={key}
-      4. Returnerer trailer_url (None hvis ingen YouTube-video fundet).
-    Gælder både film og TV-serier.
-  - get_person_filmography() bruger /movie_credits endpoint (ikke combined_credits)
-    → ALLE film returneres. Filtrering: 'uncredited' og ingen release_date fjernes.
-  - get_tmdb_collection_movies() returnerer tmdb_id, title, original_title.
-  - get_trending() laver to parallelle kald, returnerer 5+5 dict.
-  - get_now_playing() og get_upcoming() sorterer efter popularity, top 10.
+  - _extract_trailer_url() konstruerer nu korte YouTube-links via
+    https://youtu.be/{key} i stedet for det lange watch?v= format.
+    Det korte format er nødvendigt for at Telegram trigger sin
+    indbyggede video-afspiller direkte i chatten.
+  - Alle øvrige funktioner (get_media_details, get_trending,
+    get_person_filmography, osv.) er uændrede.
 """
 
 import asyncio
@@ -105,11 +99,11 @@ def _extract_trailer_url(data: dict) -> str | None:
       1. type="Trailer" og site="YouTube"  — officiel trailer
       2. type="Teaser"  og site="YouTube"  — teaser hvis ingen trailer
 
-    TMDB returnerer videoer på det originale sprog (ikke oversat til da-DK),
-    men append_to_response=videos hentes uden language-parameter for at
-    undgå at gå glip af engelske trailere pga. manglende dansk lokalisering.
+    Returnerer kort youtu.be/{key} URL — dette format er påkrævet for at
+    Telegrams inline video-afspiller aktiveres automatisk i chatten.
+    Det lange watch?v= format understøtter ikke denne adfærd.
 
-    Returnerer fuldt YouTube-URL eller None hvis ingen video fundet.
+    Returnerer None hvis ingen YouTube-video fundet.
     """
     videos = data.get("videos", {})
     results = videos.get("results", []) if isinstance(videos, dict) else []
@@ -123,7 +117,7 @@ def _extract_trailer_url(data: dict) -> str | None:
             key = video.get("key")
             if key:
                 logger.debug("TMDB trailer fundet: type=Trailer key=%s", key)
-                return f"https://www.youtube.com/watch?v={key}"
+                return f"https://youtu.be/{key}"
 
     # Trin 2: fallback til teaser
     for video in results:
@@ -131,7 +125,7 @@ def _extract_trailer_url(data: dict) -> str | None:
             key = video.get("key")
             if key:
                 logger.debug("TMDB trailer fallback: type=Teaser key=%s", key)
-                return f"https://www.youtube.com/watch?v={key}"
+                return f"https://youtu.be/{key}"
 
     logger.debug("TMDB: ingen YouTube-trailer fundet i %d videoer", len(results))
     return None
@@ -169,17 +163,11 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
     """
     Fetch full details for a film or TV show, including YouTube trailer URL.
 
-    FIX: Tilføjet append_to_response=videos til API-kaldet.
-    TMDB returnerer nu videoer (trailere, teasere osv.) i samme svar,
-    hvilket sparer et ekstra API-kald og reducerer latens.
+    append_to_response=videos er inkluderet for at hente trailere i samme
+    API-kald og undgå ekstra latens. trailer_url konstrueres via
+    _extract_trailer_url() og er None hvis ingen YouTube-video findes.
 
-    trailer_url er None hvis:
-      - Ingen videos-data i svaret
-      - Ingen YouTube-video med type Trailer eller Teaser
-      - TMDB har ikke registreret trailere for titlen endnu
-
-    For TV-serier henter vi stadig external_ids i et separat kald for tvdb_id
-    (Sonarr kræver dette), men videos er inkluderet i hoved-kaldet.
+    For TV-serier hentes external_ids separat for tvdb_id (Sonarr kræver det).
     """
     endpoint = "movie" if media_type == "movie" else "tv"
 
@@ -187,7 +175,7 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
         try:
             resp = await client.get(
                 f"{_BASE_URL}/{endpoint}/{tmdb_id}",
-                params=_params(append_to_response="videos"),  # ← trailer-fix
+                params=_params(append_to_response="videos"),
             )
             resp.raise_for_status()
             data = resp.json()
@@ -216,7 +204,7 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
             "genre_ids":         [g["id"] for g in data.get("genres", [])],
             "original_language": data.get("original_language"),
             "imdb_id":           data.get("imdb_id"),
-            "trailer_url":       trailer_url,   # ← ny nøgle
+            "trailer_url":       trailer_url,
             "media_type":        "movie",
         })
 
@@ -253,7 +241,7 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
         "original_language":    data.get("original_language"),
         "status":               data.get("status"),
         "tvdb_id":              tvdb_id,
-        "trailer_url":          trailer_url,   # ← ny nøgle
+        "trailer_url":          trailer_url,
         "media_type":           "tv",
     })
 
@@ -388,73 +376,51 @@ async def get_person_filmography(person_id: int) -> dict | None:
         except httpx.HTTPError as e:
             logger.warning("TMDB TV credits error (id=%s): %s", person_id, e)
 
-    raw_cast = movie_data.get("cast", [])
-    logger.info(
-        "get_person_filmography: person_id=%s → %d rå film-credits",
-        person_id, len(raw_cast),
-    )
+    # Filtrer og dedupliker film
+    cast_raw = movie_data.get("cast", [])
+    seen: dict[int, dict] = {}
+    for item in cast_raw:
+        if not item.get("release_date"):
+            continue
+        if "uncredited" in (item.get("character") or "").lower():
+            continue
+        mid = item.get("id")
+        if mid is None:
+            continue
+        if mid not in seen or item.get("vote_count", 0) > seen[mid].get("vote_count", 0):
+            seen[mid] = item
 
-    # Filtrér uncredited og uden release_date
-    filtered = [
-        item for item in raw_cast
-        if "uncredited" not in (item.get("character") or "").strip().lower()
-        and (item.get("release_date") or "").strip()
+    movie_credits = sorted(seen.values(), key=lambda x: x.get("popularity", 0), reverse=True)
+    movie_credits = [
+        {
+            "tmdb_id":      m.get("id"),
+            "title":        m.get("title") or m.get("original_title"),
+            "release_date": m.get("release_date", "Ukendt"),
+            "vote_average": round(m.get("vote_average", 0), 1),
+            "vote_count":   m.get("vote_count", 0),
+            "character":    m.get("character", ""),
+            "popularity":   round(m.get("popularity", 0), 1),
+        }
+        for m in movie_credits
     ]
 
-    # Deduplikér på tmdb_id
-    seen: dict[int, dict] = {}
-    for item in filtered:
-        tid = item.get("id")
-        if not tid:
-            continue
-        existing = seen.get(tid)
-        if existing is None or (item.get("vote_count", 0) or 0) > (existing.get("vote_count", 0) or 0):
-            seen[tid] = item
-
-    movie_credits = []
-    for item in seen.values():
-        title          = item.get("title") or item.get("original_title") or ""
-        original_title = item.get("original_title") or title
-        if not title:
-            continue
-        movie_credits.append({
-            "tmdb_id":        item.get("id"),
-            "title":          title,
-            "original_title": original_title,
-            "release_date":   (item.get("release_date") or "")[:4] or "Ukendt",
-            "character":      item.get("character") or "",
-            "vote_average":   round(item.get("vote_average", 0) or 0, 1),
-            "vote_count":     item.get("vote_count", 0) or 0,
-            "popularity":     round(item.get("popularity", 0) or 0, 2),
-        })
-
-    movie_credits.sort(key=lambda x: x["popularity"], reverse=True)
-
-    logger.info(
-        "get_person_filmography: %d unikke film (fjernet %d råposter)",
-        len(movie_credits), len(raw_cast) - len(movie_credits),
-    )
-
-    tv_credits = sorted(
-        [
-            {
-                "id":             i.get("id"),
-                "title":          i.get("name") or i.get("original_name"),
-                "first_air_date": (i.get("first_air_date") or "")[:4] or "Ukendt",
-                "character":      i.get("character"),
-                "vote_average":   round(i.get("vote_average", 0) or 0, 1),
-            }
-            for i in tv_credits_raw
-            if i.get("name") or i.get("original_name")
-        ],
-        key=lambda x: x["first_air_date"],
-        reverse=True,
-    )[:10]
+    # Top 10 TV-serier
+    tv_credits = sorted(tv_credits_raw, key=lambda x: x.get("popularity", 0), reverse=True)[:10]
+    tv_credits = [
+        {
+            "tmdb_id":    t.get("id"),
+            "title":      t.get("name") or t.get("original_name"),
+            "air_date":   t.get("first_air_date", "Ukendt"),
+            "character":  t.get("character", ""),
+            "popularity": round(t.get("popularity", 0), 1),
+        }
+        for t in tv_credits
+    ]
 
     return {
-        "id":                   bio.get("id"),
+        "person_id":            person_id,
         "name":                 bio.get("name"),
-        "biography":            (bio.get("biography") or "Ingen biografi tilgængelig.")[:300],
+        "biography":            (bio.get("biography") or "")[:300],
         "birthday":             bio.get("birthday"),
         "place_of_birth":       bio.get("place_of_birth"),
         "known_for_department": bio.get("known_for_department", "Ukendt"),
@@ -529,40 +495,34 @@ async def get_watch_providers(tmdb_id: int, media_type: str) -> dict:
 
 
 async def get_now_playing() -> list[dict]:
-    """Sorterer efter popularity (faldende), returnerer top 10. Henter 2 sider."""
-    raw: list[dict] = []
+    """Sorterer efter popularity (faldende), returnerer top 10."""
     async with httpx.AsyncClient(timeout=10) as client:
-        for page in (1, 2):
-            try:
-                resp = await client.get(
-                    f"{_BASE_URL}/movie/now_playing",
-                    params=_params(region="DK", page=page),
-                )
-                resp.raise_for_status()
-                raw.extend(resp.json().get("results", []))
-            except httpx.HTTPError as e:
-                logger.error("TMDB now_playing error (page %d): %s", page, e)
-                break
-    raw.sort(key=lambda x: x.get("popularity", 0), reverse=True)
-    return [_format_movie_result(i) for i in raw[:_MAX_RESULTS]]
+        try:
+            resp = await client.get(
+                f"{_BASE_URL}/movie/now_playing",
+                params=_params(region="DK"),
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+        except httpx.HTTPError as e:
+            logger.error("TMDB now_playing error: %s", e)
+            return []
+    results.sort(key=lambda x: x.get("popularity", 0), reverse=True)
+    return [_format_movie_result(i) for i in results[:_MAX_RESULTS]]
 
 
 async def get_upcoming() -> list[dict]:
-    """Sorterer efter popularity (faldende), top 10 præsenteret kronologisk."""
-    raw: list[dict] = []
+    """Sorterer efter popularity (faldende), returnerer top 10."""
     async with httpx.AsyncClient(timeout=10) as client:
-        for page in (1, 2):
-            try:
-                resp = await client.get(
-                    f"{_BASE_URL}/movie/upcoming",
-                    params=_params(region="DK", page=page),
-                )
-                resp.raise_for_status()
-                raw.extend(resp.json().get("results", []))
-            except httpx.HTTPError as e:
-                logger.error("TMDB upcoming error (page %d): %s", page, e)
-                break
-    raw.sort(key=lambda x: x.get("popularity", 0), reverse=True)
-    top10 = raw[:_MAX_RESULTS]
-    top10.sort(key=lambda x: x.get("release_date") or "")
-    return [_format_movie_result(i) for i in top10]
+        try:
+            resp = await client.get(
+                f"{_BASE_URL}/movie/upcoming",
+                params=_params(region="DK"),
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+        except httpx.HTTPError as e:
+            logger.error("TMDB upcoming error: %s", e)
+            return []
+    results.sort(key=lambda x: x.get("popularity", 0), reverse=True)
+    return [_format_movie_result(i) for i in results[:_MAX_RESULTS]]

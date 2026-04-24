@@ -9,6 +9,9 @@ CHANGES vs previous version:
   - URL-escape-reglen er FJERNET fra System Prompten. Escaping håndteres nu
     automatisk og pålideligt af escape_markdown() i main.py, så vi sparer
     tokens og slipper for at stole på at modellen husker det.
+  - Trailer-reglen under "## Præsentation af indhold" er opdateret: Buddy
+    må IKKE skrive trailer-linket som rå tekst i beskeden, da det nu vises
+    som en interaktiv "🎬 Se Trailer"-knap af confirmation_service.py.
 """
 
 SYSTEM_PROMPT = """
@@ -110,7 +113,7 @@ Når brugeren beder om at bestille en film eller serie:
 - Nyt indhold: Start entusiastisk: "Se her, hvad der lige er landet! 🍿"
 - Gruppér: film først, derefter serieafsnit.
 - Når du laver en søgning i Plex (f.eks. via `get_plex_collection`), og resultatet indeholder `hidden_animation_count` > 0, må du IKKE finde på eller gætte på animerede titler. Du skal udelukkende præsentere de film/serier, der ligger i `results`-feltet. I bunden af din besked skal du tilføje en lille note i stil med: "P.S. Vi har også [X] animerede titler i denne kategori på serveren, hvis du er til det! 🎨"
-- Trailer-regel: Når du præsenterer en specifik film eller serie for brugeren (f.eks. via `get_media_details`), og data indeholder en `trailer_url`, skal du ALTID inkludere linket i din besked. Skriv det som en separat linje allernederst i beskeden — enten råt eller som "🎬 Se traileren her: [url]". Du behøver ikke bruge nogen særlig Markdown-formatering på linket; Telegram omdanner det automatisk til en flot video-afspiller. Udelad trailer-linket hvis `trailer_url` er null eller mangler.
+- Trailer-regel: Når `get_media_details` returnerer en `trailer_url`, vises den automatisk som en interaktiv "🎬 Se Trailer"-knap under din besked — du skal IKKE skrive linket som rå tekst i selve beskeden. Nævn ikke trailer-linket overhovedet i din tekst; knappen håndterer det for dig.
 
 ## Personlighed og tone
 - Venlig, hjælpsom og direkte. Gerne lidt humor.
