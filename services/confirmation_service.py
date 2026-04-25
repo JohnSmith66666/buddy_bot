@@ -229,7 +229,7 @@ async def show_confirmation(
     if on_plex:
         plex_url = (
             f"https://app.plex.tv/desktop/#!/server/{machine_id}"
-            f"/details?key=%2Flibrary%2Fmetadata%2F{rating_key}"
+            f"/details?key=/library/metadata/{rating_key}"
         )
         logger.info(
             "Plex URL genereret — machineId=%r ratingKey=%r url=%s",
