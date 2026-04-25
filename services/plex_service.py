@@ -15,9 +15,13 @@ TOKEN OPTIMISATION (data-diæt):
     which is called explicitly when the user asks for them.
 
 CHANGES vs previous version:
-  - check_actor_on_plex(): tmdb_id tilføjet til hvert element i
-    found_on_plex og missing_top_movies. Buddy modtager nu ID'erne
-    direkte fra tool-output og behøver ikke gætte eller udelade links.
+  - Fix A: _build_actor_guid_set() scanner nu HELE biblioteket (Lag 2)
+    udover actor-filter (Lag 1). Returnerer nu tuple(tmdb_ids, imdb_ids).
+    Fanger film gemt under fremmed titel (f.eks. 'Boundless' for 'Den grænseløse').
+  - _extract_imdb_id_from_guids() tilføjet — ny hjælpefunktion.
+  - check_actor_on_plex(): IMDb GUID-match tilføjet som Lag 1b
+    (efter TMDB-match, før fuzzy titel-match).
+  - tmdb_service.py: original_title tilføjet til movie_credits dict.
   - _check_sync(): item.reload() + ratingKey + machineIdentifier — uændret.
   - add_to_watchlist() — uændret.
 """
@@ -94,6 +98,22 @@ def _extract_tmdb_id_from_guids(item) -> int | None:
                     return int(raw)
     except Exception as e:
         logger.debug("_extract_tmdb_id_from_guids error: %s", e)
+    return None
+
+
+def _extract_imdb_id_from_guids(item) -> str | None:
+    """
+    Udtræk IMDb ID (f.eks. 'tt21909366') fra et Plex-items .guids liste.
+    Bruges som sekundær nøgle når TMDB-GUID mangler.
+    """
+    try:
+        guids = getattr(item, "guids", []) or []
+        for guid in guids:
+            guid_str = getattr(guid, "id", None) or str(guid)
+            if guid_str.startswith("imdb://"):
+                return guid_str.replace("imdb://", "").strip()
+    except Exception as e:
+        logger.debug("_extract_imdb_id_from_guids error: %s", e)
     return None
 
 
@@ -414,8 +434,10 @@ async def check_actor_on_plex(
             if t:
                 plex_actor_titles.add(_clean_title(t))
 
-        # Byg GUID-sæt: søg Plex bredt med skuespillerens navn for at hente .guids
-        plex_tmdb_ids = await asyncio.to_thread(
+        # Byg GUID-sæt: TMDB IDs + IMDb IDs fra hele Plex-biblioteket
+        # Lag 2 i _build_actor_guid_set scanner alle film og fanger
+        # titler gemt under fremmed navn (f.eks. 'Boundless' for 'Den grænseløse')
+        plex_tmdb_ids, plex_imdb_ids = await asyncio.to_thread(
             partial(_build_actor_guid_set, actor_name=actor_display,
                     plex_username=plex_username)
         )
@@ -437,8 +459,23 @@ async def check_actor_on_plex(
         release        = movie.get("release_date", "")
         year           = int(release[:4]) if release and len(release) >= 4 and release[:4].isdigit() else None
 
-        # Lag 1: GUID-match
+        # Lag 1a: TMDB GUID-match (primær)
         if tmdb_id and tmdb_id in plex_tmdb_ids:
+            found_on_plex.append({
+                "title":     title,
+                "year":      year,
+                "character": movie.get("character"),
+                "tmdb_id":   tmdb_id,
+            })
+            continue
+
+        # Lag 1b: IMDb GUID-match (sekundær — fanger titler gemt under fremmed navn)
+        imdb_id = movie.get("imdb_id") or ""
+        if imdb_id and imdb_id in plex_imdb_ids:
+            logger.info(
+                "IMDb GUID-match: '%s' → '%s' fundet via %s",
+                title, imdb_id, imdb_id,
+            )
             found_on_plex.append({
                 "title":     title,
                 "year":      year,
@@ -592,35 +629,63 @@ async def search_by_actor(
 def _build_actor_guid_set(
     actor_name: str,
     plex_username: str | None = None,
-) -> set[int]:
+) -> tuple[set[int], set[str]]:
     """
-    Byg et sæt af TMDB IDs for alle Plex-film der indeholder skuespilleren.
-    Bruger PlexAPI's actor-filter og udtrækker .guids fra hvert item.
-    Kører i thread pool — returnerer set[int].
+    Byg to sæt for alle Plex-film der matcher skuespilleren:
+      - tmdb_ids: set[int]  — TMDB IDs fra Plex GUIDs
+      - imdb_ids: set[str]  — IMDb IDs fra Plex GUIDs (f.eks. 'tt21909366')
+
+    Strategi (to lag):
+      Lag 1: section.search(actor=actor_name) — hurtig, men misser titler
+              gemt under fremmed titel (f.eks. 'Boundless' ≠ 'Den grænseløse').
+      Lag 2: Scan hele biblioteket og udtræk GUIDs fra ALLE film — robust
+              fallback der fanger uanset titel-sprogforskel.
+
+    Kører i thread pool.
     """
     plex = _connect(plex_username)
     if isinstance(plex, dict):
-        return set()
+        return set(), set()
 
     tmdb_ids: set[int] = set()
+    imdb_ids: set[str] = set()
 
     for section in _sections(plex, _MOVIE_TYPE):
+        # Lag 1: actor-filter (hurtig)
         try:
-            items = section.search(actor=actor_name)
+            actor_items = section.search(actor=actor_name)
         except Exception:
-            try:
-                # Fallback: scan hele sektionen
-                items = section.search()
-            except Exception as e:
-                logger.warning("GUID set build error in '%s': %s", section.title, e)
-                continue
+            actor_items = []
 
-        for item in items:
+        for item in actor_items:
             tid = _extract_tmdb_id_from_guids(item)
+            iid = _extract_imdb_id_from_guids(item)
             if tid:
                 tmdb_ids.add(tid)
+            if iid:
+                imdb_ids.add(iid)
 
-    return tmdb_ids
+        # Lag 2: scan hele sektionen — fanger fremmedsprogede titler
+        # (f.eks. 'Boundless' for 'Den grænseløse')
+        try:
+            all_items = section.search()
+        except Exception as e:
+            logger.warning("Full section scan fejl i '%s': %s", section.title, e)
+            continue
+
+        for item in all_items:
+            tid = _extract_tmdb_id_from_guids(item)
+            iid = _extract_imdb_id_from_guids(item)
+            if tid:
+                tmdb_ids.add(tid)
+            if iid:
+                imdb_ids.add(iid)
+
+    logger.debug(
+        "_build_actor_guid_set '%s': %d TMDB IDs, %d IMDb IDs",
+        actor_name, len(tmdb_ids), len(imdb_ids),
+    )
+    return tmdb_ids, imdb_ids
 
 
 def _franchise_plex_check_sync(

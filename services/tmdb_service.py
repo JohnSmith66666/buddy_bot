@@ -434,13 +434,14 @@ async def get_person_filmography(person_id: int) -> dict | None:
     movie_credits = sorted(seen.values(), key=lambda x: x.get("popularity", 0), reverse=True)
     movie_credits = [
         {
-            "tmdb_id":      m.get("id"),
-            "title":        m.get("title") or m.get("original_title"),
-            "release_date": m.get("release_date", "Ukendt"),
-            "vote_average": round(m.get("vote_average", 0), 1),
-            "vote_count":   m.get("vote_count", 0),
-            "character":    m.get("character", ""),
-            "popularity":   round(m.get("popularity", 0), 1),
+            "tmdb_id":        m.get("id"),
+            "title":          m.get("title") or m.get("original_title"),
+            "original_title": m.get("original_title") or m.get("title"),
+            "release_date":   m.get("release_date", "Ukendt"),
+            "vote_average":   round(m.get("vote_average", 0), 1),
+            "vote_count":     m.get("vote_count", 0),
+            "character":      m.get("character", ""),
+            "popularity":     round(m.get("popularity", 0), 1),
         }
         for m in movie_credits
     ]
