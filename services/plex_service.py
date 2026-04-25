@@ -305,11 +305,13 @@ async def check_library(
     year: int | None,
     media_type: str,
     plex_username: str | None = None,
+    tmdb_id: int | None = None,
 ) -> dict:
     try:
         return await asyncio.to_thread(
             partial(_check_sync, title=title, year=year,
-                    media_type=media_type, plex_username=plex_username)
+                    media_type=media_type, plex_username=plex_username,
+                    tmdb_id=tmdb_id)
         )
     except Exception as e:
         logger.error("check_library error: %s", e)
@@ -798,7 +800,18 @@ def _check_sync(
     year: int | None,
     media_type: str,
     plex_username: str | None = None,
+    tmdb_id: int | None = None,
 ) -> dict:
+    """
+    Søg efter en titel i Plex-biblioteket.
+
+    Tre lag:
+      Lag 0 (GUID): Scan hele sektionen og match via TMDB GUID.
+                    Fanger titler gemt under fremmed navn
+                    (f.eks. 'Boundless' når vi søger 'Den grænseløse').
+      Lag 1 (eksakt): section.search(title) + _titles_match.
+      Lag 2/3 (fuzzy): section.search(title) + _titles_match_fuzzy.
+    """
     is_tv     = (media_type == "tv")
     plex_type = _TV_TYPE if is_tv else _MOVIE_TYPE
 
@@ -806,7 +819,45 @@ def _check_sync(
     if isinstance(plex, dict):
         return plex
 
+    def _build_result(item, match_lag) -> dict:
+        item_title = getattr(item, "title", "") or ""
+        item_year  = getattr(item, "year", None)
+        logger.info(
+            "Plex HIT (lag %s): '%s' (%s) — søgt på '%s' (%s)",
+            match_lag, item_title, item_year, title, year,
+        )
+        try:
+            item.reload()
+        except Exception as e:
+            logger.warning("item.reload() fejlede for '%s': %s", item_title, e)
+        p_rating     = getattr(item, "rating", None)
+        a_rating     = getattr(item, "audienceRating", None)
+        final_rating = p_rating if p_rating else a_rating
+        logger.debug(
+            "Plex ratings for '%s': rating=%s audienceRating=%s → bruger=%s",
+            item_title, p_rating, a_rating, final_rating,
+        )
+        return {
+            "status":            STATUS_FOUND,
+            "title":             item_title,
+            "year":              item_year,
+            "ratingKey":         item.ratingKey,
+            "machineIdentifier": plex.machineIdentifier,
+            "rating":            final_rating,
+        }
+
     for section in _sections(plex, plex_type):
+        # ── Lag 0: GUID-match via fuld biblioteksscan ─────────────────────────
+        # Fanger titler gemt under fremmed navn (f.eks. 'Boundless' for 'Den grænseløse')
+        if tmdb_id:
+            try:
+                for item in section.search():
+                    if _extract_tmdb_id_from_guids(item) == tmdb_id:
+                        return _build_result(item, "0/GUID")
+            except Exception as e:
+                logger.warning("GUID scan fejl i '%s': %s", section.title, e)
+
+        # ── Lag 1+2/3: titel-søgning (eksakt + fuzzy) ────────────────────────
         for item in _safe_search(section, title):
             item_title = getattr(item, "title", "") or ""
             item_year  = getattr(item, "year", None)
@@ -824,34 +875,7 @@ def _check_sync(
                 if year and item_year and abs(item_year - year) > 1:
                     continue
 
-            logger.info(
-                "Plex HIT (lag %s): '%s' (%s) i '%s' — søgt på '%s' (%s)",
-                match_lag, item_title, item_year, section.title, title, year,
-            )
-
-            # reload() henter det fulde metadata-objekt inkl. ratings
-            # (søgeresultater er "lette" objekter uden ratings)
-            try:
-                item.reload()
-            except Exception as e:
-                logger.warning("item.reload() fejlede for '%s': %s", item_title, e)
-
-            p_rating    = getattr(item, "rating", None)
-            a_rating    = getattr(item, "audienceRating", None)
-            final_rating = p_rating if p_rating else a_rating
-            logger.debug(
-                "Plex ratings for '%s': rating=%s audienceRating=%s → bruger=%s",
-                item_title, p_rating, a_rating, final_rating,
-            )
-
-            return {
-                "status":            STATUS_FOUND,
-                "title":             item_title,
-                "year":              item_year,
-                "ratingKey":         item.ratingKey,
-                "machineIdentifier": plex.machineIdentifier,
-                "rating":            final_rating,
-            }
+            return _build_result(item, match_lag)
 
     return {"status": STATUS_MISSING}
 

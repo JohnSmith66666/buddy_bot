@@ -209,7 +209,8 @@ async def show_confirmation(
 
     # ── Tjek om titlen er på Plex ─────────────────────────────────────────────
     plex_check = await check_library(
-        title, int(year) if year else None, media_type, plex_username
+        title, int(year) if year else None, media_type, plex_username,
+        tmdb_id=tmdb_id,
     )
     on_plex    = plex_check.get("status") == STATUS_FOUND
     machine_id = plex_check.get("machineIdentifier", "")
