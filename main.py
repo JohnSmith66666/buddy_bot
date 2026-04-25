@@ -203,7 +203,7 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not await _guard(update):
         return
 
-    logger.info("HANDLER TRIGGERET: Modtog kommando %s", update.message.text)
+    logger.info("HANDLER MODTOG: %s", update.message.text)
 
     if context.matches:
         match = context.matches[0]
@@ -211,6 +211,7 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         text  = (update.message.text or "").strip()
         match = re.match(r"^/info_?(movie|tv)_?(\d+)$", text)
         if not match:
+            logger.warning("HANDLER: ingen match på '%s' — ignorerer", update.message.text)
             return
 
     media_type    = match.group(1)
