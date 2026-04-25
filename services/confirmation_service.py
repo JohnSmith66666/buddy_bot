@@ -33,11 +33,18 @@ def _make_token() -> str:
 
 def _build_caption(details: dict, rating: float | None = None) -> str:
     """
-    Byg simpel Markdown-caption (ikke MarkdownV2) til send_photo.
+    Byg Markdown-caption til send_photo — Design B med skillelinjer og kursiv resume.
+
+    Layout:
+      *Titel* (År)
+      ━━━━━━━━━━━━━━━━
+      🎭 Genre · Genre · Genre
+      ⭐️ 7.3/10  ·  ⏱ 144 min
+      👥 Skuespiller, Skuespiller
+      ━━━━━━━━━━━━━━━━
+      _Resumé i kursiv..._
 
     rating: Plex IMDb-score (foretrukket) eller TMDB vote_average (fallback).
-    Vises som: 🎬 IMDb: {score}/10
-
     Overview trimmes til Telegrams max caption-grænse på 1024 tegn.
     """
     title    = details.get("title") or "Ukendt"
@@ -49,6 +56,7 @@ def _build_caption(details: dict, rating: float | None = None) -> str:
     runtime  = details.get("runtime_minutes")
     seasons  = details.get("number_of_seasons")
 
+    SEP = "━━━━━━━━━━━━━━━━"
     lines = []
 
     # Titel + årstal
@@ -56,39 +64,41 @@ def _build_caption(details: dict, rating: float | None = None) -> str:
     if year:
         header += f" ({year})"
     lines.append(header)
-    lines.append("")
+    lines.append(SEP)
 
     # Genrer
     if genres:
-        lines.append(f"🎬 {', '.join(genres)}")
+        lines.append(f"🎭 {' · '.join(genres)}")
 
-    # Score — Plex IMDb foretrukket, TMDB som fallback
+    # Score + varighed på samme linje
+    meta_parts = []
     if score:
-        lines.append(f"🎬 IMDb: {score}/10")
-
-    # Varighed / sæsoner
+        meta_parts.append(f"⭐️ {score}/10")
     if runtime:
-        lines.append(f"⏱ {runtime} min")
+        meta_parts.append(f"⏱ {runtime} min")
     elif seasons:
-        lines.append(f"📺 {seasons} sæson{'er' if seasons != 1 else ''}")
+        meta_parts.append(f"📺 {seasons} sæson{'er' if seasons != 1 else ''}")
+    if meta_parts:
+        lines.append("  ·  ".join(meta_parts))
 
     # Skuespillere
     if cast:
         cast_str = cast if isinstance(cast, str) else ", ".join(cast)
-        lines.append(f"🎭 {cast_str}")
+        lines.append(f"👥 {cast_str}")
 
-    lines.append("")
+    lines.append(SEP)
 
-    header_text = "\n".join(lines)
+    header_text = "\n".join(lines) + "\n"
 
-    # Overview — trim så caption ikke overstiger 1024 tegn
-    available = _MAX_CAPTION - len(header_text) - 3
+    # Overview i kursiv — trim så caption ikke overstiger 1024 tegn
+    # 2 ekstra tegn til "_" på hver side af kursiv
+    available = _MAX_CAPTION - len(header_text) - 5
     if available <= 0:
         return header_text.strip()
     if len(overview) > available:
         overview = overview[:available] + "…"
 
-    return header_text + overview
+    return header_text + f"_{overview}_"
 
 
 # ── Step 1: Vis søgeresultater som knapper ────────────────────────────────────
