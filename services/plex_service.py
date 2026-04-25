@@ -15,11 +15,11 @@ TOKEN OPTIMISATION (data-diæt):
     which is called explicitly when the user asks for them.
 
 CHANGES vs previous version:
-  - _check_sync(): kalder nu item.reload() inden ratings udtrækkes.
-    Søgeresultater er "lette" objekter uden ratings — reload() henter
-    det fulde metadata-objekt inkl. rating og audienceRating.
-    Bruger p_rating (IMDb) med fallback til a_rating (publikum).
-  - add_to_watchlist() og _add_to_watchlist_sync() tilføjet — uændret.
+  - check_actor_on_plex(): tmdb_id tilføjet til hvert element i
+    found_on_plex og missing_top_movies. Buddy modtager nu ID'erne
+    direkte fra tool-output og behøver ikke gætte eller udelade links.
+  - _check_sync(): item.reload() + ratingKey + machineIdentifier — uændret.
+  - add_to_watchlist() — uændret.
 """
 
 import asyncio
@@ -443,6 +443,7 @@ async def check_actor_on_plex(
                 "title":     title,
                 "year":      year,
                 "character": movie.get("character"),
+                "tmdb_id":   tmdb_id,
             })
             continue
 
@@ -475,12 +476,14 @@ async def check_actor_on_plex(
                 "title":     title,
                 "year":      year,
                 "character": movie.get("character"),
+                "tmdb_id":   tmdb_id,
             })
         else:
             missing_top_movies.append({
                 "title":        title,
                 "release_date": release or "Ukendt",
                 "vote_average": movie.get("vote_average", 0),
+                "tmdb_id":      tmdb_id,
             })
 
     found_count   = len(found_on_plex)
