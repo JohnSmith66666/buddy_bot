@@ -332,6 +332,7 @@ TOOLS = [
         "name": "get_popular_on_plex",
         "description": (
             "Hent de mest populaere film og serier paa Plex-serveren. "
+            "Returnerer altid top 10 film og top 10 serier med tmdb_id — brug det til links. "
             "days=30 for seneste maaned (standard), days=365 for seneste aar. "
             "days=0 for 'all time' / 'nogensinde'."
         ),

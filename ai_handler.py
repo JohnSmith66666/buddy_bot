@@ -218,11 +218,28 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
 
     # ── Tautulli ──────────────────────────────────────────────────────────────
     if tool_name == "get_popular_on_plex":
-        days = tool_input.get("days", 30)
-        return j(await get_popular_on_plex(
-            stats_count=tool_input.get("stats_count", 10),
+        days   = tool_input.get("days", 30)
+        result = await get_popular_on_plex(
+            stats_count=10,  # Altid top 10 — uanset hvad Buddy sender
             time_range=days if days is not None else 30,
-        ))
+        )
+        if not result:
+            return j({"error": "Ingen data fra Tautulli."})
+
+        # Berig alle rækker med TMDB ID via title-opslag
+        async def _enrich_rows(rows: list, media_type: str) -> None:
+            lookup_fn = _lookup_movie if media_type == "movie" else _lookup_tv
+            lookups   = await asyncio.gather(*[lookup_fn(r.get("title", "")) for r in rows])
+            for row, tmdb_id in zip(rows, lookups):
+                if tmdb_id:
+                    row["tmdb_id"]    = tmdb_id
+                    row["media_type"] = media_type
+
+        await asyncio.gather(
+            _enrich_rows(result.get("top_movies") or [], "movie"),
+            _enrich_rows(result.get("top_tv")     or [], "tv"),
+        )
+        return j(result)
     if tool_name == "get_user_watch_stats":
         if not plex_username:
             return j({"error": "Intet Plex-brugernavn fundet."})
