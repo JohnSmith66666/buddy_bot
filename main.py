@@ -347,9 +347,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Det originale reply bruges stadig til normalt svar (bevarer Markdown)
     clean_reply = reply.replace("`", "").strip()
 
+    def _find_signal(signal: str) -> str | None:
+        """
+        Scan alle linjer i clean_reply for signalet og returner linjen.
+        Buddy placerer nogle gange signalet på linje 2 efter en tekstlinje
+        — startswith() på hele svaret fanger ikke dette. Vi scanner linje
+        for linje og returnerer den første linje der starter med signalet.
+        """
+        for line in clean_reply.splitlines():
+            line = line.strip()
+            if line.startswith(signal):
+                return line
+        return None
+
     # ── Signal: bestillingsflow ───────────────────────────────────────────────
-    if clean_reply.startswith(SEARCH_SIGNAL):
-        parts = clean_reply[len(SEARCH_SIGNAL):].split(":", 1)
+    signal_line = _find_signal(SEARCH_SIGNAL)
+    if signal_line:
+        parts = signal_line[len(SEARCH_SIGNAL):].split(":", 1)
         query_term = parts[0].strip()
         media_type = parts[1].strip() if len(parts) > 1 else "both"
         await show_search_results(update.message, query_term, media_type)
@@ -357,8 +371,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # ── Signal: Netflix-look infokort ─────────────────────────────────────────
     # Format: SHOW_INFO:<tmdb_id>:<media_type>
-    if clean_reply.startswith(INFO_SIGNAL):
-        payload = clean_reply[len(INFO_SIGNAL):].strip()
+    signal_line = _find_signal(INFO_SIGNAL)
+    if signal_line:
+        payload = signal_line[len(INFO_SIGNAL):].strip()
         parts   = payload.split(":")
         if len(parts) >= 2:
             tmdb_id_str = parts[0].strip()
@@ -382,8 +397,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # ── Signal: trailer-knap ──────────────────────────────────────────────────
     # Format: SHOW_TRAILER:<beskedtekst>|<trailer_url>
-    if clean_reply.startswith(TRAILER_SIGNAL):
-        payload  = clean_reply[len(TRAILER_SIGNAL):]
+    signal_line = _find_signal(TRAILER_SIGNAL)
+    if signal_line:
+        payload  = signal_line[len(TRAILER_SIGNAL):]
         # Del ved det SIDSTE pipe-tegn for at beskytte mod pipe i beskeden
         pipe_idx = payload.rfind("|")
         if pipe_idx != -1:
