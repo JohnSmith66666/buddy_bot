@@ -8,6 +8,21 @@ Versionering følger [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PA
 
 ---
 
+## [0.9.2-beta] — 2026-04-25
+
+### Ændret (cache-optimering — ingen funktionalitetsændringer)
+- **Cache-vending i `prompts.py`**: Persona-prompten indsættes nu i BUNDEN af system-prompten i stedet for toppen. Tidligere invaliderede et persona-skift hele cachen for de ~4000 tokens regler nedenunder. Nu genbruges body-cachen på tværs af persona-skift, og kun den lille persona-blok skal skrives. Estimeret besparelse: ~3500 tokens per persona-skift.
+- **Slankere dynamisk blok i `ai_handler.py`**: Den lange forklaring om dato-sammenligning er fjernet fra `dynamic_lines`. Reglen er allerede i `_SYSTEM_PROMPT_BODY` under "## Absolut tillid til værktøjer" og caches dér. Tidligere blev de ~150 tokens forklaring sendt UCACHET ved hvert request — nu sendes kun den faktiske dato (~30 tokens) ucachet. Estimeret besparelse: ~120 tokens per kald.
+- `get_system_prompt()` returnerer nu `body + persona_prompt` i stedet for `persona_prompt + body`.
+- `personas.py` docstring opdateret til at reflektere den nye arkitektur — persona-teksterne selv er 100% uændrede.
+- VERSION CHECK log opdateret med `cache-optimeret: JA`-flag.
+
+### Forventet effekt
+- Cache read ratio: 39 % → forventet 50–60 %
+- Alle adfærdsregler om lister, anbefalinger, links, ID'er, signaler og dato-håndtering er bit-identiske med 0.9.1-beta — kun rækkefølgen i system-prompten og placeringen af dato-instruktionen er ændret.
+
+---
+
 ## [0.9.1-beta] — 2026-04-25
 
 ### Fikset

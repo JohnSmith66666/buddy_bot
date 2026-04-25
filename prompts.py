@@ -1,25 +1,25 @@
 """
 prompts.py - System prompt for Buddy.
 
-CHANGES vs previous version:
-  - Tilføjet sektion "## Sprogkrav - STRENGT" som den første adfærdsregel
-    efter persona-linjen. Sektionen forbyder engelske indlån, klodset
-    oversatte talemåder og grammatiske fejl — og kræver idiomatisk,
-    indfødt dansk i alle svar.
-  - URL-escape-reglen er FJERNET fra System Prompten. Escaping håndteres nu
-    automatisk og pålideligt af escape_markdown() i main.py, så vi sparer
-    tokens og slipper for at stole på at modellen husker det.
-  - Trailer-reglen under "## Præsentation af indhold" er opdateret: Buddy
-    må IKKE skrive trailer-linket som rå tekst i beskeden, da det nu vises
-    som en interaktiv "🎬 Se Trailer"-knap af confirmation_service.py.
-  - Sektionen "## Absolut tillid til værktøjer" er opdateret: den blinde
-    fremtids-regel ("tro ukritisk på data fra fremtiden") er fjernet, da
-    Buddy nu kender den rigtige dato via dynamisk system-kontekst i
-    ai_handler.py og kan agere logisk ud fra dags dato.
-  - Trailer-reglen er skærpet med eksplicit krav: Buddy SKAL kalde
-    get_media_details for at hente trailer_url, selv når filmen allerede
-    er identificeret via search_media eller check_franchise_status.
-    search_media returnerer aldrig trailer_url — det gør KUN get_media_details.
+CHANGES vs previous version (0.9.2-beta cache-optimering):
+  - ARKITEKTUR: Persona-blokken er flyttet fra TOPPEN til BUNDEN af system-prompten.
+    Tidligere lagde get_system_prompt() persona-prompt øverst, hvilket invaliderede
+    HELE den efterfølgende cache hver gang en bruger skiftede persona.
+    Nu lægges body (de stabile regler) øverst og persona nederst — så de ~4000 tokens
+    regler genbruges på tværs af persona-skift. Estimeret cache-write besparelse:
+    ~3500 tokens per persona-skift.
+  - DUPLIKERING FJERNET: Forklaringen om dato-sammenligning fra ai_handler.py's
+    dynamiske blok er fjernet dér. Reglen er allerede i _SYSTEM_PROMPT_BODY
+    under "## Absolut tillid til værktøjer" og caches nu — i stedet for at blive
+    sendt ucachet ved hvert kald (~150 tokens spares per request).
+  - ADFÆRDSREGLER FOR BUDDY ER 100% UÆNDREDE — kun rækkefølgen er ændret.
+
+Tidligere ændringer (bevares):
+  - "## Sprogkrav - STRENGT" — første adfærdsregel.
+  - URL-escape-reglen håndteres af escape_markdown() i main.py.
+  - Trailer-knap håndteres af confirmation_service.py.
+  - Dato-sammenligningsregel under "## Absolut tillid til værktøjer".
+  - Trailer-regel skærpet med eksplicit krav om get_media_details-kald.
 """
 
 _SYSTEM_PROMPT_BODY = """
@@ -283,16 +283,26 @@ PÅ SEKUNDET du har ID'et fra `search_media`, returnerer du KUN signalet — ing
 ## Begrænsninger
 - Du afslører aldrig andre brugeres aktivitet eller data.
 - Du nævner aldrig TMDB ID'er, rating_keys eller andre tekniske IDs over for brugeren.
+
+## Persona — DIN AKTUELLE ROLLE
+Alle ovenstående regler er ufravigelige og gælder uanset hvilken persona du spiller.
+Din specifikke persona, tone og stil defineres herunder:
+
 """
 
 
 def get_system_prompt(persona_id: str = "buddy") -> str:
     """
-    Returnér komplet system-prompt med den valgte persona indsat øverst.
-    Persona-teksten erstatter den hardkodede Buddy-introduktion.
+    Returnér komplet system-prompt med den valgte persona indsat NEDERST.
+
+    Cache-arkitektur:
+      Body (ufravigelige regler) lægges ØVERST og caches.
+      Persona-prompt lægges NEDERST — efter cachen er læst.
+      Det betyder at når en bruger skifter persona, ændrer kun den sidste del
+      af prompten sig — de ~4000 tokens regler ovenover genbruges fra cachen.
     """
     from personas import get_persona_prompt
-    return get_persona_prompt(persona_id) + _SYSTEM_PROMPT_BODY
+    return _SYSTEM_PROMPT_BODY + get_persona_prompt(persona_id)
 
 
 # Bagudkompatibel konstant — bruges af kode der ikke er persona-bevidst endnu

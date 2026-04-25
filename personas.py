@@ -1,18 +1,25 @@
 """
 personas.py - Persona-definitioner for Buddy.
 
-CHANGES vs previous version:
-  - Ny fil. Indeholder alle persona-definitioner som en dict.
-  - Hver persona har: id, navn, emoji, beskrivelse (til menu) og prompt (til Claude).
-  - get_persona_prompt(persona_id) returnerer persona-specifik indledning til system-prompten.
+CHANGES vs previous version (0.9.2-beta cache-optimering):
+  - INGEN ÆNDRINGER i persona-teksterne — de er bevidst bevaret 100% identiske.
+  - Cache-arkitektur ændret i prompts.py (ikke her): persona-prompten indsættes
+    nu i BUNDEN af system-prompten i stedet for toppen. Det betyder at når
+    en bruger skifter persona (f.eks. fra Buddy → Onkel Flemming), invalideres
+    KUN den lille persona-blok — ikke de ~4000 tokens regler ovenover. Dette
+    sparer en cache-write på ~3500 tokens per persona-skift.
+
+Tidligere ændringer (bevares):
+  - Hver persona har: id, navn, emoji, beskrivelse (til menu), prompt og image_path.
+  - get_persona_prompt(persona_id) returnerer persona-specifik prompt.
   - Buddy (default) er persona 'buddy'. Nye personaer tilføjes her.
 """
 
 from __future__ import annotations
 
 # ── Persona-definitioner ──────────────────────────────────────────────────────
-# Hvert entry: id → {navn, emoji, beskrivelse, prompt}
-# 'prompt' indsættes øverst i system-prompten og erstatter Buddy-personaen.
+# Hvert entry: id → {navn, emoji, beskrivelse, prompt, image_path}
+# 'prompt' indsættes NEDERST i system-prompten (ny arkitektur — se prompts.py).
 
 PERSONAS: dict[str, dict] = {
 
@@ -93,7 +100,7 @@ def get_persona(persona_id: str) -> dict:
 
 
 def get_persona_prompt(persona_id: str) -> str:
-    """Returnér persona-prompten der indsættes øverst i system-prompten."""
+    """Returnér persona-prompten der indsættes NEDERST i system-prompten."""
     return get_persona(persona_id)["prompt"]
 
 
