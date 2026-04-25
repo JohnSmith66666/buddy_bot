@@ -313,17 +313,17 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
                             movie["tmdb_id"] = tmdb_id
                             logger.info("TMDB film-fallback: '%s' → %s", movie["title"], tmdb_id)
 
-            # Berig serier uden tmdb_id — søg på series_name (serienavn, ikke episodetitel)
+            # Berig serier — søg ALTID på series_name for at få seriens TMDB ID
+            # Tautulli returnerer episodens TMDB ID, ikke seriens — det er ubrugeligt
             if result.get("episodes"):
-                needs_tv = [e for e in result["episodes"] if not e.get("tmdb_id")]
-                if needs_tv:
-                    looked_up = await _asyncio.gather(
-                        *[_lookup_tv(e.get("series_name") or e.get("title", "")) for e in needs_tv]
-                    )
-                    for ep, tmdb_id in zip(needs_tv, looked_up):
-                        if tmdb_id:
-                            ep["tmdb_id"] = tmdb_id
-                            logger.info("TMDB TV-fallback: '%s' → %s", ep.get("series_name"), tmdb_id)
+                all_episodes = result["episodes"]
+                looked_up = await _asyncio.gather(
+                    *[_lookup_tv(e.get("series_name") or e.get("title", "")) for e in all_episodes]
+                )
+                for ep, tmdb_id in zip(all_episodes, looked_up):
+                    if tmdb_id:
+                        ep["tmdb_id"] = tmdb_id
+                        logger.info("TMDB TV-fallback: '%s' → %s", ep.get("series_name"), tmdb_id)
 
         return j(result)
 
