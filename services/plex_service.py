@@ -74,6 +74,7 @@ def _slim(item) -> dict:
         "rating":  getattr(item, "audienceRating", None),
         "genres":  genres,
         "summary": summary or None,
+        "tmdb_id": _extract_tmdb_id_from_guids(item),
     }
 
 
