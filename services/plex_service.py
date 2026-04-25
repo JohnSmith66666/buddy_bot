@@ -1268,6 +1268,8 @@ def _get_user_server_sync(plex_username: str):
     return None
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
+
+async def add_to_watchlist(
     title: str,
     plex_username: str | None = None,
 ) -> bool:
