@@ -1,7 +1,12 @@
 """
 services/plex_service.py - Plex Media Server integration via python-plexapi.
 
-Dynamically scans all library sections on the server — no hardcoded names.
+CHANGES vs previous version:
+  - _GENRE_SYNONYMS: Tilføjet "sciencefiction" og "science fiction" som
+    selvstændige nøgler. Buddy sender genre="science fiction" som normaliserer
+    til "science fiction" — men kun "scifi" var nøgle i tabellen, så synonymerne
+    blev aldrig aktiveret og søgningen returnerede 0 resultater selvom der er
+    masser af sci-fi på serveren.
 Uses fuzzy title matching to handle variations like 'Olsen-banden' vs 'Olsen Banden'.
 PlexAPI calls are synchronous so we run them in a thread pool to avoid
 blocking the async event loop.
@@ -527,7 +532,9 @@ _GENRE_SYNONYMS: dict[str, list[str]] = {
     "documentary": ["dokumentar", "documentary"],
     "romance":     ["romantik", "romance", "romantic"],
     "romantik":    ["romance", "romantic", "romantik"],
-    "scifi":       ["sciencefiction", "sci fi", "scifi"],
+    "scifi":          ["sciencefiction", "sci fi", "scifi", "science fiction"],
+    "sciencefiction": ["scifi", "sci fi", "science fiction", "sciencefiction"],
+    "science fiction": ["scifi", "sciencefiction", "sci fi"],
     "fantasy":     ["fantasy"],
     "mystery":     ["mysterium", "mystery"],
     "mysterium":   ["mystery", "mysterium"],
