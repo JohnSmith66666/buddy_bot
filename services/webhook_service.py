@@ -66,10 +66,10 @@ async def _resolve_telegram_ids(tag_ids: list, source: str) -> list[int]:
       - Radarr: integer tag-IDs → tags=[3, 7]
         Disse slås op mod Radarr's tag-liste: {3: "tg_123456789"} → 123456789
       - Sonarr: string labels direkte → tags=["tg_6465421173"]
-        Disse parses direkte uden API-opslag (label starter med "tg_")
+        Disse parses direkte uden API-opslag (label starter med "tg-")
 
     Funktionen håndterer begge formater i samme løkke:
-      1. Hvis elementet er en string der starter med "tg_" → parse direkte
+      1. Hvis elementet er en string der starter med "tg-" → parse direkte
       2. Hvis elementet er et integer → slå op i tag-map fra API
     """
     if not tag_ids:
@@ -93,7 +93,7 @@ async def _resolve_telegram_ids(tag_ids: list, source: str) -> list[int]:
         # ── Format A: string label direkte (Sonarr) ───────────────────────────
         # Sonarr sender labels som strings: ["tg_6465421173"]
         if isinstance(tid, str):
-            if tid.startswith("tg_"):
+            if tid.startswith("tg-"):
                 try:
                     telegram_id = int(tid[3:])
                     telegram_ids.append(telegram_id)
@@ -109,7 +109,7 @@ async def _resolve_telegram_ids(tag_ids: list, source: str) -> list[int]:
         if isinstance(tid, int):
             tag_map = await _get_tag_map()
             label   = tag_map.get(tid, "")
-            if label.startswith("tg_"):
+            if label.startswith("tg-"):
                 try:
                     telegram_id = int(label[3:])
                     telegram_ids.append(telegram_id)
