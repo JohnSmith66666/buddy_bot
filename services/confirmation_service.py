@@ -228,11 +228,10 @@ async def show_confirmation(
     button_rows = []
 
     if on_plex:
-        # Søgelink — åbner Plex mobilapp med titlen søgt op direkte
-        # Deep-links til specifikke film virker ikke på mobil
+        # watch.plex.tv er registreret som verified link i Plex mobilappen
+        # Åbner søgesiden med filmtitlen udfyldt
         from urllib.parse import quote
-        plex_search_query = quote(title)
-        plex_url = f"https://app.plex.tv/desktop/#!/search?query={plex_search_query}"
+        plex_url = f"https://watch.plex.tv/search?q={quote(title)}"
         logger.info(
             "Plex søge-URL genereret — titel=%r url=%s",
             title, plex_url,
