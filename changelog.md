@@ -10,6 +10,9 @@ Versionering følger [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PA
 
 ## [0.9.2-beta] — 2026-04-25
 
+### Fikset (kritisk dataintegritet)
+- **Ingen flere hallucinerede TMDB-ID'er i lister**: Buddy/Onkel Flemming gættede tidligere ID'er fra træningsdata når de skulle nævne manglende eller kommende film (f.eks. ved "hvad mangler vi af Marvel?"). Det resulterede i `/info_movie_<id>`-links der pegede på helt forkerte film. Ny regel #7 i `## REGLER FOR LISTER` forbyder eksplicit dette: alle ID'er i links SKAL stamme fra et tool-resultat i den aktuelle samtale. Hvis ID'et ikke er verificeret, udelades linket helt — eller `search_media` kaldes først.
+
 ### Ændret (cache-optimering — ingen funktionalitetsændringer)
 - **Cache-vending i `prompts.py`**: Persona-prompten indsættes nu i BUNDEN af system-prompten i stedet for toppen. Tidligere invaliderede et persona-skift hele cachen for de ~4000 tokens regler nedenunder. Nu genbruges body-cachen på tværs af persona-skift, og kun den lille persona-blok skal skrives. Estimeret besparelse: ~3500 tokens per persona-skift.
 - **Slankere dynamisk blok i `ai_handler.py`**: Den lange forklaring om dato-sammenligning er fjernet fra `dynamic_lines`. Reglen er allerede i `_SYSTEM_PROMPT_BODY` under "## Absolut tillid til værktøjer" og caches dér. Tidligere blev de ~150 tokens forklaring sendt UCACHET ved hvert request — nu sendes kun den faktiske dato (~30 tokens) ucachet. Estimeret besparelse: ~120 tokens per kald.
@@ -19,7 +22,10 @@ Versionering følger [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PA
 
 ### Forventet effekt
 - Cache read ratio: 39 % → forventet 50–60 %
-- Alle adfærdsregler om lister, anbefalinger, links, ID'er, signaler og dato-håndtering er bit-identiske med 0.9.1-beta — kun rækkefølgen i system-prompten og placeringen af dato-instruktionen er ændret.
+- Alle adfærdsregler om lister, anbefalinger, links, ID'er, signaler og dato-håndtering er bit-identiske med 0.9.1-beta — bortset fra den nye regel #7 der er en SKÆRPELSE af eksisterende "GÆTTE ER FORBUDT"-regel, ikke en ændring af adfærd. Cache-vendingen og dato-flytningen er rent strukturelle.
+
+### Kendt begrænsning (ikke fikset i denne version)
+- `check_franchise_status` rammer kun TMDB-collections der matcher søgeordet i navnet. Mega-franchises som MCU består af ~10 separate collections (Avengers, Spider-Man, Iron Man, Thor, Captain America osv.) plus stand-alone-film. Ved søgning på "Marvel" returneres kun de samlinger der har "Marvel" i navnet (Avengers, Captain Marvel, Spider-Man-Avengers, Marvel Rising, LEGO Marvel) — Iron Man, Thor osv. ekskluderes. Permanent fix planlagt til 0.10.0.
 
 ---
 
