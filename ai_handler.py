@@ -63,7 +63,7 @@ _client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 _histories: dict[int, list[dict]] = defaultdict(list)
 _MAX_HISTORY = 6          # Reduceret fra 10 → sparer ~400 uncached tokens per kald
-_MAX_TOOL_RESULT_CHARS = 2000
+_MAX_TOOL_RESULT_CHARS = 6000
 
 # Signal som Claude returnerer for at trigge bestillingsflow i main.py
 SEARCH_SIGNAL = "SHOW_SEARCH_RESULTS:"
@@ -119,11 +119,15 @@ def _trim(telegram_id: int) -> None:
         _histories[telegram_id] = h[-_MAX_HISTORY:]
 
 
-def _slim_data(data, max_list_items: int = 10):
+def _slim_data(data, max_list_items: int = 40):
     """
     Rekursivt trim data-strukturen FØR JSON-serialisering.
     Lister cappes til max_list_items — aldrig hård string-truncation.
     Garanterer altid gyldig JSON output.
+
+    max_list_items hævet til 40 for at matche _FRANCHISE_MAX_PER_LIST
+    og sikre at alle film fra check_actor_on_plex og check_franchise_status
+    når frem til Buddy med korrekte ID'er.
     """
     if isinstance(data, list):
         trimmed = data[:max_list_items]
