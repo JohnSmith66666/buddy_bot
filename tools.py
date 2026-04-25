@@ -1,19 +1,18 @@
 """
 tools.py - Claude Tool Use definitions for Buddy.
 
-CHANGES vs previous version:
-  v0.9.4 — search_media year-filter:
-  - search_media: valgfri `year` (integer) parameter tilføjet til input_schema.
-    Buddy skal sende årstal HER — aldrig som del af query-strengen.
-    Svarer til primary_release_year (film) / first_air_date_year (TV) i TMDB API.
-  - search_media description opdateret med eksplicit forbud mod årstal i query.
+CHANGES vs previous version (v1.0.4 — search_plex_by_actor instruktør-fix):
+  - search_plex_by_actor: Tilføjet eksplicit advarsel om atværktøjet KUN
+    finder skuespillerroller i Plex — ikke instruktørfilm.
+    For instruktørspørgsmål ('hvilke Tarantino-film har vi?') skal Buddy
+    bruge get_person_filmography + check_plex_library i stedet.
+    Årsag: Tarantino instruerede 12 film men spiller kun i 7 — search_plex_by_actor
+    returnerede kun 7 og ignorerede resten.
 
-UNCHANGED:
-  - check_plex_library: tmdb_id tilføjet som valgfri parameter.
-    Aktiverer GUID-matching i Plex (Lag 0) der finder titler gemt under
-    fremmed navn (f.eks. 'Boundless' for 'Den grænseløse').
-  - check_franchise_status: instruks om at bruge dette ved 'den seneste',
-    'den nyeste' eller 'næste' film i en serie — uændret.
+UNCHANGED (v0.9.4 — search_media year-filter):
+  - search_media: valgfri `year` parameter, årstal sendes separat.
+  - check_plex_library: tmdb_id parameter for GUID-matching.
+  - check_franchise_status: instruks om 'den seneste'/'næste' i serie.
 """
 
 TOOLS = [
@@ -122,8 +121,15 @@ TOOLS = [
         "description": (
             "Hent den fulde filmografi for en person via TMDB person-ID. "
             "Returnerer ALLE film sorteret efter popularity (stoerste hits foerst) "
-            "samt top 10 TV-serier. Brug dette til karriere-spoergsmaal generelt. "
-            "Til fuld Plex-analyse med mangler og statistik: brug search_plex_by_actor."
+            "samt top 10 TV-serier. "
+            "BRUG DETTE naar brugeren spoerger om en INSTRUKTOER (f.eks. 'hvilke "
+            "Tarantino-film har vi?' eller 'vis mig Spielbergs film'). "
+            "Instruktoerfilm kan IKKE findes via search_plex_by_actor — det vaerktoej "
+            "finder kun skuespillerroller. Workflow for instruktoer-spoergsmaal: "
+            "1. Kald search_person for at finde person_id. "
+            "2. Kald get_person_filmography med person_id. "
+            "3. Kald check_plex_library parallelt for alle film i movie_credits. "
+            "Til skuespiller-analyse (ikke instruktoer): brug search_plex_by_actor."
         ),
         "input_schema": {
             "type": "object",
@@ -244,12 +250,13 @@ TOOLS = [
     {
         "name": "search_plex_by_actor",
         "description": (
-            "Completionist skuespiller-analyse: slaar op BAADE lokalt paa Plex OG "
-            "mod skuespillerens FULDE filmografi fra TMDB. "
-            "Returnerer: total_movies, owned_movies, found_on_plex, top_5_missing. "
-            "Brug dette NÅR brugeren spørger om en skuespiller — baade "
-            "'hvilke film har vi med X?', 'hvad mangler vi af X?' og "
-            "'hvor mange af X's film har vi?'. "
+            "Soeg i Plex efter film hvor en SKUESPILLER medvirker. "
+            "VIGTIGT: Dette vaerktoej finder KUN titler hvor personen optræder "
+            "som skuespiller i Plex-databasen — IKKE som instruktoer, producer osv. "
+            "Brug dette naar brugeren spoerger om en skuespiller: "
+            "'hvilke film har vi med Tom Hanks?', 'vis mig Cate Blanchetts film'. "
+            "Brug IKKE dette til instruktoer-spoergsmaal (Tarantino, Spielberg, Nolan osv.) "
+            "— brug i stedet get_person_filmography + check_plex_library. "
             "Input: actor_name (skuespillerens navn)."
         ),
         "input_schema": {
