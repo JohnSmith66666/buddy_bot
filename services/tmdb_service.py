@@ -458,21 +458,24 @@ async def search_person(query: str) -> list[dict]:
 
 async def get_person_filmography(person_id: int) -> dict | None:
     """
-    Hent den FULDE filmografi for en person via /movie_credits endpoint.
+    Hent filmografi for en person via /movie_credits endpoint.
 
-    Bruger /movie_credits (ikke /combined_credits) for at få ALLE film på én gang.
-    Filtrering: fjerner 'uncredited'-roller og poster uden release_date.
-    Deduplikering på tmdb_id — beholder posten med højest vote_count.
-    Sorteret efter popularity faldende.
+    Returnerer KUN film hvor personen er registreret som INSTRUKTØR (job="Director")
+    i crew-listen — ikke skuespillerroller. Dette reducerer Tarantinos 91 cast-film
+    til ~10 instruktørfilm, som passer komfortabelt inden for 6.000-chars-grænsen.
 
-    Token-optimering (v1.0.4): movie_credits returnerer kun 4 felter
-    (tmdb_id, title, original_title, release_date) — nok til Plex-tjek.
-    Fjernede felter: vote_average, vote_count, character, popularity.
-    Resultat: 91 film passer nu inden for 6000-chars-grænsen.
+    Hvis personen ikke har nogen crew-credits (dvs. er ren skuespiller),
+    falder vi tilbage til cast-listen for at stadig returnere noget brugbart.
+
+    Sorteret efter release_date (ældste først) — kronologisk rækkefølge er
+    mere intuitiv for instruktør-filmografier end popularity.
+
+    Token-optimering: kun 3 felter per film (tmdb_id, title, original_title,
+    release_date). biography, tv_credits og skuespillerroller fjernet.
     """
     async with httpx.AsyncClient(timeout=15) as client:
         try:
-            bio_resp, movie_credits_resp = await asyncio.gather(
+            bio_resp, credits_resp = await asyncio.gather(
                 client.get(f"{_BASE_URL}/person/{person_id}", params=_params()),
                 client.get(
                     f"{_BASE_URL}/person/{person_id}/movie_credits",
@@ -480,44 +483,49 @@ async def get_person_filmography(person_id: int) -> dict | None:
                 ),
             )
             bio_resp.raise_for_status()
-            movie_credits_resp.raise_for_status()
+            credits_resp.raise_for_status()
             bio        = bio_resp.json()
-            movie_data = movie_credits_resp.json()
+            movie_data = credits_resp.json()
         except httpx.HTTPError as e:
             logger.error("TMDB filmography error (id=%s): %s", person_id, e)
             return None
 
-    # TV-credits separat
-    tv_credits_raw = []
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            tv_resp = await client.get(
-                f"{_BASE_URL}/person/{person_id}/tv_credits",
-                params={"api_key": TMDB_API_KEY, "language": _LANGUAGE},
-            )
-            tv_resp.raise_for_status()
-            tv_credits_raw = tv_resp.json().get("cast", [])
-        except httpx.HTTPError as e:
-            logger.warning("TMDB TV credits error (id=%s): %s", person_id, e)
-
-    # Filtrer og dedupliker film
-    cast_raw = movie_data.get("cast", [])
-    seen: dict[int, dict] = {}
-    for item in cast_raw:
-        if not item.get("release_date"):
+    # ── Hent kun instruktørfilm fra crew-listen ───────────────────────────────
+    crew_raw = movie_data.get("crew", [])
+    directed: dict[int, dict] = {}
+    for item in crew_raw:
+        if item.get("job") != "Director":
             continue
-        if "uncredited" in (item.get("character") or "").lower():
+        if not item.get("release_date"):
             continue
         mid = item.get("id")
         if mid is None:
             continue
-        if mid not in seen or item.get("vote_count", 0) > seen[mid].get("vote_count", 0):
-            seen[mid] = item
+        if mid not in directed:
+            directed[mid] = item
 
-    movie_credits = sorted(seen.values(), key=lambda x: x.get("popularity", 0), reverse=True)
-    # ── Slim payload: kun de 4 felter Buddy faktisk bruger ────────────────────
-    # vote_average, vote_count, character og popularity fjernet —
-    # 91 film × 65 chars = ~5.900 chars → alle passer inden for 6000-grænsen.
+    # Fallback til cast hvis ingen crew-credits (ren skuespiller)
+    if not directed:
+        logger.info(
+            "get_person_filmography: ingen Director-credits for person_id=%s — falder tilbage til cast",
+            person_id,
+        )
+        cast_raw = movie_data.get("cast", [])
+        seen: dict[int, dict] = {}
+        for item in cast_raw:
+            if not item.get("release_date"):
+                continue
+            if "uncredited" in (item.get("character") or "").lower():
+                continue
+            mid = item.get("id")
+            if mid is None:
+                continue
+            if mid not in seen or item.get("vote_count", 0) > seen[mid].get("vote_count", 0):
+                seen[mid] = item
+        directed = seen
+
+    # Sortér kronologisk (ældste film først)
+    movie_credits = sorted(directed.values(), key=lambda x: x.get("release_date", ""))
     movie_credits = [
         {
             "tmdb_id":        m.get("id"),
@@ -528,16 +536,10 @@ async def get_person_filmography(person_id: int) -> dict | None:
         for m in movie_credits
     ]
 
-    # Top 10 TV-serier
-    tv_credits = sorted(tv_credits_raw, key=lambda x: x.get("popularity", 0), reverse=True)[:10]
-    tv_credits = [
-        {
-            "tmdb_id":  t.get("id"),
-            "title":    t.get("name") or t.get("original_name"),
-            "air_date": t.get("first_air_date", "Ukendt"),
-        }
-        for t in tv_credits
-    ]
+    logger.info(
+        "get_person_filmography: person_id=%s '%s' → %d film (Director-credits)",
+        person_id, bio.get("name"), len(movie_credits),
+    )
 
     return {
         "person_id":            person_id,
@@ -545,8 +547,6 @@ async def get_person_filmography(person_id: int) -> dict | None:
         "known_for_department": bio.get("known_for_department", "Ukendt"),
         "total_movie_credits":  len(movie_credits),
         "movie_credits":        movie_credits,
-        # biography, birthday, place_of_birth og tv_credits fjernet —
-        # Buddy bruger dem ikke til Plex-tjek og de koster ~900 chars overhead.
     }
 
 

@@ -82,9 +82,9 @@ _last_activity: dict[int, float] = {}
 _SESSION_TIMEOUT = 10 * 60
 _MAX_HISTORY = 6
 
-# Hævet fra 6.000 → 12.000 for at håndtere store filmografier (91+ film).
-# Tarantinos filmografi = ~10.000 chars med 4 felter per film.
-_MAX_TOOL_RESULT_CHARS = 12000
+# Tarantinos instruktørfilm: ~10 film × 98 chars = ~1.000 chars — passer fint i 6.000.
+# get_person_filmography returnerer nu kun crew/Director-film, ikke alle 91 cast-film.
+_MAX_TOOL_RESULT_CHARS = 6000
 
 SEARCH_SIGNAL  = "SHOW_SEARCH_RESULTS:"
 TRAILER_SIGNAL = "SHOW_TRAILER:"
@@ -103,11 +103,10 @@ def _trim(telegram_id: int) -> None:
         _histories[telegram_id] = hist[-_MAX_HISTORY:]
 
 
-def _slim_data(data, max_list_items: int = 40):
+def _slim_data(data, max_list_items: int = 10):
     """
     Rekursivt trim store lister og fjern None-værdier for at spare tokens.
-    max_list_items hævet til 40 (fra 10) for at bevare filmografi-lister.
-    To pas: max 40 items, derefter max 20 hvis stadig for lang.
+    To pas: max 10 items, derefter max 5 hvis stadig for lang.
     """
     if isinstance(data, dict):
         return {k: _slim_data(v, max_list_items) for k, v in data.items() if v is not None}
@@ -119,7 +118,7 @@ def _slim_data(data, max_list_items: int = 40):
 def _trim_tool_result(result: str) -> str:
     """
     Trim et tool-resultat til max _MAX_TOOL_RESULT_CHARS tegn.
-    To pas: max 40 items, derefter max 20 hvis stadig for lang.
+    To pas: max 10 items, derefter max 5 hvis stadig for lang.
     """
     if len(result) <= _MAX_TOOL_RESULT_CHARS:
         return result
@@ -131,7 +130,7 @@ def _trim_tool_result(result: str) -> str:
         compact = json.dumps(slimmed, ensure_ascii=False, separators=(",", ":"))
         if len(compact) <= _MAX_TOOL_RESULT_CHARS:
             return compact
-        slimmed2 = _slim_data(data, max_list_items=20)
+        slimmed2 = _slim_data(data, max_list_items=5)
         return json.dumps(slimmed2, ensure_ascii=False, separators=(",", ":"))
     except (json.JSONDecodeError, Exception) as e:
         logger.warning("Could not parse tool result as JSON: %s", e)
