@@ -926,8 +926,10 @@ async def check_actor_on_plex(
     plex_username: str | None = None,
 ) -> dict:
     """
-    Krydstjek en skuespillers top 20 film mod Plex.
-    Flow: TMDB person → filmografi → Plex GUID-match → fuzzy fallback.
+    Krydstjek en skuespillers top 75 film mod Plex.
+    Flow: TMDB person → filmografi (top 75) → Plex GUID-match → fuzzy fallback.
+    Top 75 (mod 20) fanger klassikere der er lavt placeret på TMDB's popularitetsliste
+    men stadig i biblioteket — f.eks. Tom Hanks' 38 Plex-film.
     """
     from services.tmdb_service import search_person, get_person_filmography
 
@@ -942,7 +944,7 @@ async def check_actor_on_plex(
     if not filmography:
         return {"status": "not_found", "message": f"Ingen filmografi fundet for '{actor_name}'."}
 
-    top_movies = filmography.get("movie_credits", [])[:20]
+    top_movies = filmography.get("movie_credits", [])[:75]
 
     return await asyncio.to_thread(
         partial(
