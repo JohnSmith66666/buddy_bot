@@ -767,10 +767,18 @@ def _franchise_plex_check_sync(
                     break
 
         if matched:
-            found_on_plex.append({"title": tmdb_title, "year": tmdb_year,
-                                   "match_method": match_method})
+            found_on_plex.append({
+                "title":        tmdb_title,
+                "year":         tmdb_year,
+                "tmdb_id":      tmdb_id,
+                "match_method": match_method,
+            })
         else:
-            missing_from_plex.append({"title": tmdb_title, "release_date": release or "Ukendt"})
+            missing_from_plex.append({
+                "title":        tmdb_title,
+                "release_date": release or "Ukendt",
+                "tmdb_id":      tmdb_id,
+            })
 
     found_count   = len(found_on_plex)
     missing_count = len(missing_from_plex)
@@ -782,7 +790,10 @@ def _franchise_plex_check_sync(
         guid_hits, found_count - guid_hits, missing_count,
     )
 
-    clean_found = [{"title": f["title"], "year": f["year"]} for f in found_on_plex]
+    clean_found = [
+        {"title": f["title"], "year": f["year"], "tmdb_id": f["tmdb_id"]}
+        for f in found_on_plex
+    ]
 
     return {
         "status":             "ok",
