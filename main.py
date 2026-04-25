@@ -522,7 +522,7 @@ async def on_startup(application: Application) -> None:
             "Sæt WEBHOOK_SECRET i Railway for at sikre endpointene."
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
-    logger.info("VERSION CHECK — TRAILER_SIGNAL: JA | dato: JA | signal-arkitektur: JA")
+    logger.info("VERSION CHECK — v0.9.1-beta | TRAILER_SIGNAL: JA | dato: JA | signal-arkitektur: JA")
 
 
 async def on_shutdown(application: Application) -> None:
