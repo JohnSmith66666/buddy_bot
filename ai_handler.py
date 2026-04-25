@@ -220,14 +220,25 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
     if tool_name == "get_popular_on_plex":
         days   = tool_input.get("days", 30)
         result = await get_popular_on_plex(
-            stats_count=10,  # Altid top 10 — uanset hvad Buddy sender
+            stats_count=10,
             time_range=days if days is not None else 30,
         )
         if not result:
             return j({"error": "Ingen data fra Tautulli."})
 
-        # Berig alle rækker med TMDB ID via title-opslag
-        async def _enrich_rows(rows: list, media_type: str) -> None:
+        # result er en liste af stat-blokke: [{"stat_id": "top_movies", "rows": [...]}, ...]
+        # Udtræk film- og TV-rækker via stat_id
+        top_movies: list = []
+        top_tv:     list = []
+        for block in result:
+            sid = block.get("stat_id", "")
+            if "movie" in sid:
+                top_movies = block.get("rows", [])
+            elif "tv" in sid or "show" in sid:
+                top_tv = block.get("rows", [])
+
+        # Berig med TMDB IDs parallelt
+        async def _enrich(rows: list, media_type: str) -> None:
             lookup_fn = _lookup_movie if media_type == "movie" else _lookup_tv
             lookups   = await asyncio.gather(*[lookup_fn(r.get("title", "")) for r in rows])
             for row, tmdb_id in zip(rows, lookups):
@@ -236,10 +247,11 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
                     row["media_type"] = media_type
 
         await asyncio.gather(
-            _enrich_rows(result.get("top_movies") or [], "movie"),
-            _enrich_rows(result.get("top_tv")     or [], "tv"),
+            _enrich(top_movies, "movie"),
+            _enrich(top_tv,     "tv"),
         )
-        return j(result)
+
+        return j({"top_movies": top_movies, "top_tv": top_tv})
     if tool_name == "get_user_watch_stats":
         if not plex_username:
             return j({"error": "Intet Plex-brugernavn fundet."})
