@@ -288,7 +288,13 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
 
 
 async def get_tmdb_collection_movies(keyword: str) -> dict | None:
-    """Søg efter en TMDB-samling og returner alle film med tmdb_id, title, original_title."""
+    """
+    Søg efter TMDB-samlinger og returner alle film med tmdb_id, title, original_title.
+
+    Henter ALLE collections der matcher keyword (ikke kun den første) og merger
+    deres film. Dette sikrer at f.eks. både danske og norske Olsen-banden-samlinger
+    fanges i én søgning.
+    """
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             search_resp = await client.get(
@@ -303,43 +309,61 @@ async def get_tmdb_collection_movies(keyword: str) -> dict | None:
         if not search_results:
             return None
 
-        top             = search_results[0]
-        collection_id   = top.get("id")
-        collection_name = top.get("name") or top.get("original_name") or keyword
+        # Hent detaljer for ALLE matchende collections og merge filmene
+        all_movies:       dict[int, dict] = {}  # tmdb_id → movie dict (dedupliker)
+        collection_names: list[str]       = []
 
-        logger.info("TMDB collection: '%s' → '%s' (id=%s)", keyword, collection_name, collection_id)
+        for collection in search_results:
+            collection_id   = collection.get("id")
+            collection_name = collection.get("name") or collection.get("original_name") or keyword
 
-        try:
-            detail_resp = await client.get(
-                f"{_BASE_URL}/collection/{collection_id}", params=_params()
+            logger.info(
+                "TMDB collection: '%s' → '%s' (id=%s)",
+                keyword, collection_name, collection_id,
             )
-            detail_resp.raise_for_status()
-            detail = detail_resp.json()
-        except httpx.HTTPError as e:
-            logger.error("TMDB collection detail error (id=%s): %s", collection_id, e)
-            return None
 
-    parts  = detail.get("parts", [])
-    movies = []
-    for part in parts:
-        title          = part.get("title") or part.get("original_title") or ""
-        original_title = part.get("original_title") or title
-        tmdb_id        = part.get("id")
-        if not title or not tmdb_id:
-            continue
-        movies.append({
-            "tmdb_id":        tmdb_id,
-            "title":          title,
-            "original_title": original_title,
-            "release_date":   part.get("release_date") or "Ukendt",
-        })
+            try:
+                detail_resp = await client.get(
+                    f"{_BASE_URL}/collection/{collection_id}", params=_params()
+                )
+                detail_resp.raise_for_status()
+                detail = detail_resp.json()
+            except httpx.HTTPError as e:
+                logger.warning(
+                    "TMDB collection detail fejl (id=%s): %s — springer over",
+                    collection_id, e,
+                )
+                continue
 
-    movies.sort(key=lambda x: x["release_date"])
-    logger.info("TMDB collection '%s': %d film fundet", collection_name, len(movies))
+            collection_names.append(collection_name)
+
+            for part in detail.get("parts", []):
+                tmdb_id        = part.get("id")
+                title          = part.get("title") or part.get("original_title") or ""
+                original_title = part.get("original_title") or title
+                if not title or not tmdb_id:
+                    continue
+                if tmdb_id not in all_movies:
+                    all_movies[tmdb_id] = {
+                        "tmdb_id":        tmdb_id,
+                        "title":          title,
+                        "original_title": original_title,
+                        "release_date":   part.get("release_date") or "Ukendt",
+                    }
+
+    if not all_movies:
+        return None
+
+    movies          = sorted(all_movies.values(), key=lambda x: x["release_date"])
+    merged_name     = " + ".join(collection_names) if len(collection_names) > 1 else collection_names[0]
+    logger.info(
+        "TMDB collection '%s': %d film fundet fra %d samlinger",
+        merged_name, len(movies), len(collection_names),
+    )
 
     return {
-        "collection_id":   collection_id,
-        "collection_name": collection_name,
+        "collection_id":   None,  # Flere collections — intet enkelt ID
+        "collection_name": merged_name,
         "total_parts":     len(movies),
         "movies":          movies,
     }
