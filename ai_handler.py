@@ -1,19 +1,18 @@
 """
 ai_handler.py - Agentic loop for Buddy.
 
-CHANGES vs previous version (0.9.2-beta cache-optimering):
-  - SLANKERE DYNAMISK BLOK: Forklaringen om dato-sammenligning er fjernet
-    fra dynamic_lines. Reglen er allerede i _SYSTEM_PROMPT_BODY under
-    "## Absolut tillid til værktøjer" og caches dér. Tidligere blev de
-    ~150 tokens forklaring sendt UCACHET ved hvert eneste request — nu
-    sendes kun den faktiske dato (~30 tokens) ucachet. Estimeret
-    besparelse: ~120 tokens per kald.
-  - Ingen ændringer i tool-dispatch, parallel execution, max_tokens-håndtering
-    eller cache_control på system-blokke og tools.
+CHANGES vs previous version (0.9.3-beta — persona-rens + svartids-vinkel):
+  - get_ai_response() tager nu user_first_name (hentes fra database.telegram_name
+    i main.py og videresendes hertil). Bruges af get_system_prompt() til at
+    indsætte fornavnet i persona-prompten — Buddy tiltaler dermed brugeren ved
+    fornavn uden at skulle gætte.
+  - SLANKERE DYNAMISK BLOK: Dato-forklaringen (~150 tokens) er fjernet fra
+    dynamic_lines. Reglen ligger nu kun i _SYSTEM_PROMPT_BODY (cachet).
+    Dynamisk blok indeholder NU kun: dags dato + plex_username. Sparer ~120
+    tokens per request, hvilket giver ~200ms hurtigere TTFB.
 
 Tidligere ændringer (bevares):
   - INFO_SIGNAL = "SHOW_INFO:" — bruges af main.py til at åbne Netflix-look infokort.
-    Format: SHOW_INFO:<tmdb_id>:<media_type>
   - Parallel tool execution via asyncio.gather.
   - max_tokens-håndtering returnerer partial reply med note.
   - ZoneInfo("Europe/Copenhagen") for korrekt dansk dato på Railway (UTC).
@@ -349,6 +348,7 @@ async def get_ai_response(
     user_message: str,
     plex_username: str | None = None,
     persona_id: str = "buddy",
+    user_first_name: str | None = None,
 ) -> str:
     """
     Run the full agentic loop and return Buddy's reply.
@@ -356,9 +356,10 @@ async def get_ai_response(
     System-prompt arkitektur (to blokke):
       Blok 0 — system-prompt med cache_control: ephemeral
                Indeholder body (regler) + persona-prompt sidst.
-               Caches af Anthropic og genbruges på tværs af kald.
-               Persona-skift invaliderer kun den sidste lille del af cachen,
-               IKKE de ~4000 tokens regler ovenover (ny arkitektur 0.9.2).
+               Persona-prompten har fornavnet interpoleret før caching, så
+               cachen er stabil per (persona_id, user_first_name)-kombo.
+               I praksis: hver bruger får sin egen cache-streng, men
+               regelblokken ovenover er identisk og caches på serveren.
 
       Blok 1 — Dynamisk kontekst UDEN cache_control
                Indeholder KUN dags dato og plex_username. Reglen om
@@ -368,11 +369,11 @@ async def get_ai_response(
     _histories[telegram_id].append({"role": "user", "content": user_message})
     _trim(telegram_id)
 
-    # ── Blok 0: stabil, cachet system-prompt (body + persona) ─────────────────
+    # ── Blok 0: stabil, cachet system-prompt (body + persona med fornavn) ────
     system_blocks = [
         {
             "type": "text",
-            "text": get_system_prompt(persona_id),
+            "text": get_system_prompt(persona_id, user_first_name),
             "cache_control": {"type": "ephemeral"},
         }
     ]

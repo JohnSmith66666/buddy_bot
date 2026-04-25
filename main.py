@@ -1,11 +1,25 @@
 """
 main.py - Buddy bot entry point.
 
-CHANGES vs previous version:
-  - handle_watchlist_callback importeret fra confirmation_service
-    (ikke defineret her længere — al confirmation-logik er samlet dér).
+CHANGES vs previous version (0.9.3-beta — persona-rens):
+  - FJERNET: cmd_persona, persona_callback, /persona-kommando og
+    persona-callback-handler. Buddy er nu eneste persona — /persona-menuen
+    er fjernet for at simplificere UX.
+  - FJERNET: import af all_personas (kun Buddy tilbage).
+  - get_persona stadig importeret fordi persona_id stadig bor i databasen
+    (bagudkompatibelt) — men er reelt altid 'buddy' nu.
+  - TILTALE: handle_text sender nu user.first_name med til get_ai_response,
+    så Buddy kan tiltale brugeren ved navn uden at gætte. Hentes direkte fra
+    update.effective_user — ingen ekstra DB-opslag nødvendigt.
+  - VERSION CHECK opdateret til v0.9.3-beta med id-hallucination-fix og
+    cache-optimeret-flags.
+
+Tidligere ændringer (bevares):
+  - handle_watchlist_callback importeret fra confirmation_service.
   - Duplikeret watchlist-handler fjernet fra main.py.
-  - Alle andre handlers uændrede.
+  - SHOW_INFO, SHOW_TRAILER, SHOW_SEARCH_RESULTS signal-handling.
+  - escape_markdown for URL-underscores.
+  - Webhook server på port 8080 med valgfri token-tjek.
 """
 
 import asyncio
@@ -29,7 +43,7 @@ import config
 import database
 from admin_handlers import handle_approve_callback, notify_admin_new_user
 from ai_handler import INFO_SIGNAL, SEARCH_SIGNAL, TRAILER_SIGNAL, check_session_timeout, clear_history, get_ai_response
-from personas import all_personas, get_persona
+from personas import get_persona
 from services.confirmation_service import (
     execute_order,
     handle_watchlist_callback,
@@ -139,75 +153,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await update.message.reply_text(reply)
     await database.log_message(user.id, "outgoing", reply)
-
-
-async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Vis persona-menu som inline keyboard."""
-    if not await _guard(update):
-        return
-    user       = update.effective_user
-    current_id = await database.get_persona(user.id)
-    current    = get_persona(current_id)
-
-    keyboard = []
-    for p in all_personas():
-        label = f"{'✅ ' if p['id'] == current_id else ''}{p['emoji']} {p['navn']}"
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"persona:{p['id']}")])
-
-    await update.message.reply_text(
-        f"🎭 *Vælg din assistent*\n\n"
-        f"Aktiv: {current['emoji']} *{current['navn']}*\n"
-        f"_{current['beskrivelse']}_",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-
-async def persona_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Håndtér persona-valg fra inline keyboard."""
-    query = update.callback_query
-    await query.answer()
-
-    persona_id = query.data.replace("persona:", "")
-    user_id    = query.from_user.id
-    persona    = get_persona(persona_id)
-
-    await database.set_persona(user_id, persona_id)
-    clear_history(user_id)  # Nulstil historik ved persona-skift
-
-    keyboard = []
-    for p in all_personas():
-        label = f"{'✅ ' if p['id'] == persona_id else ''}{p['emoji']} {p['navn']}"
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"persona:{p['id']}")])
-
-    await query.edit_message_text(
-        f"🎭 *Vælg din assistent*\n\n"
-        f"Aktiv: {persona['emoji']} *{persona['navn']}*\n"
-        f"_{persona['beskrivelse']}_\n\n"
-        f"✅ Skiftet til *{persona['navn']}*! Snak løs 🎬",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    logger.info("Persona skiftet: telegram_id=%s → %s", user_id, persona_id)
-
-    # Send velkomstbesked med billede hvis persona har et
-    if persona.get("image_path"):
-        import os
-        img_path = persona["image_path"]
-        if os.path.exists(img_path):
-            try:
-                with open(img_path, "rb") as img:
-                    await context.bot.send_photo(
-                        chat_id=query.message.chat_id,
-                        photo=img,
-                        caption=(
-                            f"*{persona['navn']}* her! 🍺\n"
-                            f"Skriv hvad du vil, min dreng — jeg er klar!"
-                        ),
-                        parse_mode="Markdown",
-                    )
-            except Exception as e:
-                logger.warning("Kunne ikke sende persona-billede: %s", e)
 
 
 async def cmd_skift_plex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -367,6 +312,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         user_message=text,
         plex_username=plex_username,
         persona_id=persona_id,
+        user_first_name=user.first_name,
     )
 
     # Slet loading-beskeden
@@ -522,7 +468,7 @@ async def on_startup(application: Application) -> None:
             "Sæt WEBHOOK_SECRET i Railway for at sikre endpointene."
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
-    logger.info("VERSION CHECK — v0.9.1-beta | TRAILER_SIGNAL: JA | dato: JA | signal-arkitektur: JA")
+    logger.info("VERSION CHECK — v0.9.3-beta | TRAILER_SIGNAL: JA | dato: JA | signal-arkitektur: JA | cache-optimeret: JA | id-hallucination-fix: JA | persona-rens: JA")
 
 
 async def on_shutdown(application: Application) -> None:
@@ -543,13 +489,9 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start",      cmd_start))
     app.add_handler(CommandHandler("skift_plex", cmd_skift_plex))
-    app.add_handler(CommandHandler("persona",    cmd_persona))
 
     # Admin approval
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve_user:\d+$"))
-
-    # Persona-valg
-    app.add_handler(CallbackQueryHandler(persona_callback, pattern=r"^persona:"))
 
     # Bestillingsflow
     app.add_handler(CallbackQueryHandler(handle_pick_callback,      pattern=r"^pick:"))

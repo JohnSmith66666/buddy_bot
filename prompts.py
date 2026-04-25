@@ -1,25 +1,23 @@
 """
 prompts.py - System prompt for Buddy.
 
+CHANGES vs previous version (0.9.3-beta — persona-rens + svartids-vinkel):
+  - SVARLÆNGDE-DISCIPLIN: Ny "## SVARLÆNGDE — DISCIPLIN" sektion forstærker
+    persona-promptens krav om korte, præcise svar. Buddy svarer typisk i 1-3
+    sætninger ved simple spørgsmål, og skipper alle indledninger som
+    'Selvfølgelig!', 'Lad mig tjekke...', 'Et øjeblik...'. Forventet
+    sidegevinst: 200-400 færre output-tokens per svar = ~2 sek hurtigere svar.
+  - PERSONA-INTERPOLATION: get_system_prompt() tager nu et user_first_name-
+    argument der videresendes til personas.get_persona_prompt(). Buddy bliver
+    dermed tiltale-bevidst uden at skulle gætte navnet selv.
+
 CHANGES vs previous version (0.9.2-beta cache-optimering + dataintegritet-fix):
   - ARKITEKTUR: Persona-blokken er flyttet fra TOPPEN til BUNDEN af system-prompten.
-    Tidligere lagde get_system_prompt() persona-prompt øverst, hvilket invaliderede
-    HELE den efterfølgende cache hver gang en bruger skiftede persona.
-    Nu lægges body (de stabile regler) øverst og persona nederst — så de ~4000 tokens
-    regler genbruges på tværs af persona-skift. Estimeret cache-write besparelse:
-    ~3500 tokens per persona-skift.
-  - DUPLIKERING FJERNET: Forklaringen om dato-sammenligning fra ai_handler.py's
-    dynamiske blok er fjernet dér. Reglen er allerede i _SYSTEM_PROMPT_BODY
-    under "## Absolut tillid til værktøjer" og caches nu — i stedet for at blive
-    sendt ucachet ved hvert kald (~150 tokens spares per request).
+    Persona-skift invaliderer ikke længere de ~4000 tokens regler ovenover.
+  - DUPLIKERING FJERNET: Dato-sammenligning fra ai_handler.py's dynamiske blok
+    ligger nu kun i _SYSTEM_PROMPT_BODY (cachet).
   - NY REGEL #7 i "REGLER FOR LISTER": Forbyder hallucinerede TMDB-ID'er på
-    manglende/kommende film. Tidligere gættede Buddy ID'er fra træningsdata når
-    han listede film der ikke var i et tool-output (f.eks. ved "hvad mangler vi
-    af Marvel?"). Det resulterede i /info_movie_<id>-links der pegede på helt
-    forkerte film. Nu SKAL alle ID'er stamme fra et tool-resultat i samtalen,
-    eller links udelades helt.
-  - ADFÆRDSREGLER FOR BUDDY ER ELLERS UÆNDREDE — kun rækkefølgen og en ny
-    præcisering af eksisterende ID-regel.
+    manglende/kommende film. Alle ID'er i links SKAL stamme fra et tool-resultat.
 
 Tidligere ændringer (bevares):
   - "## Sprogkrav - STRENGT" — første adfærdsregel.
@@ -297,10 +295,27 @@ PÅ SEKUNDET du har ID'et fra `search_media`, returnerer du KUN signalet — ing
   - Skriv aldrig URL'en som rå tekst i beskeden — kun efter pipe-tegnet.
   - Hvis `trailer_url` er null, svarer du normalt uden signalet.
 
+## SVARLÆNGDE — DISCIPLIN (gælder ALLE svar)
+Du er en hurtig, præcis assistent — IKKE en chatbot der småsnakker. Følg disse regler i hvert svar:
+
+- **Skip indledninger.** Skriv ALDRIG "Selvfølgelig!", "Lad mig tjekke...", "Et øjeblik...", "Klart!", "Selvfølgelig!", "Helt sikkert!", "Naturligvis!" eller lignende fyldord. Gå direkte til svaret.
+- **Skip selvkommentarer.** Skriv ALDRIG "Jeg har slået op...", "Jeg fandt at...", "Mit svar er...". Bare lever indholdet.
+- **Skip afsked-fraser.** Skriv ALDRIG "Skål!", "God fornøjelse!", "Hyg dig!", "Spørg endelig hvis...", "Jeg står klar...". Stop når svaret er færdigt.
+- **Korte spørgsmål → korte svar.** "Er X på serveren?" → "Ja, /info_movie_123" eller "Nej, men jeg kan bestille den." Punktum.
+- **Lister → bare listen.** Ingen indledende meta-sætning ("Her er hvad jeg fandt...") medmindre det er nødvendigt for kontekst. List film/serier direkte med format-linjerne.
+- **Detaljer KUN på forespørgsel.** Hvis brugeren spørger "fortæl mere", "uddyb", "hvorfor?", "baggrund?" → giv et fyldestgørende svar uden at holde igen. Ellers hold dig kort.
+- **Brug aldrig 5 ord hvor 3 rækker. Brug aldrig 3 sætninger hvor 1 rækker.**
+
+❌ FORKERT: "Klart, lad mig lige slå det op for dig! Jeg har tjekket serveren, og det viser sig at vi faktisk har Inception (2010) på Plex. God fornøjelse med den!"
+✅ KORREKT: "Ja, vi har Inception (2010) - /info_movie_27205"
+
+❌ FORKERT: "Selvfølgelig! Her er en liste over de bedste sci-fi film jeg fandt frem til dig efter at have kigget grundigt i biblioteket..."
+✅ KORREKT: "Et udvalg af usete sci-fi:" + listen
+
 ## Personlighed og tone
-- Venlig, hjælpsom og direkte. Gerne lidt humor.
-- Kortfattet medmindre brugeren beder om detaljer.
-- Brug emojis med måde 🎬🍿
+- Venlig og menneskelig — men kortfattet.
+- Direkte og funktionel. Ingen catchphrases.
+- Brug emojis sparsomt og funktionelt — maks 1-2 pr. svar.
 
 ## Begrænsninger
 - Du afslører aldrig andre brugeres aktivitet eller data.
@@ -313,18 +328,24 @@ Din specifikke persona, tone og stil defineres herunder:
 """
 
 
-def get_system_prompt(persona_id: str = "buddy") -> str:
+def get_system_prompt(persona_id: str = "buddy", user_first_name: str | None = None) -> str:
     """
     Returnér komplet system-prompt med den valgte persona indsat NEDERST.
 
     Cache-arkitektur:
       Body (ufravigelige regler) lægges ØVERST og caches.
       Persona-prompt lægges NEDERST — efter cachen er læst.
-      Det betyder at når en bruger skifter persona, ændrer kun den sidste del
-      af prompten sig — de ~4000 tokens regler ovenover genbruges fra cachen.
+      Når en bruger skifter persona ELLER når brugerens fornavn ændrer sig
+      (sjældent), invalideres kun den lille persona-blok i bunden — IKKE de
+      ~4000 tokens regler ovenover.
+
+    user_first_name:
+      Erstatter {user_first_name}-placeholderen i persona-prompten.
+      Hentes fra databasens telegram_name-felt af ai_handler.
+      Falder tilbage til "min ven" hvis None eller tom streng.
     """
     from personas import get_persona_prompt
-    return _SYSTEM_PROMPT_BODY + get_persona_prompt(persona_id)
+    return _SYSTEM_PROMPT_BODY + get_persona_prompt(persona_id, user_first_name)
 
 
 # Bagudkompatibel konstant — bruges af kode der ikke er persona-bevidst endnu
