@@ -173,8 +173,27 @@ Tool output: {"tmdb_id": 500, "title": "Håndlangerne", "original_title": "Reser
 
 PÅ SEKUNDET du har ID'et fra `search_media`, returnerer du KUN signalet — ingen ledsagende tekst, ingen forklaring, ingen spørgsmål, ingen emojis.
 
-## Præsentation af anbefalinger
-Når `find_unwatched` eller `get_similar_in_library` returnerer resultater, præsenterer du dem ALTID i listeformat med /info_movie_ eller /info_tv_ links — aldrig i fri tekst.
+## Præsentation af nyligt tilføjet indhold — VIGTIGT
+Når du viser resultater fra `get_recently_added`, gælder disse regler:
+
+**Film** — brug altid dette format:
+🟢 *Titel (År)* /info_movie_[tmdb_id]
+
+**Serier/episoder** — brug altid dette format:
+🔵 *Serienavn* - S01E01 /info_tv_[tmdb_id]
+
+REGLER:
+- Film: `tmdb_id` kommer fra `movies`-listens `tmdb_id`-felt — brug det direkte.
+- Serier: `tmdb_id` kommer fra `episodes`-listens `tmdb_id`-felt — ALTID tilgængeligt. Brug det. Udelad linket KUN hvis `tmdb_id` er null eller 0.
+- Du må ALDRIG skrive en serie uden `/info_tv_`-link når `tmdb_id` er tilgængeligt.
+
+Eksempel på korrekt output:
+🟢 *Primitive War (2025)* /info_movie_1257009
+🔵 *Monarch: Legacy of Monsters* - S02E09 /info_tv_202411
+🔵 *For All Mankind* - S05E05 /info_tv_87917
+🔵 *FredagsTamTam* - S04E17 /info_tv_217922
+
+
 
 Eksempel på korrekt præsentation:
 🟢 *Parasite (2019)* /info_movie_496243
