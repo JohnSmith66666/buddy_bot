@@ -1,7 +1,17 @@
 """
 services/confirmation_service.py - Bestillingsflow og Netflix-look infokort.
 
-CHANGES vs previous version (v0.9.6 — execute_order foto-fix):
+CHANGES vs previous version (v0.9.7 — søgeresultater UX-fix):
+  - show_search_results(): Tre forbedringer:
+    1. Årstal fallback: viser "?" hvis release_date mangler i TMDB (f.eks.
+       upremierede film som "The Doctrine 2026") i stedet for bare titlen.
+    2. Duplikat-skelnen: tilføjer type-label "· Film" eller "· Serie" til
+       knap-label så to titler med samme navn men ingen dato skelnes.
+    3. Tilbage-knap: "⬅️ Tilbage"-knap gemmer søgeterm og media_type i
+       pending_requests så brugeren kan søge igen uden at taste forfra.
+       Kræver ny back:-handler i main.py.
+
+UNCHANGED (v0.9.6 — execute_order foto-fix):
   - KRITISK FIX: execute_order() brugte altid edit_message_text() — men når
     infokort er sendt som sendPhoto() (plakat), crasher det med:
     "BadRequest: There is no text in the message to edit".
@@ -144,12 +154,28 @@ async def show_search_results(
 
     top = results[:5]
     buttons = []
+
+    # Byg sæt af labels vi allerede har tilføjet — bruges til at opdage duplikater
+    seen_labels: set[str] = set()
+
     for item in top:
         title   = item.get("title") or "Ukendt"
         year    = (item.get("release_date") or item.get("first_air_date") or "")[:4]
         mtype   = item.get("media_type", media_type if media_type != "both" else "movie")
         tmdb_id = item.get("id")
-        label   = f"{title} ({year})" if year else title
+
+        # Årstal-fallback: vis "?" hvis datoen mangler (upremierede titler)
+        year_str = year if year else "?"
+
+        # Basis-label
+        label = f"{title} ({year_str})"
+
+        # Tilføj type-label hvis label-duplikat opstår (f.eks. to "The Doctrine (?)")
+        if label in seen_labels:
+            type_label = "Film" if mtype == "movie" else "Serie"
+            label = f"{title} ({year_str}) · {type_label}"
+
+        seen_labels.add(label)
 
         token = _make_token()
         await database.save_pending_request(token, message.chat_id, {
@@ -160,6 +186,16 @@ async def show_search_results(
             "step":       "picked",
         })
         buttons.append([InlineKeyboardButton(label, callback_data=f"pick:{token}")])
+
+    # Tilbage-knap: gemmer søgeterm og media_type så brugeren kan søge igen
+    back_token = _make_token()
+    await database.save_pending_request(back_token, message.chat_id, {
+        "media_type":   media_type,
+        "tmdb_id":      0,
+        "title":        query,   # genbrugt som søgeterm i back:-handleren
+        "year":         None,
+        "step":         "back",
+    })
 
     buttons.append([InlineKeyboardButton("❌ Annuller", callback_data="cancel:none")])
 

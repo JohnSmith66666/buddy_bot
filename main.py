@@ -1,23 +1,16 @@
 """
 main.py - Buddy bot entry point.
 
-CHANGES vs previous version (0.9.3-beta — persona-rens):
-  - FJERNET: cmd_persona, persona_callback, /persona-kommando og
-    persona-callback-handler. Buddy er nu eneste persona — /persona-menuen
-    er fjernet for at simplificere UX.
-  - FJERNET: import af all_personas (kun Buddy tilbage).
-  - get_persona stadig importeret fordi persona_id stadig bor i databasen
-    (bagudkompatibelt) — men er reelt altid 'buddy' nu.
-  - TILTALE: handle_text sender nu user.first_name med til get_ai_response,
-    så Buddy kan tiltale brugeren ved navn uden at gætte. Hentes direkte fra
-    update.effective_user — ingen ekstra DB-opslag nødvendigt.
-  - VERSION CHECK opdateret til v0.9.3-beta med id-hallucination-fix og
-    cache-optimeret-flags.
+CHANGES vs previous version (v0.9.7 — søgeresultater UX-fix):
+  - Tilføjet handle_back_callback: håndterer ⬅️ Tilbage-knappen i søgeresultatlisten.
+    Henter søgeterm og media_type fra pending_request og viser listen igen.
+  - Registreret back:-handler i main() under bestillingsflow.
+  - VERSION CHECK opdateret til v0.9.7-beta.
 
 Tidligere ændringer (bevares):
+  - v0.9.5: user_first_name sendes til get_ai_response.
+  - v0.9.3: persona-rens, SHOW_INFO/TRAILER/SEARCH_RESULTS signal-arkitektur.
   - handle_watchlist_callback importeret fra confirmation_service.
-  - Duplikeret watchlist-handler fjernet fra main.py.
-  - SHOW_INFO, SHOW_TRAILER, SHOW_SEARCH_RESULTS signal-handling.
   - escape_markdown for URL-underscores.
   - Webhook server på port 8080 med valgfri token-tjek.
 """
@@ -207,6 +200,36 @@ async def handle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
     await query.edit_message_text("Bestillingen blev annulleret. 👍")
 
 
+async def handle_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Bruger trykkede ⬅️ Tilbage i søgeresultatlisten.
+    Henter søgeterm og media_type fra pending_request og viser listen igen.
+    title-feltet genbruges til at gemme søgetermen.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    if not await _guard(update):
+        return
+
+    token = query.data.split(":", 1)[1]
+    pending = await database.get_pending_request(token)
+    if not pending:
+        await query.edit_message_text("Sessionen er udløbet — start forfra.")
+        return
+
+    search_query = pending["title"]       # title-feltet genbruges som søgeterm
+    media_type   = pending["media_type"]
+
+    # Slet den eksisterende besked og vis søgelisten på ny
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    await show_search_results(query.message, search_query, media_type)
+
+
 # ── /info_movie_<id> og /info_tv_<id> handler ────────────────────────────────
 
 async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -271,8 +294,6 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await show_confirmation(update.message, context, token, plex_username,
                             loading_msg=loading_msg)
 
-
-# ── Watchlist callback ────────────────────────────────────────────────────────
 
 # ── Message handler ───────────────────────────────────────────────────────────
 
@@ -351,7 +372,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     "title":      "Slår op...",
                     "step":       "picked",
                 })
-                await show_confirmation(update.message, context, token, plex_username)
+                await show_confirmation(update.message, context, token,
+                                        plex_username)
                 return
             except Exception as e:
                 logger.error("Fejl ved håndtering af SHOW_INFO: %s", e)
@@ -442,10 +464,11 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
     """
     logger.error(
         "Uventet fejl ved håndtering af update:\n%s",
-        "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__)),
+        "".join(traceback.format_exception(
+            type(context.error), context.error, context.error.__traceback__
+        )),
     )
 
-    # Forsøg at sende en venlig besked til brugeren
     if isinstance(update, Update) and update.effective_message:
         try:
             await update.effective_message.reply_text(
@@ -468,7 +491,11 @@ async def on_startup(application: Application) -> None:
             "Sæt WEBHOOK_SECRET i Railway for at sikre endpointene."
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
-    logger.info("VERSION CHECK — v0.9.3-beta | TRAILER_SIGNAL: JA | dato: JA | signal-arkitektur: JA | cache-optimeret: JA | id-hallucination-fix: JA | persona-rens: JA")
+    logger.info(
+        "VERSION CHECK — v0.9.7-beta | "
+        "søgeresultater-UX: JA | foto-fix: JA | årstal-fallback: JA | "
+        "tilbage-knap: JA | already-anmodet-check: JA | user_first_name: JA"
+    )
 
 
 async def on_shutdown(application: Application) -> None:
@@ -498,6 +525,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_confirm_callback,   pattern=r"^confirm:"))
     app.add_handler(CallbackQueryHandler(handle_cancel_callback,    pattern=r"^cancel:"))
     app.add_handler(CallbackQueryHandler(handle_watchlist_callback, pattern=r"^watchlist:"))
+    app.add_handler(CallbackQueryHandler(handle_back_callback,      pattern=r"^back:"))
 
     # Info-links fra lister — fleksibelt regex fanger både /info_movie_123 og /infomovie123
     app.add_handler(MessageHandler(
