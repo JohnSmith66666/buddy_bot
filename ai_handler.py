@@ -227,7 +227,6 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
             return j({"error": "Ingen data fra Tautulli."})
 
         # result er en liste af stat-blokke: [{"stat_id": "top_movies", "rows": [...]}, ...]
-        # Udtræk film- og TV-rækker via stat_id
         top_movies: list = []
         top_tv:     list = []
         for block in result:
@@ -237,19 +236,19 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
             elif "tv" in sid or "show" in sid:
                 top_tv = block.get("rows", [])
 
-        # Berig med TMDB IDs parallelt
-        async def _enrich(rows: list, media_type: str) -> None:
-            lookup_fn = _lookup_movie if media_type == "movie" else _lookup_tv
-            lookups   = await asyncio.gather(*[lookup_fn(r.get("title", "")) for r in rows])
-            for row, tmdb_id in zip(rows, lookups):
-                if tmdb_id:
-                    row["tmdb_id"]    = tmdb_id
-                    row["media_type"] = media_type
-
-        await asyncio.gather(
-            _enrich(top_movies, "movie"),
-            _enrich(top_tv,     "tv"),
+        # Berig med TMDB IDs — brug modulniveau-funktioner direkte (undgår scoping-fejl)
+        movie_ids, tv_ids = await asyncio.gather(
+            asyncio.gather(*[_lookup_movie(r.get("title", "")) for r in top_movies]),
+            asyncio.gather(*[_lookup_tv(r.get("title", ""))    for r in top_tv]),
         )
+        for row, tmdb_id in zip(top_movies, movie_ids):
+            if tmdb_id:
+                row["tmdb_id"]    = tmdb_id
+                row["media_type"] = "movie"
+        for row, tmdb_id in zip(top_tv, tv_ids):
+            if tmdb_id:
+                row["tmdb_id"]    = tmdb_id
+                row["media_type"] = "tv"
 
         return j({"top_movies": top_movies, "top_tv": top_tv})
     if tool_name == "get_user_watch_stats":
