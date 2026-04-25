@@ -1,7 +1,12 @@
 """
 services/confirmation_service.py - Bestillingsflow og Netflix-look infokort.
 
-CHANGES vs previous version (v0.9.7 — søgeresultater UX-fix):
+CHANGES vs previous version (v0.9.8 — Annuller-knap på infokort):
+  - show_confirmation(): Tilføjet ❌ Annuller-knap nederst i infokortets keyboard.
+    Brugeren kan nu afvise et infokort uden at starte forfra.
+    Bruger cancel:none callback — samme handler som søgelistens Annuller.
+
+UNCHANGED (v0.9.7 — søgeresultater UX-fix):
   - show_search_results(): Tre forbedringer:
     1. Årstal fallback: viser "?" hvis release_date mangler i TMDB (f.eks.
        upremierede film som "The Doctrine 2026") i stedet for bare titlen.
@@ -320,6 +325,8 @@ async def show_confirmation(
 
     if trailer_url:
         button_rows.append([InlineKeyboardButton("🎬 Se Trailer", url=trailer_url)])
+
+    button_rows.append([InlineKeyboardButton("❌ Annuller", callback_data="cancel:none")])
 
     keyboard = InlineKeyboardMarkup(button_rows)
     caption  = _build_caption(details, rating=plex_rating)
