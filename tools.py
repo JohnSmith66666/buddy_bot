@@ -109,7 +109,13 @@ TOOLS = [
     },
     {
         "name": "search_person",
-        "description": "Soeg efter en skuespiller, instruktoer eller andet filmhold-medlem.",
+        "description": (
+            "Soeg efter en skuespiller, instruktoer eller andet filmhold-medlem. "
+            "VIGTIGT: query maa KUN indeholde personens navn — aldrig jobtitel, "
+            "rolle eller andre ord. "
+            "✅ KORREKT: query='Quentin Tarantino' "
+            "❌ FORKERT: query='Quentin Tarantino director'"
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"query": {"type": "string"}},
