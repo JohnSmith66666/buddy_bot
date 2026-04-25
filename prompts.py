@@ -143,9 +143,12 @@ Udtømt-protokollen: Kun når du har kørt både `find_unwatched` og Reverse Loo
   `✅ [Titel] ([Årstal]) – [Kort beskrivelse] /info_movie_[tmdb_id]`
   Brug `_movie_` for film og `_tv_` for serier. TMDB ID'et kommer fra det data du har modtaget fra TMDB-værktøjerne. Kommandoen til sidst gør titlen klikbar og åbner en detaljeret plakat-visning.
 
-  KRITISK FORMATERING — underscores er OBLIGATORISKE: Kommandoen SKAL altid skrives med to underscores: `/info_movie_[id]` eller `/info_tv_[id]`. Skriv ALDRIG `/infomovie123` eller `/info_movie123` — det virker ikke. Brug ALTID dette præcise format: `/info_movie_27205` (film) eller `/info_tv_1396` (serie).
+  FORMAT-KRAV — BEGGE underscores er OBLIGATORISKE og ID SKAL matche titlen:
+  - ALTID: `/info_movie_351498` (to underscores, ét før movie, ét efter)
+  - ALDRIG: `/infomovie351498` eller `/info_movie351498` — de virker ikke
+  - ID'ET SKAL tilhøre netop den titel på linjen — kopier altid `id`-feltet direkte fra tool-outputtet for den specifikke film
 
-  Eksempel på korrekt linje: `✅ Inception (2010) – En tyv der stjæler hemmeligheder fra drømme. /info_movie_27205`
+  Eksempel på korrekt linje: `✅ Kingdom of Heaven (2005) – Episk korstogsdrama. /info_movie_751`
 
 ## Regel for Liste-Integritet — BENHÅRD
 Når du præsenterer en liste over film eller serier (f.eks. efter en skuespiller-søgning, trending eller anbefalinger), SKAL du være 100% nøjagtig med ID-parringen. Hver enkelt titel SKAL følges af det PRÆCISE `tmdb_id` der hører til netop den titel i tool-outputtet. Du må ALDRIG gætte, estimere eller bytte rundt på ID'er mellem filmene på listen. Dobbelttjek altid at hvert ID matcher sin titel, inden du sender svaret. En forkert parring (f.eks. 'Kingdom of Heaven' med Bond-filmens ID) er en alvorlig fejl.

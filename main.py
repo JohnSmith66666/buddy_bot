@@ -197,12 +197,15 @@ async def handle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Fanger /info_movie_<tmdb_id> og /info_tv_<tmdb_id> kommandoer.
-    Fleksibelt regex fanger også varianter uden underscore (f.eks. /infomovie123).
-    Kalder show_confirmation direkte med Message og context — ingen adapter.
+    Bruger (filters.COMMAND | filters.TEXT) & filters.Regex — fanger:
+      - /info_movie_123  (Telegram kommando med underscores)
+      - /infomovie123    (tekst-variant uden underscores)
+    Regex-grupper: group(1) = movie|tv, group(2) = tmdb_id
     """
     if not await _guard(update):
         return
 
+    # Hent match fra filters.Regex (context.matches) eller parse manuelt
     if context.matches:
         match = context.matches[0]
     else:
@@ -447,9 +450,10 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_watchlist_callback, pattern=r"^watchlist:"))
 
     # Info-links fra lister (/info_movie_<id>, /info_tv_<id>)
-    # Fleksibelt mønster fanger også varianter uden underscore (Buddy-fejlskrivning)
+    # Bruger filters.COMMAND | filters.Regex for at fange både kommando-varianter
+    # (/info_movie_123 som kommando) og tekstvarianter (/infomovie123 som tekst)
     app.add_handler(MessageHandler(
-        filters.Regex(r"^/info_?(movie|tv)_?(\d+)$"),
+        (filters.COMMAND | filters.TEXT) & filters.Regex(r"^/info_?(movie|tv)_?(\d+)$"),
         handle_info_link,
     ))
 
