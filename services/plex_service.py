@@ -1268,8 +1268,6 @@ def _get_user_server_sync(plex_username: str):
     return None
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
-
-async def add_to_watchlist(
     title: str,
     plex_username: str | None = None,
 ) -> bool:
@@ -1309,3 +1307,53 @@ def _add_to_watchlist_sync(title: str, plex_username: str | None = None) -> bool
     except Exception as e:
         logger.error("Watchlist add error for '%s': %s", title, e)
         return False
+
+
+async def get_plex_watch_url(
+    tmdb_id: int,
+    media_type: str,
+) -> str | None:
+    """
+    Hent watch.plex.tv deep-link URL for en specifik film/serie.
+
+    Bruger Plex metadata API til at konvertere TMDB ID → slug:
+      GET https://metadata.provider.plex.tv/library/metadata/matches
+        ?guid=tmdb://{tmdb_id}&type={1|2}&X-Plex-Token={token}
+
+    Returnerer f.eks. https://watch.plex.tv/movie/spy-kids
+    eller None ved fejl.
+    """
+    import httpx as _httpx
+
+    plex_type = 1 if media_type == "movie" else 2
+    url = "https://metadata.provider.plex.tv/library/metadata/matches"
+    params = {
+        "guid":         f"tmdb://{tmdb_id}",
+        "type":         plex_type,
+        "X-Plex-Token": PLEX_TOKEN,
+    }
+
+    try:
+        async with _httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+        metadata = data.get("MediaContainer", {}).get("Metadata", [])
+        if not metadata:
+            logger.warning("Plex slug: ingen metadata for tmdb://%s", tmdb_id)
+            return None
+
+        slug = metadata[0].get("slug")
+        if not slug:
+            logger.warning("Plex slug: ingen slug for tmdb://%s", tmdb_id)
+            return None
+
+        prefix = "movie" if media_type == "movie" else "show"
+        watch_url = f"https://watch.plex.tv/{prefix}/{slug}"
+        logger.info("Plex watch URL: tmdb_id=%s → %s", tmdb_id, watch_url)
+        return watch_url
+
+    except Exception as e:
+        logger.warning("get_plex_watch_url fejl for tmdb_id=%s: %s", tmdb_id, e)
+        return None

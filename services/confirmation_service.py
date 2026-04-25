@@ -228,14 +228,17 @@ async def show_confirmation(
     button_rows = []
 
     if on_plex:
-        # watch.plex.tv er registreret som verified link i Plex mobilappen
-        # Åbner søgesiden med filmtitlen udfyldt
-        from urllib.parse import quote
-        plex_url = f"https://watch.plex.tv/search?q={quote(title)}"
-        logger.info(
-            "Plex søge-URL genereret — titel=%r url=%s",
-            title, plex_url,
-        )
+        # Hent watch.plex.tv deep-link via Plex metadata API (slug-opslag)
+        # Fallback til søge-URL hvis slug-opslaget fejler
+        from services.plex_service import get_plex_watch_url
+        watch_url = await get_plex_watch_url(tmdb_id, media_type)
+        if watch_url:
+            plex_url = watch_url
+        else:
+            # Fallback: søge-URL med titlen
+            from urllib.parse import quote
+            plex_url = f"https://watch.plex.tv/search?q={quote(title)}"
+        logger.info("Plex URL — titel=%r url=%s", title, plex_url)
         button_rows.append([InlineKeyboardButton("▶️ Se på Plex", url=plex_url)])
     else:
         button_rows.append([
