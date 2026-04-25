@@ -2,6 +2,15 @@
 services/tmdb_service.py - TMDB API integration.
 
 CHANGES vs previous version:
+  v0.9.4 — search_media year-filter:
+  - search_media() har nu en valgfri `year: int | None = None` parameter.
+  - Film: sender primary_release_year til TMDB når year er angivet.
+  - TV:   sender first_air_date_year til TMDB når year er angivet.
+  - Årstal strippes IKKE fra query — query sendes uændret. Year-filteret
+    er et separat TMDB-filter-parameter, ikke en del af søgeteksten.
+  - Ingen andre ændringer.
+
+UNCHANGED:
   - KRITISK BUG RETTET: "poster_url" var i _STRIP_FIELDS og blev slettet
     af _strip() — nu er "poster_path" og "credits" i _STRIP_FIELDS i stedet.
   - cast returneres som list[str] med de 3 øverste skuespillere fra credits.
@@ -145,13 +154,35 @@ def _extract_trailer_url(data: dict) -> str | None:
     return None
 
 
-async def search_media(query: str, media_type: str = "both") -> list[dict]:
+async def search_media(
+    query: str,
+    media_type: str = "both",
+    year: int | None = None,
+) -> list[dict]:
+    """
+    Søg efter film og/eller TV-serier på TMDB.
+
+    Args:
+        query:      Søgetekst — MÅ IKKE indeholde årstal. Send årstal via year.
+        media_type: "movie", "tv" eller "both".
+        year:       Valgfrit årstal-filter.
+                    Film → primary_release_year sendes til TMDB.
+                    TV   → first_air_date_year sendes til TMDB.
+                    Sender et separat TMDB-filter-parameter — ikke en del af query.
+    """
     results: list[dict] = []
     async with httpx.AsyncClient(timeout=10) as client:
         if media_type in ("movie", "both"):
             try:
+                movie_params = _params(query=query)
+                if year:
+                    movie_params["primary_release_year"] = year
+                    logger.debug(
+                        "TMDB movie search: query=%r primary_release_year=%s",
+                        query, year,
+                    )
                 resp = await client.get(
-                    f"{_BASE_URL}/search/movie", params=_params(query=query)
+                    f"{_BASE_URL}/search/movie", params=movie_params
                 )
                 resp.raise_for_status()
                 for item in resp.json().get("results", [])[:_MAX_RESULTS]:
@@ -161,8 +192,15 @@ async def search_media(query: str, media_type: str = "both") -> list[dict]:
 
         if media_type in ("tv", "both"):
             try:
+                tv_params = _params(query=query)
+                if year:
+                    tv_params["first_air_date_year"] = year
+                    logger.debug(
+                        "TMDB tv search: query=%r first_air_date_year=%s",
+                        query, year,
+                    )
                 resp = await client.get(
-                    f"{_BASE_URL}/search/tv", params=_params(query=query)
+                    f"{_BASE_URL}/search/tv", params=tv_params
                 )
                 resp.raise_for_status()
                 for item in resp.json().get("results", [])[:_MAX_RESULTS]:

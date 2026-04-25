@@ -1,24 +1,19 @@
 """
 ai_handler.py - Agentic loop for Buddy.
 
-CHANGES vs previous version (0.9.3-beta — persona-rens + svartids-vinkel):
-  - get_ai_response() tager nu user_first_name (hentes fra database.telegram_name
-    i main.py og videresendes hertil). Bruges af get_system_prompt() til at
-    indsætte fornavnet i persona-prompten — Buddy tiltaler dermed brugeren ved
-    fornavn uden at skulle gætte.
-  - SLANKERE DYNAMISK BLOK: Dato-forklaringen (~150 tokens) er fjernet fra
-    dynamic_lines. Reglen ligger nu kun i _SYSTEM_PROMPT_BODY (cachet).
-    Dynamisk blok indeholder NU kun: dags dato + plex_username. Sparer ~120
-    tokens per request, hvilket giver ~200ms hurtigere TTFB.
+CHANGES vs previous version:
+  v0.9.4 — search_media year-filter:
+  - _dispatch: search_media-kaldet sender nu tool_input.get("year") videre
+    til tmdb_service.search_media() som tredje argument.
+    Tidligere blev year ignoreret selv om det var i tool_input.
 
-Tidligere ændringer (bevares):
-  - INFO_SIGNAL = "SHOW_INFO:" — bruges af main.py til at åbne Netflix-look infokort.
-  - Parallel tool execution via asyncio.gather.
-  - max_tokens-håndtering returnerer partial reply med note.
-  - ZoneInfo("Europe/Copenhagen") for korrekt dansk dato på Railway (UTC).
-  - _slim_data() med max_list_items=40 — matcher _FRANCHISE_MAX_PER_LIST.
-  - _MAX_TOOL_RESULT_CHARS = 6000.
-  - _MAX_HISTORY = 6 — sparer ~400 uncached tokens per kald.
+UNCHANGED:
+  - INFO_SIGNAL = "SHOW_INFO:" tilføjet og eksporteret.
+    Format: SHOW_INFO:<tmdb_id>:<media_type>
+    Bruges af main.py til at åbne Netflix-look infokort direkte
+    når brugeren beder om at se en bestemt titel.
+  - max_tokens håndtering og parallel tool execution — uændret.
+  - ZoneInfo dato-injektion — uændret.
 """
 
 import asyncio
@@ -190,7 +185,9 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
     # ── TMDB ──────────────────────────────────────────────────────────────────
     if tool_name == "search_media":
         return j(await search_media(
-            tool_input["query"], tool_input.get("media_type", "both")
+            tool_input["query"],
+            tool_input.get("media_type", "both"),
+            tool_input.get("year"),          # v0.9.4: videresend year til TMDB-filter
         ))
     if tool_name == "get_media_details":
         return j(await get_media_details(
@@ -348,42 +345,41 @@ async def get_ai_response(
     user_message: str,
     plex_username: str | None = None,
     persona_id: str = "buddy",
-    user_first_name: str | None = None,
 ) -> str:
     """
     Run the full agentic loop and return Buddy's reply.
 
     System-prompt arkitektur (to blokke):
-      Blok 0 — system-prompt med cache_control: ephemeral
-               Indeholder body (regler) + persona-prompt sidst.
-               Persona-prompten har fornavnet interpoleret før caching, så
-               cachen er stabil per (persona_id, user_first_name)-kombo.
-               I praksis: hver bruger får sin egen cache-streng, men
-               regelblokken ovenover er identisk og caches på serveren.
+      Blok 0 — persona-specifik SYSTEM_PROMPT med cache_control: ephemeral
+               Indeholder alle stabile instruktioner. Caches af Anthropic
+               og genbruges på tværs af kald så længe indholdet er uændret.
+               NB: Cache invalideres når persona skifter — dette er forventet.
 
       Blok 1 — Dynamisk kontekst UDEN cache_control
-               Indeholder KUN dags dato og plex_username. Reglen om
-               dato-sammenligning ligger i blok 0 (cachet) — den behøver
-               ikke gentages her hver gang. Spar ~120 tokens per kald.
+               Indeholder aktuel dato og plex_username. Denne blok ændrer
+               sig ved hvert kald (dato varierer) og må aldrig caches —
+               det ville invalidere cache-blok 0 ved hvert request.
     """
     _histories[telegram_id].append({"role": "user", "content": user_message})
     _trim(telegram_id)
 
-    # ── Blok 0: stabil, cachet system-prompt (body + persona med fornavn) ────
+    # ── Blok 0: stabil, cachet system-prompt (persona-specifik) ───────────────
     system_blocks = [
         {
             "type": "text",
-            "text": get_system_prompt(persona_id, user_first_name),
+            "text": get_system_prompt(persona_id),
             "cache_control": {"type": "ephemeral"},
         }
     ]
 
-    # ── Blok 1: dynamisk kontekst — minimal og ucachet ────────────────────────
-    # Reglen om hvordan datoen skal bruges ligger i system-prompten (cachet).
-    # Her sender vi KUN selve datoen og brugernavnet — det der reelt ændrer sig.
+    # ── Blok 1: dynamisk kontekst — aldrig cachet ─────────────────────────────
     dynamic_lines = [
         f"Intern system-info (MÅ IKKE NÆVNES):\n"
-        f"Dags dato (ISO) er: {_dansk_dato()}."
+        f"Dags dato (ISO) er: {_dansk_dato()}.\n"
+        f"VIGTIGT: Sammenlign ALTID filmens 'release_date' med ISO-datoen. "
+        f"Hvis 'release_date' er alfabetisk/matematisk MINDRE end dags dato, "
+        f"ER FILMEN UDKOMMET, og du SKAL omtale den i datid (f.eks. 'udkom i', 'er landet'). "
+        f"Eksempel: '2025-12-17' er MINDRE end '{_dansk_dato()[:10]}' → filmen er udkommet."
     ]
     if plex_username:
         dynamic_lines.append(f"Den aktuelle bruger hedder '{plex_username}' på Plex.")

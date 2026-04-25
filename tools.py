@@ -2,6 +2,13 @@
 tools.py - Claude Tool Use definitions for Buddy.
 
 CHANGES vs previous version:
+  v0.9.4 — search_media year-filter:
+  - search_media: valgfri `year` (integer) parameter tilføjet til input_schema.
+    Buddy skal sende årstal HER — aldrig som del af query-strengen.
+    Svarer til primary_release_year (film) / first_air_date_year (TV) i TMDB API.
+  - search_media description opdateret med eksplicit forbud mod årstal i query.
+
+UNCHANGED:
   - check_plex_library: tmdb_id tilføjet som valgfri parameter.
     Aktiverer GUID-matching i Plex (Lag 0) der finder titler gemt under
     fremmed navn (f.eks. 'Boundless' for 'Den grænseløse').
@@ -16,13 +23,32 @@ TOOLS = [
         "description": (
             "Soeg efter film og/eller TV-serier til informationsformaal. "
             "Brug dette til at besvare spoergsmaal om en titel — IKKE til bestilling. "
-            "Til bestilling: tjek Plex, og svar derefter med SHOW_SEARCH_RESULTS-kommandoen."
+            "Til bestilling: tjek Plex, og svar derefter med SHOW_SEARCH_RESULTS-kommandoen. "
+            "VIGTIGT: query maa KUN indeholde titlen — aldrig aarstal eller parentes. "
+            "Hvis brugeren naevner et aarstal (f.eks. 'The Drama fra 2026' eller "
+            "'Breaking the Sound Barrier (2021)'), send titlen rent i query "
+            "og send aarstal separat via year-parameteren. "
+            "Eksempel: query='The Drama', year=2026 — IKKE query='The Drama 2026'."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string"},
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Kun titlen — ingen aarstal, ingen parentes. "
+                        "Korrekt: 'The Drama'. Forkert: 'The Drama 2026'."
+                    ),
+                },
                 "media_type": {"type": "string", "enum": ["movie", "tv", "both"]},
+                "year": {
+                    "type": "integer",
+                    "description": (
+                        "Valgfrit aarstal-filter. Send her hvis brugeren naevner et aarstal. "
+                        "Film: primary_release_year. TV: first_air_date_year. "
+                        "MÅ IKKE inkluderes i query."
+                    ),
+                },
             },
             "required": ["query"],
         },
