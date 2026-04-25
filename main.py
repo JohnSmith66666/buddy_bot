@@ -28,7 +28,8 @@ from telegram.ext import (
 import config
 import database
 from admin_handlers import handle_approve_callback, notify_admin_new_user
-from ai_handler import INFO_SIGNAL, SEARCH_SIGNAL, TRAILER_SIGNAL, clear_history, get_ai_response
+from ai_handler import INFO_SIGNAL, SEARCH_SIGNAL, TRAILER_SIGNAL, check_session_timeout, clear_history, get_ai_response
+from personas import all_personas, get_persona
 from services.confirmation_service import (
     execute_order,
     handle_watchlist_callback,
@@ -138,6 +139,75 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await update.message.reply_text(reply)
     await database.log_message(user.id, "outgoing", reply)
+
+
+async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Vis persona-menu som inline keyboard."""
+    if not await _guard(update):
+        return
+    user       = update.effective_user
+    current_id = await database.get_persona(user.id)
+    current    = get_persona(current_id)
+
+    keyboard = []
+    for p in all_personas():
+        label = f"{'✅ ' if p['id'] == current_id else ''}{p['emoji']} {p['navn']}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"persona:{p['id']}")])
+
+    await update.message.reply_text(
+        f"🎭 *Vælg din assistent*\n\n"
+        f"Aktiv: {current['emoji']} *{current['navn']}*\n"
+        f"_{current['beskrivelse']}_",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def persona_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Håndtér persona-valg fra inline keyboard."""
+    query = update.callback_query
+    await query.answer()
+
+    persona_id = query.data.replace("persona:", "")
+    user_id    = query.from_user.id
+    persona    = get_persona(persona_id)
+
+    await database.set_persona(user_id, persona_id)
+    clear_history(user_id)  # Nulstil historik ved persona-skift
+
+    keyboard = []
+    for p in all_personas():
+        label = f"{'✅ ' if p['id'] == persona_id else ''}{p['emoji']} {p['navn']}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"persona:{p['id']}")])
+
+    await query.edit_message_text(
+        f"🎭 *Vælg din assistent*\n\n"
+        f"Aktiv: {persona['emoji']} *{persona['navn']}*\n"
+        f"_{persona['beskrivelse']}_\n\n"
+        f"✅ Skiftet til *{persona['navn']}*! Snak løs 🎬",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    logger.info("Persona skiftet: telegram_id=%s → %s", user_id, persona_id)
+
+    # Send velkomstbesked med billede hvis persona har et
+    if persona.get("image_path"):
+        import os
+        img_path = persona["image_path"]
+        if os.path.exists(img_path):
+            try:
+                with open(img_path, "rb") as img:
+                    await context.bot.send_photo(
+                        chat_id=query.message.chat_id,
+                        photo=img,
+                        caption=(
+                            f"*{persona['navn']}* her! 🍺\n"
+                            f"Skriv hvad du vil, min dreng — jeg er klar!"
+                        ),
+                        parse_mode="Markdown",
+                    )
+            except Exception as e:
+                logger.warning("Kunne ikke sende persona-billede: %s", e)
 
 
 async def cmd_skift_plex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -281,8 +351,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if await _needs_plex_setup(update):
         return
 
+    # ── Session timeout: kør /start automatisk efter 10 min inaktivitet ──────
+    if check_session_timeout(user.id):
+        await cmd_start(update, context)
+        return
+
     await update.message.chat.send_action("typing")
     plex_username = await database.get_plex_username(user.id)
+    persona_id    = await database.get_persona(user.id)
 
     # Send loading-besked og slet den når svaret er klar
     loading_msg = await update.message.reply_text(
@@ -294,6 +370,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         telegram_id=user.id,
         user_message=text,
         plex_username=plex_username,
+        persona_id=persona_id,
     )
 
     # Slet loading-beskeden
@@ -468,11 +545,15 @@ def main() -> None:
         .build()
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("start",      cmd_start))
     app.add_handler(CommandHandler("skift_plex", cmd_skift_plex))
+    app.add_handler(CommandHandler("persona",    cmd_persona))
 
     # Admin approval
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve_user:\d+$"))
+
+    # Persona-valg
+    app.add_handler(CallbackQueryHandler(persona_callback, pattern=r"^persona:"))
 
     # Bestillingsflow
     app.add_handler(CallbackQueryHandler(handle_pick_callback,      pattern=r"^pick:"))

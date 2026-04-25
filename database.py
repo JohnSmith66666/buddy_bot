@@ -3,10 +3,12 @@ database.py - PostgreSQL connection pool, table management,
 user whitelist, Plex username storage, onboarding state and interaction logging.
 
 CHANGES vs previous version:
-- Added `onboarding_state` column to `users` table so Railway restarts
-  never lose users mid-onboarding (replaces the in-memory set in main.py).
-- Log pruning now uses a single DELETE with ORDER BY + OFFSET instead of
-  a correlated subquery, which is faster on large tables.
+  - Tilføjet persona_id kolonne til users-tabellen.
+  - Tilføjet get_persona() og set_persona() funktioner.
+  - Added `onboarding_state` column to `users` table so Railway restarts
+    never lose users mid-onboarding (replaces the in-memory set in main.py).
+  - Log pruning now uses a single DELETE with ORDER BY + OFFSET instead of
+    a correlated subquery, which is faster on large tables.
 """
 
 import logging
@@ -29,15 +31,20 @@ CREATE TABLE IF NOT EXISTS users (
     telegram_name    TEXT,
     plex_username    TEXT,
     is_whitelisted   BOOLEAN     NOT NULL DEFAULT FALSE,
-    onboarding_state TEXT,                          -- NULL | 'awaiting_plex'
+    onboarding_state TEXT,
+    persona_id       TEXT        NOT NULL DEFAULT 'buddy',
     added_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
 
-# Migration: add onboarding_state if an older version of the table exists.
 _MIGRATE_ONBOARDING_STATE = """
 ALTER TABLE users
     ADD COLUMN IF NOT EXISTS onboarding_state TEXT;
+"""
+
+_MIGRATE_PERSONA_ID = """
+ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS persona_id TEXT DEFAULT 'buddy';
 """
 
 _CREATE_INTERACTION_LOG_TABLE = """
@@ -67,6 +74,7 @@ async def setup_db() -> None:
     async with _pool.acquire() as conn:
         await conn.execute(_CREATE_USERS_TABLE)
         await conn.execute(_MIGRATE_ONBOARDING_STATE)
+        await conn.execute(_MIGRATE_PERSONA_ID)
         await conn.execute(_CREATE_INTERACTION_LOG_TABLE)
         await conn.execute(_CREATE_LOG_INDEX)
     logger.info("Database ready.")
@@ -154,6 +162,27 @@ async def set_plex_username(telegram_id: int, plex_username: str) -> None:
     logger.info("plex_username='%s' saved for telegram_id=%s", plex_username, telegram_id)
 
 
+# ── Persona ───────────────────────────────────────────────────────────────────
+
+async def get_persona(telegram_id: int) -> str:
+    """Returnér brugerens valgte persona_id. Falder tilbage til 'buddy'."""
+    async with _pool_ref().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT persona_id FROM users WHERE telegram_id = $1", telegram_id
+        )
+    return (row["persona_id"] if row and row["persona_id"] else "buddy")
+
+
+async def set_persona(telegram_id: int, persona_id: str) -> None:
+    """Gem brugerens valgte persona_id."""
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET persona_id = $1 WHERE telegram_id = $2",
+            persona_id, telegram_id,
+        )
+    logger.info("persona_id='%s' gemt for telegram_id=%s", persona_id, telegram_id)
+
+
 # ── Onboarding state ──────────────────────────────────────────────────────────
 
 async def get_onboarding_state(telegram_id: int) -> str | None:
@@ -189,8 +218,6 @@ async def log_message(
             """,
             telegram_id, direction, message_text, datetime.now(timezone.utc),
         )
-        # FIX: Pruning rewritten as a single DELETE with ORDER BY + OFFSET.
-        # This avoids the correlated subquery which is slow on large tables.
         await conn.execute(
             """
             DELETE FROM interaction_log
@@ -215,7 +242,7 @@ async def get_all_whitelisted_users() -> list[dict]:
     return [dict(row) for row in rows]
 
 
-# ── Pending requests (til Inline Keyboard bekræftelse) ────────────────────────
+# ── Pending requests ──────────────────────────────────────────────────────────
 
 _CREATE_PENDING_REQUESTS_TABLE = """
 CREATE TABLE IF NOT EXISTS pending_requests (

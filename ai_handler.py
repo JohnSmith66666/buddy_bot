@@ -24,7 +24,7 @@ except Exception:
 import anthropic
 
 from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
-from prompts import SYSTEM_PROMPT
+from prompts import get_system_prompt
 from services.plex_service import (
     check_actor_on_plex,
     check_franchise_on_plex,
@@ -336,14 +336,16 @@ async def get_ai_response(
     telegram_id: int,
     user_message: str,
     plex_username: str | None = None,
+    persona_id: str = "buddy",
 ) -> str:
     """
     Run the full agentic loop and return Buddy's reply.
 
     System-prompt arkitektur (to blokke):
-      Blok 0 — SYSTEM_PROMPT med cache_control: ephemeral
+      Blok 0 — persona-specifik SYSTEM_PROMPT med cache_control: ephemeral
                Indeholder alle stabile instruktioner. Caches af Anthropic
                og genbruges på tværs af kald så længe indholdet er uændret.
+               NB: Cache invalideres når persona skifter — dette er forventet.
 
       Blok 1 — Dynamisk kontekst UDEN cache_control
                Indeholder aktuel dato og plex_username. Denne blok ændrer
@@ -353,11 +355,11 @@ async def get_ai_response(
     _histories[telegram_id].append({"role": "user", "content": user_message})
     _trim(telegram_id)
 
-    # ── Blok 0: stabil, cachet system-prompt ──────────────────────────────────
+    # ── Blok 0: stabil, cachet system-prompt (persona-specifik) ───────────────
     system_blocks = [
         {
             "type": "text",
-            "text": SYSTEM_PROMPT,
+            "text": get_system_prompt(persona_id),
             "cache_control": {"type": "ephemeral"},
         }
     ]

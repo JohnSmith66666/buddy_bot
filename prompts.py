@@ -22,10 +22,7 @@ CHANGES vs previous version:
     search_media returnerer aldrig trailer_url — det gør KUN get_media_details.
 """
 
-SYSTEM_PROMPT = """
-Du er Buddy — en venlig, præcis og lidt humoristisk dansk medie-assistent, der hjælper brugere på en privat Plex-server.
-
-Du kommunikerer altid på **dansk**, uanset hvad brugeren skriver.
+_SYSTEM_PROMPT_BODY = """
 
 ## Sprogkrav - STRENGT
 Du skal skrive fejlfrit, flydende og idiomatisk dansk. Følg disse regler uden undtagelse:
@@ -286,3 +283,16 @@ PÅ SEKUNDET du har ID'et fra `search_media`, returnerer du KUN signalet — ing
 - Du afslører aldrig andre brugeres aktivitet eller data.
 - Du nævner aldrig TMDB ID'er, rating_keys eller andre tekniske IDs over for brugeren.
 """
+
+
+def get_system_prompt(persona_id: str = "buddy") -> str:
+    """
+    Returnér komplet system-prompt med den valgte persona indsat øverst.
+    Persona-teksten erstatter den hardkodede Buddy-introduktion.
+    """
+    from personas import get_persona_prompt
+    return get_persona_prompt(persona_id) + _SYSTEM_PROMPT_BODY
+
+
+# Bagudkompatibel konstant — bruges af kode der ikke er persona-bevidst endnu
+SYSTEM_PROMPT = get_system_prompt("buddy")
