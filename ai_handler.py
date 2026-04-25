@@ -264,7 +264,12 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
                 row["tmdb_id"]    = tmdb_id
                 row["media_type"] = "tv"
 
-        return j({"top_movies": top_movies, "top_tv": top_tv})
+        # Slim ned til kun de felter Buddy behøver — undgår 6000-chars trunkering
+        _KEEP = {"title", "year", "tmdb_id", "media_type"}
+        slim_movies = [{k: v for k, v in r.items() if k in _KEEP} for r in top_movies]
+        slim_tv     = [{k: v for k, v in r.items() if k in _KEEP} for r in top_tv]
+
+        return j({"top_movies": slim_movies, "top_tv": slim_tv})
     if tool_name == "get_user_watch_stats":
         if not plex_username:
             return j({"error": "Intet Plex-brugernavn fundet."})
