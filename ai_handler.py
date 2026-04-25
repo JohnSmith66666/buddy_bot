@@ -236,10 +236,24 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
             elif "tv" in sid or "show" in sid:
                 top_tv = block.get("rows", [])
 
-        # Berig med TMDB IDs — brug modulniveau-funktioner direkte (undgår scoping-fejl)
+        # Berig med TMDB IDs via direkte search_media-kald (undgår scoping-konflikter)
+        async def _tmdb_movie(title: str) -> int | None:
+            try:
+                hits = await search_media(title, "movie")
+                return hits[0]["id"] if hits else None
+            except Exception:
+                return None
+
+        async def _tmdb_tv(title: str) -> int | None:
+            try:
+                hits = await search_media(title, "tv")
+                return hits[0]["id"] if hits else None
+            except Exception:
+                return None
+
         movie_ids, tv_ids = await asyncio.gather(
-            asyncio.gather(*[_lookup_movie(r.get("title", "")) for r in top_movies]),
-            asyncio.gather(*[_lookup_tv(r.get("title", ""))    for r in top_tv]),
+            asyncio.gather(*[_tmdb_movie(r.get("title", "")) for r in top_movies]),
+            asyncio.gather(*[_tmdb_tv(r.get("title", ""))    for r in top_tv]),
         )
         for row, tmdb_id in zip(top_movies, movie_ids):
             if tmdb_id:
