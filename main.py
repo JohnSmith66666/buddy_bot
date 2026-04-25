@@ -240,6 +240,12 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "step":       "picked",
     })
 
+    # Slet brugerens kommando-besked for at holde chatten ren
+    try:
+        await update.message.delete()
+    except Exception:
+        pass  # Telegram tillader ikke altid sletning — ignorer stille
+
     await show_confirmation(update.message, context, token, plex_username)
 
 
