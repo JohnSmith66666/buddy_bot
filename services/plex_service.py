@@ -1,12 +1,20 @@
 """
 services/plex_service.py - Plex Media Server integration via python-plexapi.
 
-CHANGES vs previous version:
+CHANGES vs previous version (v1.1.0 — switchHomeUser failure cache):
+  - Performance fix: _connect() cacher nu Plex Home User auth-fejl per username.
+    Når switchHomeUser() fejler med 401 unauthorized, caches usernavnet i 1 time
+    så efterfølgende kald straks falder tilbage til admin-konto i stedet for
+    at spilde 3-5 sekunder på timeout-baseret retry. Ved 5 parallelle Plex-tjek
+    sparer dette 15-25 sekunder.
+  - Cachen er observerbar: ERROR-log første gang en bruger ryger i cache så
+    rod-årsagen (udløbet token, fjernet bruger) ikke bliver glemt.
+  - DEBUG-log på subsequent skips for stille drift.
+  - TTL er 1 time — rettet token får hurtigt effekt, og spam undgås.
+
+UNCHANGED (v1.0.2 — sci-fi genre fix):
   - _GENRE_SYNONYMS: Tilføjet "sciencefiction" og "science fiction" som
-    selvstændige nøgler. Buddy sender genre="science fiction" som normaliserer
-    til "science fiction" — men kun "scifi" var nøgle i tabellen, så synonymerne
-    blev aldrig aktiveret og søgningen returnerede 0 resultater selvom der er
-    masser af sci-fi på serveren.
+    selvstændige nøgler.
 Uses fuzzy title matching to handle variations like 'Olsen-banden' vs 'Olsen Banden'.
 PlexAPI calls are synchronous so we run them in a thread pool to avoid
 blocking the async event loop.
@@ -83,6 +91,19 @@ _TV_YEAR_TOLERANCE      = 2
 _COLLECTION_MAX_MAIN    = 10
 _FRANCHISE_MAX_PER_LIST = 40
 _ACTOR_MAX_MISSING      = 15
+
+# ── switchHomeUser failure cache ──────────────────────────────────────────────
+# Cacher Plex Home User auth-fejl (401 unauthorized) per username.
+# Når en bruger fejler, falder vi straks tilbage til admin-konto i stedet for
+# at spilde 3-5 sekunder på timeout-baseret retry ved hvert eneste tool-kald.
+# Cachen er per process — nulstilles ved Railway redeploy.
+#
+# TTL er bevidst 1 time: kort nok til at fange genaktiverede tokens hurtigt,
+# langt nok til at undgå spam når token er permanent revoked.
+import time
+
+_SWITCH_FAIL_TTL_SECS = 3600  # 1 time
+_switch_fail_cache: dict[str, float] = {}  # username (lower) → unix timestamp
 
 
 # ── Lightweight item serialiser ───────────────────────────────────────────────
@@ -174,9 +195,27 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
     if not plex_username:
         return admin_plex
 
+    # ── Cache-tjek: tidligere fejlet switchHomeUser? ──────────────────────────
+    norm = plex_username.strip().lower()
+    cached_at = _switch_fail_cache.get(norm)
+    if cached_at is not None:
+        age = time.time() - cached_at
+        if age < _SWITCH_FAIL_TTL_SECS:
+            logger.debug(
+                "switchHomeUser cache HIT for '%s' (age=%.0fs) — bruger admin",
+                plex_username, age,
+            )
+            return admin_plex
+        else:
+            # TTL udløbet — giv brugeren en chance igen
+            logger.info(
+                "switchHomeUser cache TTL udløbet for '%s' — prøver igen",
+                plex_username,
+            )
+            _switch_fail_cache.pop(norm, None)
+
     try:
         account = admin_plex.myPlexAccount()
-        norm    = plex_username.strip().lower()
 
         owner_names = {
             (account.username or "").lower(),
@@ -197,7 +236,14 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
                     switched = account.switchHomeUser(user)
                     return PlexServer(PLEX_URL, switched.authToken, timeout=15)
                 except Exception as e:
-                    logger.warning("switchHomeUser() failed for '%s': %s", plex_username, e)
+                    # Cache fejlen så vi ikke spilder 3-5s på næste tool-kald
+                    _switch_fail_cache[norm] = time.time()
+                    logger.error(
+                        "switchHomeUser FAILED for '%s' — caching for %ds. "
+                        "Action required: tjek Plex-token i database eller "
+                        "fjern brugerens tilknytning. Fejl: %s",
+                        plex_username, _SWITCH_FAIL_TTL_SECS, e,
+                    )
                     return admin_plex
 
         logger.warning("Plex user '%s' not found — falling back to admin", plex_username)
