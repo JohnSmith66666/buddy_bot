@@ -270,7 +270,39 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
             media_type=tool_input.get("media_type"),
         ))
     if tool_name == "get_recently_added":
-        return j(await get_recently_added(count=tool_input.get("count", 10)))
+        result = await get_recently_added(count=tool_input.get("count", 10))
+        if result and result.get("movies"):
+            # Berig film uden tmdb_id via TMDB-søgning
+            import httpx as _httpx
+            from config import TMDB_API_KEY as _TMDB_KEY
+            _TMDB_BASE = "https://api.themoviedb.org/3"
+
+            async def _lookup(title: str, year: str | None) -> int | None:
+                params = {"api_key": _TMDB_KEY, "language": "da-DK", "query": title}
+                if year:
+                    params["primary_release_year"] = str(year)
+                try:
+                    async with _httpx.AsyncClient(timeout=5) as c:
+                        r = await c.get(f"{_TMDB_BASE}/search/movie", params=params)
+                        r.raise_for_status()
+                        hits = r.json().get("results", [])
+                        return hits[0].get("id") if hits else None
+                except Exception:
+                    return None
+
+            import asyncio as _asyncio
+            tasks = [
+                _lookup(m["title"], m.get("year"))
+                for m in result["movies"] if not m.get("tmdb_id")
+            ]
+            needs_lookup = [m for m in result["movies"] if not m.get("tmdb_id")]
+            if tasks:
+                looked_up = await _asyncio.gather(*tasks)
+                for movie, tmdb_id in zip(needs_lookup, looked_up):
+                    if tmdb_id:
+                        movie["tmdb_id"] = tmdb_id
+                        logger.info("TMDB fallback: '%s' → %s", movie["title"], tmdb_id)
+        return j(result)
 
     return j({"error": f"Ukendt vaerktoej: {tool_name}"})
 
