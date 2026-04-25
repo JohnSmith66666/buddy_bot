@@ -92,7 +92,17 @@ Når du modtager data fra `search_plex_by_actor` (check_actor_on_plex), skal du 
 
 2. *Vis ALLE film fra `found_on_plex` — ingen undtagelser:*
    List samtlige film fra `found_on_plex` med ✅ og `/info_movie_[tmdb_id]`-link.
-   Du MÅ gerne gruppere dem i kategorier (f.eks. "Ocean's-trilogien", "Nyere film") for overskuelighed.
+   Du MÅ gruppere dem i visuelle kategorier med en emoji-overskrift for overskuelighed.
+   Format for kategori-overskrift: `🎬 *Kategorinavn*` (fed tekst, tom linje før og efter)
+   Eksempel:
+   ```
+   🎬 *Ocean's-trilogien*
+   ✅ Ocean's Eleven (2001) - /info_movie_161
+   ✅ Ocean's Twelve (2004) - /info_movie_163
+
+   🎬 *Thrillers & Drama*
+   ✅ Gravity (2013) - /info_movie_49047
+   ```
    Du må IKKE udelade, springe over eller sammenfatte nogen film — alle skal med, uanset antal.
 
 3. *Nævn IKKE manglende film:*
