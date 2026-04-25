@@ -542,13 +542,11 @@ async def get_person_filmography(person_id: int) -> dict | None:
     return {
         "person_id":            person_id,
         "name":                 bio.get("name"),
-        "biography":            (bio.get("biography") or "")[:300],
-        "birthday":             bio.get("birthday"),
-        "place_of_birth":       bio.get("place_of_birth"),
         "known_for_department": bio.get("known_for_department", "Ukendt"),
         "total_movie_credits":  len(movie_credits),
         "movie_credits":        movie_credits,
-        "tv_credits":           tv_credits,
+        # biography, birthday, place_of_birth og tv_credits fjernet —
+        # Buddy bruger dem ikke til Plex-tjek og de koster ~900 chars overhead.
     }
 
 

@@ -1,25 +1,28 @@
 """
 ai_handler.py - Agentic loop for Buddy.
 
-CHANGES vs previous version (v0.9.9 — get_recently_added fix):
-  - _dispatch(): get_recently_added() kaldes nu uden plex_username argument.
-    Tautulli-funktionen accepterer kun count — plex_username er ikke relevant
-    for recently_added (det er server-bred data). Fejlede med TypeError.
+CHANGES vs previous version (v1.0.5 — filmografi token-fix):
+  - _MAX_TOOL_RESULT_CHARS: 6.000 → 12.000.
+    Årsag: get_person_filmography for Tarantino (91 film × ~98 chars) = ~9.600 chars
+    + person-overhead = ~10.000 chars total. Med 6.000-grænsen blev filmografien
+    klippet til ~61 film — Inglourious Basterds, Jackie Brown, Kill Bill etc.
+    nåede aldrig frem til Buddy, som derefter gættede forkerte ID'er.
+    12.000 giver god margen selv til store filmografier (200+ film).
+  - _slim_data max_list_items: 10 → 40 for første pas.
+    Tidligere klippede _slim_data til 10 items som fallback — det er for aggressivt
+    for filmografi-lister. 40 items er et bedre kompromis.
+
+UNCHANGED (v0.9.9 — get_recently_added fix):
+  - get_recently_added() kaldes uden plex_username argument.
 
 UNCHANGED (v0.9.5 — user_first_name fix):
   - get_ai_response() har fået user_first_name: str | None = None parameter.
-    main.py kaldte allerede funktionen med user_first_name=user.first_name,
-    men ai_handler accepterede ikke argumentet → TypeError ved hvert kald.
-  - get_system_prompt() kaldes nu med user_first_name så personas.py's
-    {user_first_name}-placeholder erstattes korrekt med brugerens fornavn.
-  - Ingen andre ændringer.
 
 UNCHANGED:
   - v0.9.4: search_media year-filter videresendes til tmdb_service.
   - INFO_SIGNAL, TRAILER_SIGNAL, SEARCH_SIGNAL — uændret.
   - Prompt caching arkitektur — uændret.
   - Parallel tool execution via asyncio.gather — uændret.
-  - _slim_data() / _trim_tool_result() token-optimering — uændret.
   - ZoneInfo dato-injektion — uændret.
 """
 
@@ -75,41 +78,36 @@ logger = logging.getLogger(__name__)
 _client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 _histories: dict[int, list[dict]] = defaultdict(list)
-_last_activity: dict[int, float] = {}          # telegram_id → Unix timestamp
-_SESSION_TIMEOUT = 10 * 60                      # 10 minutter i sekunder
-_MAX_HISTORY = 6          # Reduceret fra 10 → sparer ~400 uncached tokens per kald
-_MAX_TOOL_RESULT_CHARS = 6000
+_last_activity: dict[int, float] = {}
+_SESSION_TIMEOUT = 10 * 60
+_MAX_HISTORY = 6
 
-# Signal som Claude returnerer for at trigge bestillingsflow i main.py
-SEARCH_SIGNAL = "SHOW_SEARCH_RESULTS:"
+# Hævet fra 6.000 → 12.000 for at håndtere store filmografier (91+ film).
+# Tarantinos filmografi = ~10.000 chars med 4 felter per film.
+_MAX_TOOL_RESULT_CHARS = 12000
 
-# Signal som Claude returnerer for at vise en trailer-knap i main.py
-# Format: SHOW_TRAILER:<beskedtekst>|<youtu.be-url>
+SEARCH_SIGNAL  = "SHOW_SEARCH_RESULTS:"
 TRAILER_SIGNAL = "SHOW_TRAILER:"
-
-# Signal som Claude returnerer for at åbne Netflix-look infokort direkte
-# Format: SHOW_INFO:<tmdb_id>:<media_type>  f.eks. SHOW_INFO:157336:movie
-INFO_SIGNAL = "SHOW_INFO:"
+INFO_SIGNAL    = "SHOW_INFO:"
 
 
 def _dansk_dato() -> str:
-    """Returnér aktuel dato i ISO-format (Europe/Copenhagen)."""
     if _TZ_COPENHAGEN:
         return datetime.now(_TZ_COPENHAGEN).isoformat()
     return datetime.utcnow().isoformat()
 
 
 def _trim(telegram_id: int) -> None:
-    """Behold kun de seneste _MAX_HISTORY beskeder i historikken."""
     hist = _histories[telegram_id]
     if len(hist) > _MAX_HISTORY:
         _histories[telegram_id] = hist[-_MAX_HISTORY:]
 
 
-def _slim_data(data, max_list_items: int = 10):
+def _slim_data(data, max_list_items: int = 40):
     """
     Rekursivt trim store lister og fjern None-værdier for at spare tokens.
-    To pas: max 10 items, derefter max 5 hvis stadig for lang.
+    max_list_items hævet til 40 (fra 10) for at bevare filmografi-lister.
+    To pas: max 40 items, derefter max 20 hvis stadig for lang.
     """
     if isinstance(data, dict):
         return {k: _slim_data(v, max_list_items) for k, v in data.items() if v is not None}
@@ -121,7 +119,7 @@ def _slim_data(data, max_list_items: int = 10):
 def _trim_tool_result(result: str) -> str:
     """
     Trim et tool-resultat til max _MAX_TOOL_RESULT_CHARS tegn.
-    To pas: max 10 items, derefter max 5 hvis stadig for lang.
+    To pas: max 40 items, derefter max 20 hvis stadig for lang.
     """
     if len(result) <= _MAX_TOOL_RESULT_CHARS:
         return result
@@ -133,7 +131,7 @@ def _trim_tool_result(result: str) -> str:
         compact = json.dumps(slimmed, ensure_ascii=False, separators=(",", ":"))
         if len(compact) <= _MAX_TOOL_RESULT_CHARS:
             return compact
-        slimmed2 = _slim_data(data, max_list_items=5)
+        slimmed2 = _slim_data(data, max_list_items=20)
         return json.dumps(slimmed2, ensure_ascii=False, separators=(",", ":"))
     except (json.JSONDecodeError, Exception) as e:
         logger.warning("Could not parse tool result as JSON: %s", e)
@@ -155,7 +153,7 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
         return j(await search_media(
             tool_input["query"],
             tool_input.get("media_type", "both"),
-            tool_input.get("year"),          # v0.9.4: videresend year til TMDB-filter
+            tool_input.get("year"),
         ))
     if tool_name == "get_media_details":
         return j(await get_media_details(
@@ -244,10 +242,9 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
             media_type=tool_input.get("media_type"),
         ))
     if tool_name == "get_recently_added":
-        count = tool_input.get("count", 10)
+        count  = tool_input.get("count", 10)
         result = await get_recently_added(count=count)
 
-        # Berig film med TMDB ID via title-fallback hvis det mangler
         if result and result.get("movies"):
             async def _lookup_movie(title: str) -> int | None:
                 try:
@@ -263,8 +260,6 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
                         movie["tmdb_id"] = tmdb_id
                         logger.info("TMDB film-fallback: '%s' → %s", movie["title"], tmdb_id)
 
-        # Berig serier — søg ALTID på series_name for at få seriens TMDB ID
-        # Tautulli returnerer episodens TMDB ID, ikke seriens — det er ubrugeligt
         if result and result.get("episodes"):
             all_episodes = result["episodes"]
             looked_up = await asyncio.gather(
@@ -281,7 +276,6 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
 
 
 async def _lookup_tv(series_name: str) -> int | None:
-    """Slå en serie op på TMDB og returnér series-niveau TMDB ID."""
     try:
         hits = await search_media(series_name, "tv")
         return hits[0]["id"] if hits else None
@@ -294,26 +288,18 @@ async def get_ai_response(
     user_message: str,
     plex_username: str | None = None,
     persona_id: str = "buddy",
-    user_first_name: str | None = None,      # v0.9.5: tilføjet — videresendes til system-prompt
+    user_first_name: str | None = None,
 ) -> str:
     """
     Run the full agentic loop and return Buddy's reply.
 
     System-prompt arkitektur (to blokke):
-      Blok 0 — persona-specifik SYSTEM_PROMPT med cache_control: ephemeral
-               Indeholder alle stabile instruktioner. Caches af Anthropic
-               og genbruges på tværs af kald så længe indholdet er uændret.
-               NB: Cache invalideres når persona skifter eller navn ændres.
-
-      Blok 1 — Dynamisk kontekst UDEN cache_control
-               Indeholder aktuel dato og plex_username. Denne blok ændrer
-               sig ved hvert kald (dato varierer) og må aldrig caches —
-               det ville invalidere cache-blok 0 ved hvert request.
+      Blok 0 — cachet system-prompt (persona-specifik + brugernavn)
+      Blok 1 — dynamisk kontekst (dato, plex_username) — aldrig cachet
     """
     _histories[telegram_id].append({"role": "user", "content": user_message})
     _trim(telegram_id)
 
-    # ── Blok 0: stabil, cachet system-prompt (persona-specifik + brugernavn) ──
     system_blocks = [
         {
             "type": "text",
@@ -322,7 +308,6 @@ async def get_ai_response(
         }
     ]
 
-    # ── Blok 1: dynamisk kontekst — aldrig cachet ─────────────────────────────
     dynamic_lines = [
         f"Intern system-info (MÅ IKKE NÆVNES):\n"
         f"Dags dato (ISO) er: {_dansk_dato()}.\n"
@@ -337,10 +322,8 @@ async def get_ai_response(
     system_blocks.append({
         "type": "text",
         "text": "\n\n".join(dynamic_lines),
-        # Ingen cache_control — denne blok er altid frisk
     })
 
-    # ── Tools med cache på det sidste element ────────────────────────────────
     tools_with_cache = [dict(t) for t in TOOLS]
     if tools_with_cache:
         tools_with_cache[-1] = {
@@ -378,9 +361,6 @@ async def get_ai_response(
                     {"role": "assistant", "content": response.content}
                 )
 
-                # ── Parallel tool execution via asyncio.gather ────────────────
-                # Alle tool-kald i samme runde eksekveres samtidigt.
-                # Speedup ved N parallelle kald: N×latens → max(latens).
                 tool_blocks = [b for b in response.content if b.type == "tool_use"]
 
                 async def _run_tool(block) -> dict:
@@ -404,7 +384,6 @@ async def get_ai_response(
                 _trim(telegram_id)
                 continue
 
-            # ── max_tokens: svar afhugget — returner hvad vi har + note ──────
             if response.stop_reason == "max_tokens":
                 partial = next(
                     (b.text for b in response.content if hasattr(b, "text")), ""
