@@ -197,25 +197,24 @@ async def handle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Fanger /info_movie_<tmdb_id> og /info_tv_<tmdb_id> kommandoer.
-    Bruger (filters.COMMAND | filters.TEXT) & filters.Regex — fanger:
-      - /info_movie_123  (Telegram kommando med underscores)
-      - /infomovie123    (tekst-variant uden underscores)
-    Regex-grupper: group(1) = movie|tv, group(2) = tmdb_id
+    Bruger (filters.COMMAND | filters.TEXT) & filters.Regex — fanger begge varianter.
+    Logger altid hvilket ID der blev klikket for at debugge ID-parring fejl.
     """
     if not await _guard(update):
         return
 
-    # Hent match fra filters.Regex (context.matches) eller parse manuelt
     if context.matches:
         match = context.matches[0]
     else:
         text  = (update.message.text or "").strip()
-        match = re.match(r"^/info_?(movie|tv)_?(\d+)$", text)
+        match = re.match(r"^/info_(movie|tv)_(\d+)$", text)
         if not match:
             return
 
     media_type    = match.group(1)
     tmdb_id       = int(match.group(2))
+    logger.info("Bruger trykkede på info-link: type=%s, id=%s", media_type, tmdb_id)
+
     user_id       = update.effective_user.id
     plex_username = await database.get_plex_username(user_id)
 
@@ -450,10 +449,9 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_watchlist_callback, pattern=r"^watchlist:"))
 
     # Info-links fra lister (/info_movie_<id>, /info_tv_<id>)
-    # Bruger filters.COMMAND | filters.Regex for at fange både kommando-varianter
-    # (/info_movie_123 som kommando) og tekstvarianter (/infomovie123 som tekst)
+    # Fanger både kommando-form og tekst-form via COMMAND|TEXT filter
     app.add_handler(MessageHandler(
-        (filters.COMMAND | filters.TEXT) & filters.Regex(r"^/info_?(movie|tv)_?(\d+)$"),
+        (filters.COMMAND | filters.TEXT) & filters.Regex(r"^/info_(movie|tv)_(\d+)$"),
         handle_info_link,
     ))
 

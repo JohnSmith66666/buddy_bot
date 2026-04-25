@@ -405,6 +405,7 @@ async def get_ai_response(
             )
             _histories[telegram_id].append({"role": "assistant", "content": reply})
             _trim(telegram_id)
+            logger.info("Buddy svar (tjek ID-parring): %s", reply[:200])
             return reply
 
     except anthropic.APIError as e:
