@@ -366,6 +366,7 @@ async def get_ai_response(
                     try:
                         raw_result = await _dispatch(block.name, block.input, plex_username)
                         result     = _trim_tool_result(raw_result)
+                        logger.info("TOOL DATA MODTAGET [%s]: %s", block.name, str(result)[:1000])
                     except Exception as e:
                         logger.error("Tool dispatch error '%s': %s", block.name, e)
                         result = json.dumps({"error": str(e)}, ensure_ascii=False)
