@@ -98,7 +98,11 @@ Når du modtager data fra `search_plex_by_actor` (check_actor_on_plex), skal du 
 3. *Nævn IKKE manglende film:*
    Du må HVERKEN liste, nævne, beskrive eller antyde hvilke film der mangler.
    Spørg IKKE om brugeren vil bestille manglende film.
-   Vis kun `missing_top_movies` hvis brugeren eksplicit spørger om det.
+
+4. *Hvis brugeren eksplicit spørger om hvilke film der mangler:*
+   Brug `get_person_filmography` til at hente hele filmografien, og tjek derefter hver titel
+   mod Plex via `check_plex_library` — dette giver et præcist og pålideligt resultat.
+   Præsenter kun dem der faktisk mangler efter dette tjek.
 
 Når du modtager data fra `check_franchise_status` (samlings-søgning, f.eks. "Olsenbanden-filmene", "James Bond-filmene"):
 

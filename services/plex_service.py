@@ -378,13 +378,11 @@ async def check_actor_on_plex(
 
     Returnerer:
       {
-        "actor":              "Robert Downey Jr.",
-        "tmdb_person_id":     3223,
-        "found_on_plex":      [{"title": ..., "year": ..., "character": ...}],
-        "missing_top_movies": [{"title": ..., "release_date": ..., "vote_average": ...}],
-        "found_count":        N,
-        "missing_count":      M,
-        "checked_top_n":      20,
+        "actor":          "Robert Downey Jr.",
+        "tmdb_person_id": 3223,
+        "found_on_plex":  [{"title": ..., "year": ..., "character": ..., "tmdb_id": ...}],
+        "found_count":    N,
+        "checked_top_n":  20,
       }
     """
     from services.tmdb_service import get_person_filmography, search_person
@@ -451,8 +449,7 @@ async def check_actor_on_plex(
     )
 
     # Trin 4: kryds-tjek top-20 mod Plex
-    found_on_plex:      list[dict] = []
-    missing_top_movies: list[dict] = []
+    found_on_plex: list[dict] = []
 
     for movie in top_movies:
         tmdb_id        = movie.get("tmdb_id")
@@ -517,31 +514,23 @@ async def check_actor_on_plex(
                 "character": movie.get("character"),
                 "tmdb_id":   tmdb_id,
             })
-        else:
-            missing_top_movies.append({
-                "title":        title,
-                "release_date": release or "Ukendt",
-                "vote_average": movie.get("vote_average", 0),
-                "tmdb_id":      tmdb_id,
-            })
+        # Film der ikke matches logges kun — ingen missing_top_movies liste
 
     found_count   = len(found_on_plex)
-    missing_count = len(missing_top_movies)
+    missing_count = len(top_movies) - found_count
 
     logger.info(
-        "check_actor_on_plex '%s': %d/%d fundet på Plex, %d mangler",
-        actor_display, found_count, len(top_movies), missing_count,
+        "check_actor_on_plex '%s': %d/%d fundet på Plex, %d ikke fundet i top-%d",
+        actor_display, found_count, len(top_movies), missing_count, len(top_movies),
     )
 
     return {
-        "status":           "ok",
-        "actor":            actor_display,
-        "tmdb_person_id":   person_id,
-        "found_on_plex":    found_on_plex,
-        "missing_top_movies": missing_top_movies[:_ACTOR_MAX_MISSING],
-        "found_count":      found_count,
-        "missing_count":    missing_count,
-        "checked_top_n":    len(top_movies),
+        "status":         "ok",
+        "actor":          actor_display,
+        "tmdb_person_id": person_id,
+        "found_on_plex":  found_on_plex,
+        "found_count":    found_count,
+        "checked_top_n":  len(top_movies),
     }
 
 
