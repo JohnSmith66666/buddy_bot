@@ -57,7 +57,7 @@ _TMDB_LANG = "da-DK"
 
 _TV_YEAR_TOLERANCE      = 2
 _COLLECTION_MAX_MAIN    = 10
-_FRANCHISE_MAX_PER_LIST = 20
+_FRANCHISE_MAX_PER_LIST = 40
 _ACTOR_MAX_MISSING      = 15   # Maks manglende film i check_actor_on_plex output
 
 
