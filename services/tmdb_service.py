@@ -223,6 +223,44 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
             except httpx.HTTPError as e:
                 logger.warning("TMDB en-US video fallback fejlede (id=%s): %s", tmdb_id, e)
 
+    # ── Engelsk fallback hvis ingen dansk overview ────────────────────────────
+    overview = data.get("overview") or ""
+    if not overview:
+        logger.debug("TMDB: ingen da-DK overview for tmdb_id=%s — prøver en-US", tmdb_id)
+        async with httpx.AsyncClient(timeout=10) as client:
+            try:
+                en_resp = await client.get(
+                    f"{_BASE_URL}/{endpoint}/{tmdb_id}",
+                    params={"api_key": TMDB_API_KEY, "language": "en-US"},
+                )
+                en_resp.raise_for_status()
+                en_overview = en_resp.json().get("overview") or ""
+                if en_overview:
+                    logger.info("TMDB overview (en-US fallback): tmdb_id=%s — oversætter...", tmdb_id)
+                    try:
+                        import anthropic as _anthropic
+                        from config import ANTHROPIC_API_KEY as _ANT_KEY
+                        _ant = _anthropic.AsyncAnthropic(api_key=_ANT_KEY)
+                        msg = await _ant.messages.create(
+                            model="claude-haiku-4-5-20251001",
+                            max_tokens=300,
+                            messages=[{
+                                "role": "user",
+                                "content": (
+                                    f"Oversæt dette filmresumé til naturligt dansk. "
+                                    f"Returnér KUN den oversatte tekst — ingen forklaring, ingen citationstegn:\n\n{en_overview}"
+                                ),
+                            }],
+                        )
+                        overview = msg.content[0].text.strip()
+                        logger.info("TMDB overview oversat til dansk for tmdb_id=%s", tmdb_id)
+                    except Exception as e:
+                        logger.warning("Oversættelse fejlede for tmdb_id=%s: %s — bruger engelsk", tmdb_id, e)
+                        overview = en_overview
+            except httpx.HTTPError as e:
+                logger.warning("TMDB en-US overview fallback fejlede (id=%s): %s", tmdb_id, e)
+    overview = overview or "Ingen beskrivelse."
+
     if trailer_url:
         logger.info("TMDB trailer: tmdb_id=%s → %s", tmdb_id, trailer_url)
     else:
@@ -233,7 +271,7 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
             "id":                data.get("id"),
             "title":             data.get("title") or data.get("original_title"),
             "tagline":           data.get("tagline"),
-            "overview":          data.get("overview") or "Ingen beskrivelse.",
+            "overview":          overview,
             "release_date":      data.get("release_date", "Ukendt"),
             "runtime_minutes":   data.get("runtime"),
             "vote_average":      round(data.get("vote_average", 0), 1),
@@ -265,7 +303,7 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
         "id":                   data.get("id"),
         "title":                data.get("name") or data.get("original_name"),
         "tagline":              data.get("tagline"),
-        "overview":             data.get("overview") or "Ingen beskrivelse.",
+        "overview":             overview,
         "first_air_date":       data.get("first_air_date", "Ukendt"),
         "number_of_seasons":    data.get("number_of_seasons"),
         "number_of_episodes":   data.get("number_of_episodes"),
