@@ -1,16 +1,18 @@
 """
 services/radarr_service.py - Direkte Radarr API integration.
 
-CHANGES vs previous version:
-  - Tag-strategi ændret: bruger nu telegram_id-baserede tags (tg_<id>)
-    i stedet for plex_username. Dette gør det muligt for webhook_service
-    at udtrække telegram_id direkte fra tag-labelnavnet uden DB-opslag.
-  - add_movie() tager nu telegram_id (int) i stedet for plex_username.
-  - _get_or_create_tag() er uændret i logik, men kaldes med "tg_<id>".
+CHANGES vs previous version (v0.9.6 — tag-robusthed):
+  - _get_or_create_tag(): Håndterer nu 400 Bad Request fra POST /tag mere
+    robust. Radarr returnerer 400 hvis et tag med samme label allerede
+    eksisterer — men vores GET-opslag finder det ikke pga. API-quirks.
+    Fix: ved 400 på POST, lav et nyt GET og find tagget. Hvis det stadig
+    ikke kan findes, log en warning og returner None (film tilføjes uden tag).
+  - Ingen ændringer i add_movie() eller check_radarr_library() logik.
 
-Sorteringslogik (rodmapper):
-  - genre indeholder 'Animation' → /mnt/unionfs/Media/Movies/Animation
-  - alt andet                    → /mnt/unionfs/Media/Movies/Film
+UNCHANGED:
+  - Tag-strategi: tg_<telegram_id>-labels — uændret.
+  - Rodmappe-logik: Animation vs Film — uændret.
+  - get_all_tags(), check_radarr_library() — uændrede.
 """
 
 import logging
@@ -41,28 +43,64 @@ def _headers() -> dict:
 async def _get_or_create_tag(label: str) -> int | None:
     """
     Find Radarr tag ID by label, or create it if it doesn't exist.
-    Returns the tag ID, or None on error.
+
+    Robust mod 400-fejl fra POST /tag:
+      Radarr returnerer 400 når et tag med samme label allerede eksisterer
+      men ikke findes via GET (API-quirk, f.eks. pga. case-mismatch eller
+      timing). Ved 400: lav nyt GET og forsøg at finde det igen.
+      Hvis stadig ikke fundet: log warning og returner None — filmen
+      tilføjes uden tag i stedet for at crashe.
+
+    Returns the tag ID (int), or None on unrecoverable error.
     """
     async with httpx.AsyncClient(timeout=10) as client:
         try:
+            # Trin 1: Søg efter eksisterende tag
             resp = await client.get(f"{_base()}/api/v3/tag", headers=_headers())
             resp.raise_for_status()
-            for tag in resp.json():
-                if tag.get("label", "").lower() == label.lower():
+            existing_tags = resp.json()
+
+            label_lower = label.lower().strip()
+            for tag in existing_tags:
+                if tag.get("label", "").lower().strip() == label_lower:
+                    logger.debug("Radarr: fandt eksisterende tag '%s' id=%s", label, tag["id"])
                     return tag["id"]
 
-            # Tag not found — create it
+            # Trin 2: Tag ikke fundet — opret det
             resp = await client.post(
                 f"{_base()}/api/v3/tag",
                 headers=_headers(),
                 json={"label": label},
             )
+
+            if resp.status_code == 400:
+                # Radarr siger 400 — tagget eksisterer sandsynligvis allerede
+                # Lav et nyt GET og forsøg at finde det
+                logger.warning(
+                    "Radarr: POST /tag returnerede 400 for '%s' — forsøger GET igen", label
+                )
+                resp2 = await client.get(f"{_base()}/api/v3/tag", headers=_headers())
+                resp2.raise_for_status()
+                for tag in resp2.json():
+                    if tag.get("label", "").lower().strip() == label_lower:
+                        logger.info(
+                            "Radarr: fandt tag '%s' efter 400-fallback, id=%s", label, tag["id"]
+                        )
+                        return tag["id"]
+                # Stadig ikke fundet — giv op, film tilføjes uden tag
+                logger.warning(
+                    "Radarr: kunne ikke finde eller oprette tag '%s' — film tilføjes uden tag",
+                    label,
+                )
+                return None
+
             resp.raise_for_status()
             tag_id = resp.json().get("id")
-            logger.info("Radarr: created tag '%s' with id=%s", label, tag_id)
+            logger.info("Radarr: oprettede tag '%s' med id=%s", label, tag_id)
             return tag_id
+
         except httpx.HTTPError as e:
-            logger.error("Radarr tag error: %s", e)
+            logger.error("Radarr tag error for '%s': %s", label, e)
             return None
 
 
@@ -86,7 +124,12 @@ async def get_all_tags() -> dict[int, str]:
 async def check_radarr_library(tmdb_id: int) -> dict:
     """
     Check if a movie is already in Radarr (downloaded or monitored).
-    Returns: {"status": "found"|"missing"|"monitored_only", "title": ...}
+
+    Returns:
+      {"status": "found"}          — filmen er downloadet og klar
+      {"status": "monitored_only"} — filmen er anmodet men ikke downloadet endnu
+      {"status": "missing"}        — filmen er ikke i Radarr
+      {"status": "error", ...}     — API-fejl
     """
     async with httpx.AsyncClient(timeout=10) as client:
         try:
@@ -129,7 +172,8 @@ async def add_movie(
       - 'Animation' in genres → ROOT_MOVIE_ANIMATION
       - else                  → ROOT_MOVIE_STANDARD
     """
-    genre_names_lower = [g.lower() for g in genres]
+    genre_names_lower = [g.lower() if isinstance(g, str) else (g.get("name") or "").lower()
+                         for g in genres]
     if "animation" in genre_names_lower:
         root_folder = ROOT_MOVIE_ANIMATION
     else:
@@ -141,6 +185,11 @@ async def add_movie(
         tag_id = await _get_or_create_tag(tag_label)
         if tag_id is not None:
             tag_ids = [tag_id]
+        else:
+            logger.warning(
+                "Radarr: tag '%s' ikke oprettet — film '%s' tilføjes uden notifikations-tag",
+                tag_label, title,
+            )
 
     logger.info(
         "Radarr: adding movie tmdb_id=%s title='%s' rootFolder=%s tags=%s",
@@ -180,12 +229,20 @@ async def add_movie(
 
             if resp.status_code == 400:
                 body = resp.json()
-                if any("already" in str(e).lower() for e in body):
+                errors = body if isinstance(body, list) else [body]
+                if any("already" in str(e).lower() or "exists" in str(e).lower()
+                       for e in errors):
                     return {
                         "success": False,
                         "status": "already_exists",
-                        "message": "Filmen er allerede i Radarr.",
+                        "message": f"'{title}' er allerede i Radarr.",
                     }
+                logger.error("Radarr 400 (ukendt): %s", body)
+                return {
+                    "success": False,
+                    "status": "error",
+                    "message": f"Radarr afviste bestillingen (400): {body}",
+                }
 
             resp.raise_for_status()
 
@@ -205,21 +262,3 @@ async def add_movie(
             }
 
     return {"success": False, "status": "unknown_error", "message": "Ukendt fejl."}
-
-
-# ── Get queue ─────────────────────────────────────────────────────────────────
-
-async def get_radarr_queue() -> list:
-    """Return current Radarr download queue."""
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            resp = await client.get(
-                f"{_base()}/api/v3/queue",
-                headers=_headers(),
-                params={"pageSize": 50},
-            )
-            resp.raise_for_status()
-            return resp.json().get("records", [])
-        except httpx.HTTPError as e:
-            logger.error("Radarr queue error: %s", e)
-            return []

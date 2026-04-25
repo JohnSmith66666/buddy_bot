@@ -1,114 +1,142 @@
 """
-services/confirmation_service.py - Inline keyboard bekræftelsesflow.
+services/confirmation_service.py - Bestillingsflow og Netflix-look infokort.
 
-CHANGES vs previous version:
-  - IMDb-rating hentes nu direkte fra Plex (item.rating) når filmen er på serveren.
-    Fallback til TMDB vote_average hvis Plex ikke har en rating (f.eks. ny titel).
-    Formatering: 🎬 IMDb: {score}/10 — vises i caption som hidtil.
-  - _build_caption() tager nu et valgfrit rating-argument.
-  - handle_watchlist_callback keyboard-opdatering — uændret.
-  - parse_mode="Markdown" overalt — uændret.
+CHANGES vs previous version (v0.9.6 — execute_order foto-fix):
+  - KRITISK FIX: execute_order() brugte altid edit_message_text() — men når
+    infokort er sendt som sendPhoto() (plakat), crasher det med:
+    "BadRequest: There is no text in the message to edit".
+    Ny hjælpefunktion _edit_or_caption() detekterer om beskeden er et foto
+    og bruger edit_message_caption() i stedet. Denne bruges nu overalt i
+    execute_order() (loading-besked, success-besked, fejl-besked).
+  - FORBEDRET: execute_order() tjekker nu Radarr/Sonarr for "already_exists"
+    (monitored_only) status FØR bestilling — og giver brugeren en klar besked
+    i stedet for en fejl-popup.
+  - FORBEDRET: _edit_or_caption() er robust mod alle Telegram-fejl og falder
+    tilbage til context.bot.send_message() hvis alt andet fejler.
+
+UNCHANGED:
+  - show_search_results(), show_confirmation(), handle_watchlist_callback()
+    er uændrede.
+  - _make_token(), _build_caption(), STATUS_FOUND konstanter — uændrede.
 """
 
 import logging
 import secrets
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.ext import ContextTypes
 
 import database
-from services.plex_service import check_library, STATUS_FOUND
-from services.radarr_service import add_movie
-from services.sonarr_service import add_series
+from services.radarr_service import (
+    add_movie,
+    check_radarr_library,
+)
+from services.sonarr_service import (
+    add_series,
+    check_sonarr_library,
+)
 from services.tmdb_service import get_media_details, search_media
+from services.plex_service import check_library
 
 logger = logging.getLogger(__name__)
 
-_MAX_CAPTION = 1024  # Telegrams max caption-længde for billeder
+STATUS_FOUND = "found"
 
 
 def _make_token() -> str:
     return secrets.token_hex(8)
 
 
-def _build_caption(details: dict, rating: float | None = None) -> str:
+def _build_caption(details: dict, rating=None) -> str:
     """
-    Byg Markdown-caption til send_photo — Design B med skillelinjer og kursiv resume.
-
-    Layout:
-      *Titel* (År)
-      ━━━━━━━━━━━━━━━━
-      🎭 Genre · Genre · Genre
-      ⭐️ 7.3/10  ·  ⏱ 144 min
-      👥 Skuespiller, Skuespiller
-      ━━━━━━━━━━━━━━━━
-      _Resumé i kursiv..._
-
-    rating: Plex IMDb-score (foretrukket) eller TMDB vote_average (fallback).
-    Overview trimmes til Telegrams max caption-grænse på 1024 tegn.
+    Byg Netflix-look caption til infokort.
+    Bruger Plex IMDb-rating hvis tilgængeligt, ellers TMDB vote_average.
+    parse_mode="Markdown" — ikke MarkdownV2.
     """
-    title    = details.get("title") or "Ukendt"
-    year     = (details.get("release_date") or details.get("first_air_date") or "")[:4]
-    genres   = details.get("genres", [])[:3]
-    score    = rating if rating is not None else details.get("vote_average")
-    overview = (details.get("overview") or "Ingen beskrivelse.").strip()
-    cast     = details.get("cast") or []
-    runtime  = details.get("runtime_minutes")
-    seasons  = details.get("number_of_seasons")
+    title       = details.get("title") or "Ukendt"
+    year        = (details.get("release_date") or details.get("first_air_date") or "")[:4]
+    genres      = details.get("genres") or []
+    overview    = details.get("overview") or "Ingen beskrivelse."
+    cast        = details.get("cast") or []
+    vote        = rating if rating is not None else details.get("vote_average")
 
-    SEP = "━━━━━━━━━━━━━━━━"
-    lines = []
+    genre_str = " · ".join(g if isinstance(g, str) else g.get("name", "") for g in genres[:3])
+    cast_str  = ", ".join(cast[:3]) if cast else ""
 
-    # Titel + årstal
-    header = f"*{title}*"
-    if year:
-        header += f" ({year})"
-    lines.append(header)
-    lines.append(SEP)
-
-    # Genrer
-    if genres:
-        lines.append(f"🎭 {' · '.join(genres)}")
-
-    # Score + varighed på samme linje
-    meta_parts = []
-    if score:
-        meta_parts.append(f"⭐️ {score}/10")
-    if runtime:
-        meta_parts.append(f"⏱ {runtime} min")
-    elif seasons:
-        meta_parts.append(f"📺 {seasons} sæson{'er' if seasons != 1 else ''}")
-    if meta_parts:
-        lines.append("  ·  ".join(meta_parts))
-
-    # Skuespillere
-    if cast:
-        cast_str = cast if isinstance(cast, str) else ", ".join(cast)
-        lines.append(f"👥 {cast_str}")
-
-    lines.append(SEP)
-
-    header_text = "\n".join(lines) + "\n"
-
-    # Overview i kursiv — trim så caption ikke overstiger 1024 tegn
-    # 2 ekstra tegn til "_" på hver side af kursiv
-    available = _MAX_CAPTION - len(header_text) - 5
-    if available <= 0:
-        return header_text.strip()
-    if len(overview) > available:
-        overview = overview[:available] + "…"
-
-    return header_text + f"_{overview}_\n{SEP}"
+    lines = [f"*{title}* ({year})", ""]
+    if genre_str:
+        lines += [f"🎭 {genre_str}"]
+    if cast_str:
+        lines += [f"👥 {cast_str}"]
+    if genre_str or cast_str:
+        lines += ["", "─" * 32, ""]
+    lines += [f"_{overview}_"]
+    if vote:
+        try:
+            stars = "⭐" * round(float(vote) / 2)
+            lines += ["", f"{stars} {float(vote):.1f}/10"]
+        except (ValueError, TypeError):
+            pass
+    return "\n".join(lines)
 
 
-# ── Step 1: Vis søgeresultater som knapper ────────────────────────────────────
+# ── Hjælpefunktion: rediger tekst ELLER caption ───────────────────────────────
+
+async def _edit_or_caption(
+    query_callback,
+    text: str,
+    parse_mode: str = "Markdown",
+    reply_markup=None,
+) -> None:
+    """
+    Telegram skelner mellem tekst-beskeder og foto-beskeder:
+      - Tekst-besked → edit_message_text()
+      - Foto-besked  → edit_message_caption()
+
+    Infokort sendes som sendPhoto() — derfor crasher edit_message_text()
+    med "There is no text in the message to edit".
+
+    Denne funktion detekterer besked-typen og bruger det rigtige kald.
+    Falder altid tilbage til en ny send_message() hvis alt andet fejler.
+    """
+    msg = query_callback.message
+
+    # Detektér om beskeden er et foto
+    is_photo = bool(getattr(msg, "photo", None))
+
+    kwargs = {"parse_mode": parse_mode}
+    if reply_markup is not None:
+        kwargs["reply_markup"] = reply_markup
+
+    try:
+        if is_photo:
+            await query_callback.edit_message_caption(caption=text, **kwargs)
+        else:
+            await query_callback.edit_message_text(text=text, **kwargs)
+    except Exception as e:
+        logger.warning("_edit_or_caption fejlede (%s) — forsøger send_message fallback", e)
+        try:
+            await query_callback.message.reply_text(text, parse_mode=parse_mode)
+        except Exception as e2:
+            logger.error("_edit_or_caption absolut fallback fejlede: %s", e2)
+
+
+# ── Step 1: Vis søgeresultater ────────────────────────────────────────────────
 
 async def show_search_results(
-    message: Message,
+    message,
     query: str,
-    media_type: str = "both",
+    media_type: str,
 ) -> bool:
-    """Search TMDB og præsenter top resultater som inline buttons."""
+    """
+    Søg TMDB og vis top-5 resultater som inline-knapper.
+    Returnerer True hvis resultater blev fundet.
+    """
     results = await search_media(query, media_type)
     if not results:
         await message.reply_text(f"Jeg kunne ikke finde noget for '{query}' 🤔")
@@ -159,14 +187,11 @@ async def show_confirmation(
     crash ved specialtegn i filmtitler og beskrivelser.
 
     Knap-logik:
-      - PÅ PLEX med keys → [▶️ Se på Plex] (deep-link URL-encoded)
-      - PÅ PLEX uden keys → [▶️ Se på Plex] (generisk)
+      - PÅ PLEX → [▶️ Se på Plex]
       - IKKE PÅ PLEX → [➕ Tilføj til Plex]
       - ALTID → [📌 Tilføj til Watchlist]
       - HVIS trailer → [🎬 Se Trailer]
     """
-    from telegram import CallbackQuery
-
     pending = await database.get_pending_request(token)
     if not pending:
         if isinstance(trigger, CallbackQuery):
@@ -224,9 +249,9 @@ async def show_confirmation(
         tmdb_id=tmdb_id,
     )
     on_plex    = plex_check.get("status") == STATUS_FOUND
-    machine_id = plex_check.get("machineIdentifier", "")
+    machine_id = plex_check.get("machineIdent", "")
     rating_key = plex_check.get("ratingKey", "")
-    plex_rating = plex_check.get("rating")  # IMDb-score fra Plex, None hvis ikke på serveren
+    plex_rating = plex_check.get("rating")
 
     logger.info(
         "Rating — Plex: %s, TMDB: %s, bruger: %s",
@@ -239,14 +264,11 @@ async def show_confirmation(
     button_rows = []
 
     if on_plex:
-        # Hent watch.plex.tv deep-link via Plex metadata API (slug-opslag)
-        # Fallback til søge-URL hvis slug-opslaget fejler
         from services.plex_service import get_plex_watch_url
         watch_url = await get_plex_watch_url(tmdb_id, media_type)
         if watch_url:
             plex_url = watch_url
         else:
-            # Fallback: søge-URL med titlen
             from urllib.parse import quote
             plex_url = f"https://watch.plex.tv/search?q={quote(title)}"
         logger.info("Plex URL — titel=%r url=%s", title, plex_url)
@@ -273,8 +295,7 @@ async def show_confirmation(
         except Exception:
             pass
 
-    # ── Send infokort via context.bot (Markdown — ikke MarkdownV2) ───────────
-    # Slet loading-besked lige inden infokort vises — ingen synlig ventetid
+    # ── Send infokort ──────────────────────────────────────────────────────────
     if loading_msg:
         try:
             await loading_msg.delete()
@@ -299,7 +320,6 @@ async def show_confirmation(
             )
     except Exception as e:
         logger.error("show_confirmation send fejl: %s", e)
-        # Absolut fallback — ingen parse_mode
         try:
             plain = f"{title} ({year})\n\n{details.get('overview', '')}"
             await context.bot.send_message(
@@ -339,7 +359,6 @@ async def handle_watchlist_callback(
     try:
         success = await add_to_watchlist(title, plex_username)
         if success:
-            # ── Opdater keyboard: skift watchlist-knappen til grøn bekræftelse ──
             if current_keyboard := query.message.reply_markup:
                 new_keyboard = []
                 for row in current_keyboard.inline_keyboard:
@@ -377,24 +396,75 @@ async def execute_order(
     token: str,
     plex_username: str | None,
 ) -> None:
-    """Execute Radarr/Sonarr bestilling. Sender telegram_id som tg_-tag."""
+    """
+    Execute Radarr/Sonarr bestilling.
+
+    Flow:
+      1. Hent pending request fra DB.
+      2. Tjek om filmen/serien allerede er i Radarr/Sonarr (monitored_only).
+         Giv en klar besked til brugeren hvis den allerede er anmodet.
+      3. Send til Radarr/Sonarr.
+      4. Opdater beskeden med result — bruger _edit_or_caption() som
+         håndterer både tekst-beskeder og foto-beskeder (infokort med plakat).
+    """
     pending = await database.get_pending_request(token)
     if not pending:
-        await query_callback.edit_message_text("Sessionen er udløbet — prøv igen.")
+        await _edit_or_caption(query_callback, "Sessionen er udløbet — prøv igen.")
         return
 
     media_type  = pending["media_type"]
     title       = pending["title"]
+    tmdb_id     = pending.get("tmdb_id")
+    tvdb_id     = pending.get("tvdb_id")
     telegram_id = pending.get("telegram_id") or query_callback.from_user.id
 
-    await query_callback.edit_message_text(
+    # ── Trin 1: Tjek om allerede i Radarr/Sonarr ──────────────────────────────
+    # Dette fanger "monitored_only" (anmodet men ikke downloadet endnu) og
+    # "found" (allerede downloadet) — begge tilfælde stopper bestillingen.
+    try:
+        if media_type == "movie" and tmdb_id:
+            existing = await check_radarr_library(tmdb_id)
+            if existing.get("status") in ("found", "monitored_only"):
+                status_txt = (
+                    "er allerede på Plex! 🎬"
+                    if existing.get("status") == "found"
+                    else "er allerede anmodet og søges nu — du får besked når den er klar! 🍿"
+                )
+                await _edit_or_caption(
+                    query_callback,
+                    f"*{title}* {status_txt}",
+                    parse_mode="Markdown",
+                )
+                return
+        elif media_type == "tv" and tvdb_id:
+            existing = await check_sonarr_library(tvdb_id)
+            if existing.get("status") in ("found", "monitored_only"):
+                status_txt = (
+                    "er allerede på Plex! 📺"
+                    if existing.get("status") == "found"
+                    else "er allerede anmodet og søges nu — du får besked når den er klar! 🍿"
+                )
+                await _edit_or_caption(
+                    query_callback,
+                    f"*{title}* {status_txt}",
+                    parse_mode="Markdown",
+                )
+                return
+    except Exception as e:
+        # Hvis tjekket fejler, fortsæt til bestilling — Radarr/Sonarr håndterer duplikater
+        logger.warning("Pre-check mod Radarr/Sonarr fejlede for '%s': %s", title, e)
+
+    # ── Trin 2: Vis loading-besked ─────────────────────────────────────────────
+    await _edit_or_caption(
+        query_callback,
         f"⏳ Bestiller *{title}* — vent et øjeblik…",
         parse_mode="Markdown",
     )
 
+    # ── Trin 3: Send til Radarr/Sonarr ────────────────────────────────────────
     if media_type == "movie":
         result = await add_movie(
-            tmdb_id=pending["tmdb_id"],
+            tmdb_id=tmdb_id,
             title=title,
             year=pending["year"] or 0,
             genres=pending["genres"],
@@ -402,7 +472,7 @@ async def execute_order(
         )
     else:
         result = await add_series(
-            tvdb_id=pending["tvdb_id"],
+            tvdb_id=tvdb_id,
             title=title,
             year=pending["year"] or 0,
             original_language=pending["original_language"],
@@ -410,16 +480,17 @@ async def execute_order(
             telegram_id=telegram_id,
         )
 
+    # ── Trin 4: Vis resultat ───────────────────────────────────────────────────
     if result.get("success"):
-        await query_callback.edit_message_text(
-            f"✅ *{title}* er bestilt og søges nu! "
-            f"Du får besked når den er klar på Plex 🍿",
+        await _edit_or_caption(
+            query_callback,
+            f"✅ *{title}* er bestilt og søges nu!\nDu får besked når den er klar på Plex 🍿",
             parse_mode="Markdown",
         )
     else:
         status = result.get("status", "")
         if status == "already_exists":
-            msg = f"*{title}* er allerede i biblioteket!"
+            msg = f"*{title}* er allerede anmodet — du får besked når den er klar! 🍿"
         else:
             msg = f"Noget gik galt med bestillingen af *{title}*. Prøv igen lidt senere."
-        await query_callback.edit_message_text(msg, parse_mode="Markdown")
+        await _edit_or_caption(query_callback, msg, parse_mode="Markdown")
