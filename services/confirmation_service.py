@@ -228,9 +228,11 @@ async def show_confirmation(
     button_rows = []
 
     if on_plex:
+        # URL-encoded key — kræves af Plex mobilapp
+        # Rå /library/metadata/ virker kun i browser, ikke i mobilappen
         plex_url = (
             f"https://app.plex.tv/desktop/#!/server/{machine_id}"
-            f"/details?key=/library/metadata/{rating_key}"
+            f"/details?key=%2Flibrary%2Fmetadata%2F{rating_key}"
         )
         logger.info(
             "Plex URL genereret — machineId=%r ratingKey=%r url=%s",
