@@ -1338,8 +1338,13 @@ async def get_plex_watch_url(
     try:
         async with _httpx.AsyncClient(timeout=8) as client:
             resp = await client.get(url, params=params)
+            logger.info(
+                "Plex metadata API svar: status=%s url=%s",
+                resp.status_code, str(resp.url),
+            )
             resp.raise_for_status()
             data = resp.json()
+            logger.info("Plex metadata API data: %s", str(data)[:500])
 
         metadata = data.get("MediaContainer", {}).get("Metadata", [])
         if not metadata:
