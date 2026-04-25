@@ -98,7 +98,7 @@ def _build_caption(details: dict, rating: float | None = None) -> str:
     if len(overview) > available:
         overview = overview[:available] + "…"
 
-    return header_text + f"_{overview}_"
+    return header_text + f"_{overview}_\n{SEP}"
 
 
 # ── Step 1: Vis søgeresultater som knapper ────────────────────────────────────
