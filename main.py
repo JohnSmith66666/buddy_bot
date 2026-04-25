@@ -273,11 +273,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.chat.send_action("typing")
     plex_username = await database.get_plex_username(user.id)
 
+    # Send loading-besked og slet den når svaret er klar
+    loading_msg = await update.message.reply_text(
+        "🤖 Beregner svar med lynets hast... næsten..."
+    )
+
     reply = await get_ai_response(
         telegram_id=user.id,
         user_message=text,
         plex_username=plex_username,
     )
+
+    # Slet loading-beskeden
+    try:
+        await loading_msg.delete()
+    except Exception:
+        pass
 
     # Rens backticks fra signaler — Buddy pakker dem nogle gange ind i Markdown
     # Eksempel: `SHOW_INFO:157336:movie` → SHOW_INFO:157336:movie
