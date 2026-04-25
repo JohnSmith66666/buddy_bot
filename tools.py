@@ -389,11 +389,12 @@ TOOLS = [
         "name": "get_recently_added",
         "description": (
             "Hent det nyeste indhold tilfojet til Plex. "
-            "Brug naar brugeren siger 'nyt', 'tilfojet', 'landet', 'kommet'."
+            "Brug naar brugeren siger 'nyt', 'tilfojet', 'landet', 'kommet'. "
+            "Send count=20 som standard for at faa et godt mix af film og serier."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {"count": {"type": "integer"}},
+            "properties": {"count": {"type": "integer", "description": "Antal titler. Standard 20."}},
             "required": [],
         },
     },

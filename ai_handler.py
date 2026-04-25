@@ -241,8 +241,11 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
             media_type=tool_input.get("media_type"),
         ))
     if tool_name == "get_recently_added":
-        count  = tool_input.get("count", 10)
-        result = await get_recently_added(count=count)
+        count  = tool_input.get("count", 20)
+        # Hent altid minimum 30 fra Tautulli — de 10-20 seneste kan alle være
+        # film, og serier forsvinder så helt fra svaret. Med 30 får vi et godt
+        # mix af begge typer.
+        result = await get_recently_added(count=max(count, 30))
 
         if result and result.get("movies"):
             async def _lookup_movie(title: str) -> int | None:
