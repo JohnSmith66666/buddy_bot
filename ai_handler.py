@@ -271,13 +271,13 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
         ))
     if tool_name == "get_recently_added":
         result = await get_recently_added(count=tool_input.get("count", 10))
-        if result and result.get("movies"):
-            # Berig film uden tmdb_id via TMDB-søgning
+        if result:
             import httpx as _httpx
+            import asyncio as _asyncio
             from config import TMDB_API_KEY as _TMDB_KEY
             _TMDB_BASE = "https://api.themoviedb.org/3"
 
-            async def _lookup(title: str, year: str | None) -> int | None:
+            async def _lookup_movie(title: str, year: str | None) -> int | None:
                 params = {"api_key": _TMDB_KEY, "language": "da-DK", "query": title}
                 if year:
                     params["primary_release_year"] = str(year)
@@ -290,18 +290,41 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
                 except Exception:
                     return None
 
-            import asyncio as _asyncio
-            tasks = [
-                _lookup(m["title"], m.get("year"))
-                for m in result["movies"] if not m.get("tmdb_id")
-            ]
-            needs_lookup = [m for m in result["movies"] if not m.get("tmdb_id")]
-            if tasks:
-                looked_up = await _asyncio.gather(*tasks)
-                for movie, tmdb_id in zip(needs_lookup, looked_up):
-                    if tmdb_id:
-                        movie["tmdb_id"] = tmdb_id
-                        logger.info("TMDB fallback: '%s' → %s", movie["title"], tmdb_id)
+            async def _lookup_tv(series_name: str) -> int | None:
+                params = {"api_key": _TMDB_KEY, "language": "da-DK", "query": series_name}
+                try:
+                    async with _httpx.AsyncClient(timeout=5) as c:
+                        r = await c.get(f"{_TMDB_BASE}/search/tv", params=params)
+                        r.raise_for_status()
+                        hits = r.json().get("results", [])
+                        return hits[0].get("id") if hits else None
+                except Exception:
+                    return None
+
+            # Berig film uden tmdb_id
+            if result.get("movies"):
+                needs_movie = [m for m in result["movies"] if not m.get("tmdb_id")]
+                if needs_movie:
+                    looked_up = await _asyncio.gather(
+                        *[_lookup_movie(m["title"], m.get("year")) for m in needs_movie]
+                    )
+                    for movie, tmdb_id in zip(needs_movie, looked_up):
+                        if tmdb_id:
+                            movie["tmdb_id"] = tmdb_id
+                            logger.info("TMDB film-fallback: '%s' → %s", movie["title"], tmdb_id)
+
+            # Berig serier uden tmdb_id — søg på series_name (serienavn, ikke episodetitel)
+            if result.get("episodes"):
+                needs_tv = [e for e in result["episodes"] if not e.get("tmdb_id")]
+                if needs_tv:
+                    looked_up = await _asyncio.gather(
+                        *[_lookup_tv(e.get("series_name") or e.get("title", "")) for e in needs_tv]
+                    )
+                    for ep, tmdb_id in zip(needs_tv, looked_up):
+                        if tmdb_id:
+                            ep["tmdb_id"] = tmdb_id
+                            logger.info("TMDB TV-fallback: '%s' → %s", ep.get("series_name"), tmdb_id)
+
         return j(result)
 
     return j({"error": f"Ukendt vaerktoej: {tool_name}"})
