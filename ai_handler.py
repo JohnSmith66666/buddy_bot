@@ -1,7 +1,12 @@
 """
 ai_handler.py - Agentic loop for Buddy.
 
-CHANGES vs previous version (v0.9.5 — user_first_name fix):
+CHANGES vs previous version (v0.9.9 — get_recently_added fix):
+  - _dispatch(): get_recently_added() kaldes nu uden plex_username argument.
+    Tautulli-funktionen accepterer kun count — plex_username er ikke relevant
+    for recently_added (det er server-bred data). Fejlede med TypeError.
+
+UNCHANGED (v0.9.5 — user_first_name fix):
   - get_ai_response() har fået user_first_name: str | None = None parameter.
     main.py kaldte allerede funktionen med user_first_name=user.first_name,
     men ai_handler accepterede ikke argumentet → TypeError ved hvert kald.
@@ -240,7 +245,7 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
         ))
     if tool_name == "get_recently_added":
         count = tool_input.get("count", 10)
-        result = await get_recently_added(count=count, plex_username=plex_username)
+        result = await get_recently_added(count=count)
 
         # Berig film med TMDB ID via title-fallback hvis det mangler
         if result and result.get("movies"):
