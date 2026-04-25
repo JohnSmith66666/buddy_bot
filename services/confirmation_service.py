@@ -228,15 +228,14 @@ async def show_confirmation(
     button_rows = []
 
     if on_plex:
-        # watch.plex.tv åbner direkte i Plex mobilapp (registreret som verified link)
-        # app.plex.tv åbner kun i desktop-browseren
-        plex_url = (
-            f"https://watch.plex.tv/server/{machine_id}"
-            f"/details?key=%2Flibrary%2Fmetadata%2F{rating_key}"
-        )
+        # Søgelink — åbner Plex mobilapp med titlen søgt op direkte
+        # Deep-links til specifikke film virker ikke på mobil
+        from urllib.parse import quote
+        plex_search_query = quote(title)
+        plex_url = f"https://app.plex.tv/desktop/#!/search?query={plex_search_query}"
         logger.info(
-            "Plex URL genereret — machineId=%r ratingKey=%r url=%s",
-            machine_id, rating_key, plex_url,
+            "Plex søge-URL genereret — titel=%r url=%s",
+            title, plex_url,
         )
         button_rows.append([InlineKeyboardButton("▶️ Se på Plex", url=plex_url)])
     else:
