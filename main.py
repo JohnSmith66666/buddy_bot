@@ -15,7 +15,7 @@ import sys
 import traceback
 from aiohttp import web
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -224,7 +224,8 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.chat.send_action("typing")
 
     loading_msg = await update.message.reply_text(
-        "🤖 Beregner svar med lynets hast... næsten..."
+        "🤖 Beregner svar med lynets hast... næsten...",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
     details = await get_media_details(tmdb_id, media_type)
@@ -285,7 +286,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Send loading-besked og slet den når svaret er klar
     loading_msg = await update.message.reply_text(
-        "🤖 Beregner svar med lynets hast... næsten..."
+        "🤖 Beregner svar med lynets hast... næsten...",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
     reply = await get_ai_response(
