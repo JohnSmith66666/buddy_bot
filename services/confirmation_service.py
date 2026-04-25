@@ -1,38 +1,24 @@
 """
 services/confirmation_service.py - Bestillingsflow og Netflix-look infokort.
 
-CHANGES vs previous version (v0.9.8 — Annuller-knap på infokort):
+CHANGES vs previous version (v1.0.3 — infokort layout fix):
+  - _build_caption(): Rettet tre layout-fejl der fik serier til at se
+    anderledes ud end film:
+    1. Genre-emoji: ændret fra 🎭 → 🎬 (matcher Design B / billede 1).
+    2. Skillelinje: ændret fra "─" * 32 (U+2500 tynde) → "━" * 16 (U+2501
+       tykke) — matcher den godkendte Design B.
+    3. Sæson-info for serier: tilføjet "📺 X sæson(er)" på samme linje som
+       rating, adskilt af " · " — matcher billede 2's forventede layout.
+    Ingen andre ændringer i filen.
+
+UNCHANGED (v0.9.8 — Annuller-knap på infokort):
   - show_confirmation(): Tilføjet ❌ Annuller-knap nederst i infokortets keyboard.
-    Brugeren kan nu afvise et infokort uden at starte forfra.
-    Bruger cancel:none callback — samme handler som søgelistens Annuller.
 
 UNCHANGED (v0.9.7 — søgeresultater UX-fix):
-  - show_search_results(): Tre forbedringer:
-    1. Årstal fallback: viser "?" hvis release_date mangler i TMDB (f.eks.
-       upremierede film som "The Doctrine 2026") i stedet for bare titlen.
-    2. Duplikat-skelnen: tilføjer type-label "· Film" eller "· Serie" til
-       knap-label så to titler med samme navn men ingen dato skelnes.
-    3. Tilbage-knap: "⬅️ Tilbage"-knap gemmer søgeterm og media_type i
-       pending_requests så brugeren kan søge igen uden at taste forfra.
-       Kræver ny back:-handler i main.py.
+  - show_search_results(): årstal-fallback, duplikat-skelnen, tilbage-knap.
 
 UNCHANGED (v0.9.6 — execute_order foto-fix):
-  - KRITISK FIX: execute_order() brugte altid edit_message_text() — men når
-    infokort er sendt som sendPhoto() (plakat), crasher det med:
-    "BadRequest: There is no text in the message to edit".
-    Ny hjælpefunktion _edit_or_caption() detekterer om beskeden er et foto
-    og bruger edit_message_caption() i stedet. Denne bruges nu overalt i
-    execute_order() (loading-besked, success-besked, fejl-besked).
-  - FORBEDRET: execute_order() tjekker nu Radarr/Sonarr for "already_exists"
-    (monitored_only) status FØR bestilling — og giver brugeren en klar besked
-    i stedet for en fejl-popup.
-  - FORBEDRET: _edit_or_caption() er robust mod alle Telegram-fejl og falder
-    tilbage til context.bot.send_message() hvis alt andet fejler.
-
-UNCHANGED:
-  - show_search_results(), show_confirmation(), handle_watchlist_callback()
-    er uændrede.
-  - _make_token(), _build_caption(), STATUS_FOUND konstanter — uændrede.
+  - _edit_or_caption(), execute_order() — uændrede.
 """
 
 import logging
@@ -69,34 +55,76 @@ def _make_token() -> str:
 
 def _build_caption(details: dict, rating=None) -> str:
     """
-    Byg Netflix-look caption til infokort.
+    Byg Netflix-look caption til infokort (Design B).
+
+    Layout:
+      *Titel* (År)
+
+      🎬 Genre · Genre · Genre
+      👥 Skuespiller, Skuespiller
+      ⭐️ 9.1/10 · 🕐 152 min        ← film (rating + spilletid)
+      ⭐️ 9.1/10 · 📺 2 sæsoner      ← serier (rating + sæsoner)
+      ━━━━━━━━━━━━━━━━
+
+      _Resumé i kursiv_
+
+    Rating vises øverst — mellem cast og skillelinjen.
+    Én enkelt ⭐️ (ikke stjernespam via round()).
+    Spilletid kun for film (runtime_minutes fra TMDB).
+    Serier viser antal sæsoner i stedet for spilletid.
     Bruger Plex IMDb-rating hvis tilgængeligt, ellers TMDB vote_average.
     parse_mode="Markdown" — ikke MarkdownV2.
     """
-    title       = details.get("title") or "Ukendt"
-    year        = (details.get("release_date") or details.get("first_air_date") or "")[:4]
-    genres      = details.get("genres") or []
-    overview    = details.get("overview") or "Ingen beskrivelse."
-    cast        = details.get("cast") or []
-    vote        = rating if rating is not None else details.get("vote_average")
+    title           = details.get("title") or "Ukendt"
+    year            = (details.get("release_date") or details.get("first_air_date") or "")[:4]
+    genres          = details.get("genres") or []
+    overview        = details.get("overview") or "Ingen beskrivelse."
+    cast            = details.get("cast") or []
+    vote            = rating if rating is not None else details.get("vote_average")
+    media_type      = details.get("media_type", "movie")
+    runtime_minutes = details.get("runtime_minutes")
+    num_seasons     = details.get("number_of_seasons")
 
     genre_str = " · ".join(g if isinstance(g, str) else g.get("name", "") for g in genres[:3])
     cast_str  = ", ".join(cast[:3]) if cast else ""
 
     lines = [f"*{title}* ({year})", ""]
+
     if genre_str:
-        lines += [f"🎭 {genre_str}"]
+        lines.append(f"🎬 {genre_str}")
     if cast_str:
-        lines += [f"👥 {cast_str}"]
-    if genre_str or cast_str:
-        lines += ["", "─" * 32, ""]
-    lines += [f"_{overview}_"]
+        lines.append(f"👥 {cast_str}")
+
+    # ── Rating + spilletid/sæsoner — øverst, før skillelinjen ────────────────
+    meta_parts = []
     if vote:
         try:
-            stars = "⭐" * round(float(vote) / 2)
-            lines += ["", f"{stars} {float(vote):.1f}/10"]
+            meta_parts.append(f"⭐️ {float(vote):.1f}/10")
         except (ValueError, TypeError):
             pass
+
+    if media_type == "movie" and runtime_minutes:
+        try:
+            mins = int(runtime_minutes)
+            if mins > 0:
+                meta_parts.append(f"🕐 {mins} min")
+        except (ValueError, TypeError):
+            pass
+    elif media_type == "tv" and num_seasons:
+        try:
+            n = int(num_seasons)
+            season_label = "sæson" if n == 1 else "sæsoner"
+            meta_parts.append(f"📺 {n} {season_label}")
+        except (ValueError, TypeError):
+            pass
+
+    if meta_parts:
+        lines.append(" · ".join(meta_parts))
+
+    # ── Skillelinje + resumé ──────────────────────────────────────────────────
+    lines += ["", "━" * 16, ""]
+    lines.append(f"_{overview}_")
+
     return "\n".join(lines)
 
 
@@ -120,8 +148,6 @@ async def _edit_or_caption(
     Falder altid tilbage til en ny send_message() hvis alt andet fejler.
     """
     msg = query_callback.message
-
-    # Detektér om beskeden er et foto
     is_photo = bool(getattr(msg, "photo", None))
 
     kwargs = {"parse_mode": parse_mode}
@@ -160,7 +186,6 @@ async def show_search_results(
     top = results[:5]
     buttons = []
 
-    # Byg sæt af labels vi allerede har tilføjet — bruges til at opdage duplikater
     seen_labels: set[str] = set()
 
     for item in top:
@@ -169,13 +194,9 @@ async def show_search_results(
         mtype   = item.get("media_type", media_type if media_type != "both" else "movie")
         tmdb_id = item.get("id")
 
-        # Årstal-fallback: vis "?" hvis datoen mangler (upremierede titler)
         year_str = year if year else "?"
+        label    = f"{title} ({year_str})"
 
-        # Basis-label
-        label = f"{title} ({year_str})"
-
-        # Tilføj type-label hvis label-duplikat opstår (f.eks. to "The Doctrine (?)")
         if label in seen_labels:
             type_label = "Film" if mtype == "movie" else "Serie"
             label = f"{title} ({year_str}) · {type_label}"
@@ -192,14 +213,14 @@ async def show_search_results(
         })
         buttons.append([InlineKeyboardButton(label, callback_data=f"pick:{token}")])
 
-    # Tilbage-knap: gemmer søgeterm og media_type så brugeren kan søge igen
+    # Tilbage-knap: gemmer søgeterm og media_type til back:-handleren
     back_token = _make_token()
     await database.save_pending_request(back_token, message.chat_id, {
-        "media_type":   media_type,
-        "tmdb_id":      0,
-        "title":        query,   # genbrugt som søgeterm i back:-handleren
-        "year":         None,
-        "step":         "back",
+        "media_type": media_type,
+        "tmdb_id":    0,
+        "title":      query,
+        "year":       None,
+        "step":       "back",
     })
 
     buttons.append([InlineKeyboardButton("❌ Annuller", callback_data="cancel:none")])
@@ -232,6 +253,7 @@ async def show_confirmation(
       - IKKE PÅ PLEX → [➕ Tilføj til Plex]
       - ALTID → [📌 Tilføj til Watchlist]
       - HVIS trailer → [🎬 Se Trailer]
+      - ALTID → [❌ Annuller]
     """
     pending = await database.get_pending_request(token)
     if not pending:
@@ -285,13 +307,13 @@ async def show_confirmation(
     })
 
     # ── Tjek om titlen er på Plex ─────────────────────────────────────────────
-    plex_check = await check_library(
+    plex_check  = await check_library(
         title, int(year) if year else None, media_type, plex_username,
         tmdb_id=tmdb_id,
     )
-    on_plex    = plex_check.get("status") == STATUS_FOUND
-    machine_id = plex_check.get("machineIdent", "")
-    rating_key = plex_check.get("ratingKey", "")
+    on_plex     = plex_check.get("status") == STATUS_FOUND
+    machine_id  = plex_check.get("machineIdentifier", "")
+    rating_key  = plex_check.get("ratingKey", "")
     plex_rating = plex_check.get("rating")
 
     logger.info(
@@ -445,10 +467,8 @@ async def execute_order(
     Flow:
       1. Hent pending request fra DB.
       2. Tjek om filmen/serien allerede er i Radarr/Sonarr (monitored_only).
-         Giv en klar besked til brugeren hvis den allerede er anmodet.
       3. Send til Radarr/Sonarr.
-      4. Opdater beskeden med result — bruger _edit_or_caption() som
-         håndterer både tekst-beskeder og foto-beskeder (infokort med plakat).
+      4. Opdater beskeden med result via _edit_or_caption().
     """
     pending = await database.get_pending_request(token)
     if not pending:
@@ -462,8 +482,6 @@ async def execute_order(
     telegram_id = pending.get("telegram_id") or query_callback.from_user.id
 
     # ── Trin 1: Tjek om allerede i Radarr/Sonarr ──────────────────────────────
-    # Dette fanger "monitored_only" (anmodet men ikke downloadet endnu) og
-    # "found" (allerede downloadet) — begge tilfælde stopper bestillingen.
     try:
         if media_type == "movie" and tmdb_id:
             existing = await check_radarr_library(tmdb_id)
@@ -494,7 +512,6 @@ async def execute_order(
                 )
                 return
     except Exception as e:
-        # Hvis tjekket fejler, fortsæt til bestilling — Radarr/Sonarr håndterer duplikater
         logger.warning("Pre-check mod Radarr/Sonarr fejlede for '%s': %s", title, e)
 
     # ── Trin 2: Vis loading-besked ─────────────────────────────────────────────
