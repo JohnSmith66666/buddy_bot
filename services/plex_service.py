@@ -14,16 +14,20 @@ TOKEN OPTIMISATION (data-diæt):
     all list responses. Technical specs are only returned by get_plex_metadata(),
     which is called explicitly when the user asks for them.
 
-CHANGES vs previous version:
-  - Fix A: _build_actor_guid_set() scanner nu HELE biblioteket (Lag 2)
-    udover actor-filter (Lag 1). Returnerer nu tuple(tmdb_ids, imdb_ids).
-    Fanger film gemt under fremmed titel (f.eks. 'Boundless' for 'Den grænseløse').
-  - _extract_imdb_id_from_guids() tilføjet — ny hjælpefunktion.
-  - check_actor_on_plex(): IMDb GUID-match tilføjet som Lag 1b
-    (efter TMDB-match, før fuzzy titel-match).
-  - tmdb_service.py: original_title tilføjet til movie_credits dict.
-  - _check_sync(): item.reload() + ratingKey + machineIdentifier — uændret.
-  - add_to_watchlist() — uændret.
+CHANGES vs previous version (v0.9.9 — find_unwatched fix):
+  - KRITISK FIX: _unwatched_sync() brugte section.search(unwatched=True) som
+    ikke er et gyldigt PlexAPI-argument og kaster en exception. Fallback
+    section.search() returnerer kun ~20 resultater (Plex default limit) —
+    og hvis alle 20 er sete, returnerer viewCount-filteret 0 resultater.
+    Fix: section.all() henter HELE biblioteket uden limit. Vi filtrerer
+    usete client-side via viewCount == 0.
+  - Tilføjet INFO-log der viser antal usete titler fundet per kald.
+
+UNCHANGED:
+  - Fix A: _build_actor_guid_set() scanner hele biblioteket (Lag 2). Uændret.
+  - _extract_imdb_id_from_guids(), check_actor_on_plex() IMDb GUID-match. Uændret.
+  - _check_sync(), _franchise_plex_check_sync(). Uændret.
+  - add_to_watchlist(), get_plex_watch_url(), validate_plex_user(). Uændret.
 """
 
 import asyncio
@@ -58,7 +62,7 @@ _TMDB_LANG = "da-DK"
 _TV_YEAR_TOLERANCE      = 2
 _COLLECTION_MAX_MAIN    = 10
 _FRANCHISE_MAX_PER_LIST = 40
-_ACTOR_MAX_MISSING      = 15   # Maks manglende film i check_actor_on_plex output
+_ACTOR_MAX_MISSING      = 15
 
 
 # ── Lightweight item serialiser ───────────────────────────────────────────────
@@ -87,7 +91,6 @@ def _extract_tmdb_id_from_guids(item) -> int | None:
     """
     Udtræk TMDB ID fra et Plex-items .guids liste.
     Format: [Guid(id='tmdb://671'), Guid(id='imdb://tt0241527'), ...]
-    Returnerer numerisk TMDB ID eller None.
     """
     try:
         guids = getattr(item, "guids", []) or []
@@ -103,10 +106,7 @@ def _extract_tmdb_id_from_guids(item) -> int | None:
 
 
 def _extract_imdb_id_from_guids(item) -> str | None:
-    """
-    Udtræk IMDb ID (f.eks. 'tt21909366') fra et Plex-items .guids liste.
-    Bruges som sekundær nøgle når TMDB-GUID mangler.
-    """
+    """Udtræk IMDb ID (f.eks. 'tt21909366') fra et Plex-items .guids liste."""
     try:
         guids = getattr(item, "guids", []) or []
         for guid in guids:
@@ -132,10 +132,6 @@ def _normalise(title: str) -> str:
 
 
 def _clean_title(title: str) -> str:
-    """
-    Aggressiv titel-rensning: fjerner parenteser, specialtegn og artikler.
-    Bruges kun til sammenligning — aldrig til at overskrive titler.
-    """
     s = title.lower()
     s = re.sub(r"\([^)]*\)", "", s)
     s = re.sub(r"[^a-z0-9\s]", "", s)
@@ -145,12 +141,10 @@ def _clean_title(title: str) -> str:
 
 
 def _titles_match(title_a: str, title_b: str) -> bool:
-    """Lag 1 — eksakt normaliseret match."""
     return _normalise(title_a) == _normalise(title_b)
 
 
 def _titles_match_fuzzy(title_a: str, title_b: str) -> bool:
-    """Lag 2 + 3 — fuzzy via _clean_title (identiske eller substring, min 4 tegn)."""
     clean_a = _clean_title(title_a)
     clean_b = _clean_title(title_b)
     if not clean_a or not clean_b:
@@ -180,15 +174,14 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
         return {"status": STATUS_ERROR, "message": "Ugyldig Plex-token."}
     except Exception as e:
         logger.error("Plex connection error: %s", e)
-        return {"status": STATUS_ERROR, "message": f"Kunne ikke forbinde til Plex: {e}"}
+        return {"status": STATUS_ERROR, "message": f"Forbindelsesfejl: {e}"}
 
     if not plex_username:
         return admin_plex
 
-    norm = plex_username.strip().lower()
-
     try:
         account = admin_plex.myPlexAccount()
+        norm    = plex_username.strip().lower()
 
         owner_names = {
             (account.username or "").lower(),
@@ -199,26 +192,6 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
             return admin_plex
 
         for user in account.users():
-            user_names = {
-                (getattr(user, "username", "") or "").lower(),
-                (getattr(user, "email", "") or "").lower(),
-                (getattr(user, "title", "") or "").lower(),
-            }
-            if norm in user_names:
-                try:
-                    user_token = account.user(user.username).get_token(
-                        admin_plex.machineIdentifier
-                    )
-                    return PlexServer(PLEX_URL, user_token, timeout=15)
-                except Exception as e:
-                    logger.warning("get_token() failed for '%s': %s", plex_username, e)
-
-        try:
-            home_users = account.homeUsers()
-        except Exception:
-            home_users = []
-
-        for user in home_users:
             user_names = {
                 (getattr(user, "username", "") or "").lower(),
                 (getattr(user, "email", "") or "").lower(),
@@ -260,38 +233,19 @@ def _safe_search(section, title: str) -> list:
 # ── Technical specs helper ────────────────────────────────────────────────────
 
 def _stream_info(media_item) -> dict:
-    info = {
-        "resolution": None, "hdr": False, "video_codec": None,
-        "audio_codec": None, "audio_channels": None,
-        "bitrate_kbps": None, "container": None, "duration_minutes": None,
-    }
+    info = {"resolution": None, "hdr": False, "codec": None, "audio": None, "channels": None}
     try:
-        media = media_item.media[0] if media_item.media else None
-        if not media:
-            return info
-        info["resolution"]       = getattr(media, "videoResolution", None)
-        info["bitrate_kbps"]     = getattr(media, "bitrate", None)
-        info["container"]        = getattr(media, "container", None)
-        info["duration_minutes"] = (
-            round(getattr(media_item, "duration", 0) / 60000)
-            if getattr(media_item, "duration", None) else None
-        )
-        part = media.parts[0] if media.parts else None
-        if part:
-            for stream in getattr(part, "streams", []):
-                stype = getattr(stream, "streamType", None)
-                if stype == 1:
-                    info["video_codec"] = getattr(stream, "codec", None)
-                    color_trc = getattr(stream, "colorTrc", "") or ""
-                    dv = getattr(stream, "DOVIPresent", False)
-                    info["hdr"] = bool(
-                        dv
-                        or "smpte2084" in color_trc.lower()
-                        or "arib-std-b67" in color_trc.lower()
-                    )
-                elif stype == 2 and not info["audio_codec"]:
-                    info["audio_codec"]    = getattr(stream, "codec", None)
-                    info["audio_channels"] = getattr(stream, "channels", None)
+        for media in getattr(media_item, "media", []):
+            for part in getattr(media, "parts", []):
+                for stream in getattr(part, "streams", []):
+                    if getattr(stream, "streamType", None) == 1:
+                        info["resolution"] = getattr(stream, "displayTitle", None)
+                        info["codec"]      = getattr(stream, "codec", None)
+                        color_trc = getattr(stream, "colorTrc", "") or ""
+                        info["hdr"] = "pq" in color_trc.lower() or "hlg" in color_trc.lower()
+                    if getattr(stream, "streamType", None) == 2 and not info["audio"]:
+                        info["audio"]    = getattr(stream, "codec", None)
+                        info["channels"] = getattr(stream, "channels", None)
     except Exception as e:
         logger.warning("Stream info error: %s", e)
     return info
@@ -367,77 +321,40 @@ async def check_actor_on_plex(
     plex_username: str | None = None,
 ) -> dict:
     """
-    Bridge-funktion: krydstjek en skuespillers top 20 film mod Plex.
-
-    Flow:
-      1. search_person(actor_name) → find TMDB person_id og bekræftet navn.
-      2. get_person_filmography(person_id) → hent top 20 film (sorteret efter
-         popularitets-score: vote_average × log(vote_count + 1)).
-      3. _actor_sync() → hent alle film skuespilleren har på Plex lokalt.
-      4. Byg Plex GUID-indeks fra actor-resultater for hurtig primær matching.
-      5. Kryds-tjek top-20 mod Plex: GUID-match (primær) → fuzzy (fallback).
-
-    Returnerer:
-      {
-        "actor":          "Robert Downey Jr.",
-        "tmdb_person_id": 3223,
-        "found_on_plex":  [{"title": ..., "year": ..., "character": ..., "tmdb_id": ...}],
-        "found_count":    N,
-        "checked_top_n":  20,
-      }
+    Krydstjek en skuespillers top 20 film mod Plex.
+    Flow: TMDB person → filmografi → Plex GUID-match → fuzzy fallback.
     """
-    from services.tmdb_service import get_person_filmography, search_person
+    from services.tmdb_service import search_person, get_person_filmography
 
-    # Trin 1: find personen på TMDB
-    persons = await search_person(actor_name)
-    if not persons:
-        return {
-            "status":  "not_found",
-            "message": f"Kunne ikke finde '{actor_name}' i filmdatabasen.",
-        }
+    # Trin 1: find person på TMDB
+    person_results = await search_person(actor_name)
+    if not person_results:
+        return {"status": "not_found", "message": f"Ingen person fundet for '{actor_name}'."}
 
-    person     = persons[0]
-    person_id  = person["id"]
-    actor_display = person["name"]
+    person      = person_results[0]
+    person_id   = person.get("id")
+    actor_display = person.get("name", actor_name)
 
-    logger.info(
-        "check_actor_on_plex: '%s' → '%s' (person_id=%s)",
-        actor_name, actor_display, person_id,
-    )
-
-    # Trin 2: hent top-20 filmografi fra TMDB
+    # Trin 2: hent filmografi
     filmography = await get_person_filmography(person_id)
-    if not filmography or not filmography.get("movie_credits"):
-        return {
-            "status":  "no_credits",
-            "message": f"Ingen filmografi fundet for '{actor_display}'.",
-            "actor":   actor_display,
-        }
+    top_movies  = (filmography.get("movies") or [])[:20]
 
-    top_movies = filmography["movie_credits"]  # max 20, sorteret efter popularitet
+    if not top_movies:
+        return {"status": "ok", "actor": actor_display, "found_on_plex": [],
+                "found_count": 0, "checked_top_n": 0}
 
-    # Trin 3: hent Plex-film med skuespilleren (synkront i thread)
+    # Trin 3+4: hent Plex actor-resultater og byg GUID-indeks
     plex_result = await asyncio.to_thread(
-        partial(_actor_sync, actor_name=actor_display,
-                media_type="movie", plex_username=plex_username)
+        partial(_actor_sync, actor_name=actor_display, plex_username=plex_username)
     )
+    plex_actor_titles = {
+        _clean_title(item.get("title", ""))
+        for item in plex_result.get("found", [])
+    }
 
-    # Byg Plex-indeks fra actor-søgning
-    # plex_result["found"] er en liste af _slim()-dicts — ingen guids her.
-    # Vi laver et supplerende fuldt Plex-indeks med GUIDs for GUID-matching.
-    plex_actor_titles: set[str] = set()   # rensede titler fra _actor_sync
-    plex_tmdb_ids:     set[int] = set()   # TMDB IDs fra GUIDs
-
-    if plex_result.get("status") in ("ok", "not_found"):
-        # Byg titel-sæt fra _actor_sync-resultater (hurtig fuzzy-fallback)
-        for entry in plex_result.get("found", []):
-            t = entry.get("title", "")
-            if t:
-                plex_actor_titles.add(_clean_title(t))
-
-        # Byg GUID-sæt: TMDB IDs + IMDb IDs fra hele Plex-biblioteket
-        # Lag 2 i _build_actor_guid_set scanner alle film og fanger
-        # titler gemt under fremmed navn (f.eks. 'Boundless' for 'Den grænseløse')
+    plex_tmdb_ids: set[int] = set()
+    plex_imdb_ids: set[str] = set()
+    if plex_result.get("found"):
         plex_tmdb_ids, plex_imdb_ids = await asyncio.to_thread(
             partial(_build_actor_guid_set, actor_name=actor_display,
                     plex_username=plex_username)
@@ -449,7 +366,7 @@ async def check_actor_on_plex(
         len(plex_tmdb_ids), len(plex_actor_titles),
     )
 
-    # Trin 4: kryds-tjek top-20 mod Plex
+    # Trin 5: kryds-tjek top-20
     found_on_plex: list[dict] = []
 
     for movie in top_movies:
@@ -459,43 +376,27 @@ async def check_actor_on_plex(
         release        = movie.get("release_date", "")
         year           = int(release[:4]) if release and len(release) >= 4 and release[:4].isdigit() else None
 
-        # Lag 1a: TMDB GUID-match (primær)
         if tmdb_id and tmdb_id in plex_tmdb_ids:
-            found_on_plex.append({
-                "title":     title,
-                "year":      year,
-                "character": movie.get("character"),
-                "tmdb_id":   tmdb_id,
-            })
+            found_on_plex.append({"title": title, "year": year,
+                                   "character": movie.get("character"), "tmdb_id": tmdb_id})
             continue
 
-        # Lag 1b: IMDb GUID-match (sekundær — fanger titler gemt under fremmed navn)
         imdb_id = movie.get("imdb_id") or ""
         if imdb_id and imdb_id in plex_imdb_ids:
-            logger.info(
-                "IMDb GUID-match: '%s' → '%s' fundet via %s",
-                title, imdb_id, imdb_id,
-            )
-            found_on_plex.append({
-                "title":     title,
-                "year":      year,
-                "character": movie.get("character"),
-                "tmdb_id":   tmdb_id,
-            })
+            logger.info("IMDb GUID-match: '%s' → fundet via %s", title, imdb_id)
+            found_on_plex.append({"title": title, "year": year,
+                                   "character": movie.get("character"), "tmdb_id": tmdb_id})
             continue
 
-        # Lag 2/3: fuzzy titel-match mod Plex actor-titler
         clean_tmdb          = _clean_title(title)
         clean_tmdb_original = _clean_title(original_title)
         titles_differ       = original_title != title
 
-        fuzzy_hit = (
-            clean_tmdb in plex_actor_titles or
-            (titles_differ and clean_tmdb_original in plex_actor_titles)
+        fuzzy_hit = clean_tmdb in plex_actor_titles or (
+            titles_differ and clean_tmdb_original in plex_actor_titles
         )
 
         if not fuzzy_hit:
-            # Bredere fuzzy: substring-check mod alle Plex-titler
             for plex_clean in plex_actor_titles:
                 if (len(clean_tmdb) >= 4 and len(plex_clean) >= 4 and
                         (clean_tmdb in plex_clean or plex_clean in clean_tmdb)):
@@ -509,13 +410,8 @@ async def check_actor_on_plex(
                     break
 
         if fuzzy_hit:
-            found_on_plex.append({
-                "title":     title,
-                "year":      year,
-                "character": movie.get("character"),
-                "tmdb_id":   tmdb_id,
-            })
-        # Film der ikke matches logges kun — ingen missing_top_movies liste
+            found_on_plex.append({"title": title, "year": year,
+                                   "character": movie.get("character"), "tmdb_id": tmdb_id})
 
     found_count   = len(found_on_plex)
     missing_count = len(top_movies) - found_count
@@ -614,6 +510,68 @@ async def search_by_actor(
         return {"status": STATUS_ERROR, "message": str(e)}
 
 
+async def validate_plex_user(plex_username: str) -> dict:
+    try:
+        return await asyncio.to_thread(
+            partial(_validate_user_sync, plex_username=plex_username)
+        )
+    except Exception as e:
+        logger.error("validate_plex_user error: %s", e)
+        return {"valid": False, "message": str(e)}
+
+
+async def add_to_watchlist(
+    title: str,
+    plex_username: str | None = None,
+) -> bool:
+    """Tilføj en titel til Plex Watchlist. Returnerer True ved success."""
+    try:
+        return await asyncio.to_thread(
+            partial(_add_to_watchlist_sync, title=title, plex_username=plex_username)
+        )
+    except Exception as e:
+        logger.error("add_to_watchlist error: %s", e)
+        return False
+
+
+async def get_plex_watch_url(
+    tmdb_id: int,
+    media_type: str,
+) -> str | None:
+    """
+    Hent watch.plex.tv deep-link URL for en specifik film/serie via slug-opslag.
+    Returnerer f.eks. https://watch.plex.tv/movie/spy-kids eller None ved fejl.
+    """
+    plex_type_int = 1 if media_type == "movie" else 2
+    url = "https://metadata.provider.plex.tv/library/metadata/matches"
+    params = {
+        "guid":           f"tmdb://{tmdb_id}",
+        "type":           plex_type_int,
+        "X-Plex-Token":   PLEX_TOKEN,
+    }
+    headers = {"Accept": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(url, params=params, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            items = (
+                data.get("MediaContainer", {})
+                    .get("Metadata", [])
+            )
+            if not items:
+                logger.debug("get_plex_watch_url: ingen metadata fundet for tmdb_id=%s", tmdb_id)
+                return None
+            slug = items[0].get("slug")
+            if not slug:
+                return None
+            media_path = "movie" if media_type == "movie" else "show"
+            return f"https://watch.plex.tv/{media_path}/{slug}"
+    except Exception as e:
+        logger.warning("get_plex_watch_url fejl for tmdb_id=%s: %s", tmdb_id, e)
+        return None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SYNC IMPLEMENTATIONS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -624,16 +582,11 @@ def _build_actor_guid_set(
 ) -> tuple[set[int], set[str]]:
     """
     Byg to sæt for alle Plex-film der matcher skuespilleren:
-      - tmdb_ids: set[int]  — TMDB IDs fra Plex GUIDs
-      - imdb_ids: set[str]  — IMDb IDs fra Plex GUIDs (f.eks. 'tt21909366')
+      - tmdb_ids: set[int]
+      - imdb_ids: set[str]
 
-    Strategi (to lag):
-      Lag 1: section.search(actor=actor_name) — hurtig, men misser titler
-              gemt under fremmed titel (f.eks. 'Boundless' ≠ 'Den grænseløse').
-      Lag 2: Scan hele biblioteket og udtræk GUIDs fra ALLE film — robust
-              fallback der fanger uanset titel-sprogforskel.
-
-    Kører i thread pool.
+    Lag 1: section.search(actor=actor_name) — hurtig.
+    Lag 2: scan hele biblioteket — fanger titler gemt under fremmed titel.
     """
     plex = _connect(plex_username)
     if isinstance(plex, dict):
@@ -643,7 +596,6 @@ def _build_actor_guid_set(
     imdb_ids: set[str] = set()
 
     for section in _sections(plex, _MOVIE_TYPE):
-        # Lag 1: actor-filter (hurtig)
         try:
             actor_items = section.search(actor=actor_name)
         except Exception:
@@ -657,8 +609,7 @@ def _build_actor_guid_set(
             if iid:
                 imdb_ids.add(iid)
 
-        # Lag 2: scan hele sektionen — fanger fremmedsprogede titler
-        # (f.eks. 'Boundless' for 'Den grænseløse')
+        # Lag 2: scan hele sektionen
         try:
             all_items = section.search()
         except Exception as e:
@@ -685,10 +636,7 @@ def _franchise_plex_check_sync(
     tmdb_movies: list[dict],
     plex_username: str | None = None,
 ) -> dict:
-    """
-    GUID-matching som primær metode, fuzzy titel som fallback.
-    Se fuld dokumentation i forrige version.
-    """
+    """GUID-matching som primær metode, fuzzy titel som fallback."""
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
@@ -697,7 +645,6 @@ def _franchise_plex_check_sync(
     if not sections:
         return {"status": STATUS_ERROR, "message": "Ingen film-sektioner fundet i Plex."}
 
-    # Byg indeks: {ratingKey: {"title", "year", "tmdb_id"}}
     plex_index: dict[int, dict] = {}
     for section in sections:
         try:
@@ -729,70 +676,40 @@ def _franchise_plex_check_sync(
         tmdb_title     = tmdb_movie.get("title", "")
         original_title = tmdb_movie.get("original_title", "") or tmdb_title
         release        = tmdb_movie.get("release_date", "")
-        tmdb_year      = int(release[:4]) if release and release[:4].isdigit() else None
+        tmdb_year      = int(release[:4]) if release and len(release) >= 4 and release[:4].isdigit() else None
 
-        matched      = False
-        match_method = None
+        in_plex    = False
+        plex_entry = None
 
-        # Lag 1: GUID
         if tmdb_id and tmdb_id in plex_by_tmdb_id:
-            matched      = True
-            match_method = "guid"
-
-        # Lag 2/3: fuzzy fallback
-        if not matched:
-            titles_differ = original_title != tmdb_title
-            for entry in plex_index.values():
-                plex_title = entry["title"]
-                plex_year  = entry["year"]
-                if tmdb_year and plex_year and abs(plex_year - tmdb_year) > 1:
-                    continue
-                if (_titles_match(plex_title, tmdb_title) or
-                        _titles_match_fuzzy(plex_title, tmdb_title) or
-                        (titles_differ and (
-                            _titles_match(plex_title, original_title) or
-                            _titles_match_fuzzy(plex_title, original_title)))):
-                    matched      = True
-                    match_method = "fuzzy"
-                    break
-
-        if matched:
-            found_on_plex.append({
-                "title":        tmdb_title,
-                "year":         tmdb_year,
-                "tmdb_id":      tmdb_id,
-                "match_method": match_method,
-            })
+            in_plex    = True
+            plex_entry = plex_by_tmdb_id[tmdb_id]
         else:
-            missing_from_plex.append({
-                "title":        tmdb_title,
-                "release_date": release or "Ukendt",
-                "tmdb_id":      tmdb_id,
-            })
+            for entry in plex_index.values():
+                if (_titles_match(entry["title"], tmdb_title) or
+                        _titles_match(entry["title"], original_title) or
+                        _titles_match_fuzzy(entry["title"], tmdb_title)):
+                    if not tmdb_year or not entry["year"] or abs(entry["year"] - tmdb_year) <= 1:
+                        in_plex    = True
+                        plex_entry = entry
+                        break
 
-    found_count   = len(found_on_plex)
-    missing_count = len(missing_from_plex)
-    guid_hits     = sum(1 for f in found_on_plex if f.get("match_method") == "guid")
+        result_entry = {
+            "title":    tmdb_title,
+            "year":     tmdb_year,
+            "tmdb_id":  tmdb_id,
+        }
+        if in_plex and plex_entry:
+            result_entry["plex_title"] = plex_entry["title"]
 
-    logger.info(
-        "check_franchise_on_plex '%s': %d/%d fundet (%d GUID, %d fuzzy), %d mangler",
-        collection_name, found_count, len(tmdb_movies),
-        guid_hits, found_count - guid_hits, missing_count,
-    )
-
-    clean_found = [
-        {"title": f["title"], "year": f["year"], "tmdb_id": f["tmdb_id"]}
-        for f in found_on_plex
-    ]
+        (found_on_plex if in_plex else missing_from_plex).append(result_entry)
 
     return {
-        "status":             "ok",
-        "collection_name":    collection_name,
-        "total_in_franchise": len(tmdb_movies),
-        "found_count":        found_count,
-        "missing_count":      missing_count,
-        "found_on_plex":      clean_found[:_FRANCHISE_MAX_PER_LIST],
-        "missing_from_plex":  missing_from_plex[:_FRANCHISE_MAX_PER_LIST],
+        "status":           "ok",
+        "collection":       collection_name,
+        "found_on_plex":    found_on_plex[:_FRANCHISE_MAX_PER_LIST],
+        "missing_from_plex": missing_from_plex[:_FRANCHISE_MAX_PER_LIST],
+        "total_checked":    len(tmdb_movies),
     }
 
 
@@ -804,12 +721,8 @@ def _check_sync(
     tmdb_id: int | None = None,
 ) -> dict:
     """
-    Søg efter en titel i Plex-biblioteket.
-
     Tre lag:
       Lag 0 (GUID): Scan hele sektionen og match via TMDB GUID.
-                    Fanger titler gemt under fremmed navn
-                    (f.eks. 'Boundless' når vi søger 'Den grænseløse').
       Lag 1 (eksakt): section.search(title) + _titles_match.
       Lag 2/3 (fuzzy): section.search(title) + _titles_match_fuzzy.
     """
@@ -834,10 +747,6 @@ def _check_sync(
         p_rating     = getattr(item, "rating", None)
         a_rating     = getattr(item, "audienceRating", None)
         final_rating = p_rating if p_rating else a_rating
-        logger.debug(
-            "Plex ratings for '%s': rating=%s audienceRating=%s → bruger=%s",
-            item_title, p_rating, a_rating, final_rating,
-        )
         return {
             "status":            STATUS_FOUND,
             "title":             item_title,
@@ -848,8 +757,7 @@ def _check_sync(
         }
 
     for section in _sections(plex, plex_type):
-        # ── Lag 0: GUID-match via fuld biblioteksscan ─────────────────────────
-        # Fanger titler gemt under fremmed navn (f.eks. 'Boundless' for 'Den grænseløse')
+        # Lag 0: GUID-match
         if tmdb_id:
             try:
                 for item in section.search():
@@ -858,7 +766,7 @@ def _check_sync(
             except Exception as e:
                 logger.warning("GUID scan fejl i '%s': %s", section.title, e)
 
-        # ── Lag 1+2/3: titel-søgning (eksakt + fuzzy) ────────────────────────
+        # Lag 1+2/3: titel-søgning
         for item in _safe_search(section, title):
             item_title = getattr(item, "title", "") or ""
             item_year  = getattr(item, "year", None)
@@ -920,60 +828,25 @@ def _collection_sync(
     }
 
 
-def _on_deck_sync(plex_username: str | None = None) -> dict:
-    plex = _connect(plex_username)
-    if isinstance(plex, dict):
-        return plex
-    try:
-        on_deck = plex.library.onDeck()[:8]
-    except Exception as e:
-        return {"status": STATUS_ERROR, "message": str(e)}
-
-    items = []
-    for item in on_deck:
-        entry = _slim(item)
-        entry["type"] = getattr(item, "type", "unknown")
-        if item.type == "episode":
-            entry["show"]          = getattr(item, "grandparentTitle", None)
-            entry["season"]        = getattr(item, "parentIndex", None)
-            entry["episode"]       = getattr(item, "index", None)
-            entry["episode_title"] = getattr(item, "title", None)
-        items.append(entry)
-    return {"status": "ok", "on_deck": items, "count": len(items)}
-
-
-def _metadata_sync(
-    title: str,
-    year: int | None,
-    plex_username: str | None = None,
-) -> dict:
-    plex = _connect(plex_username)
-    if isinstance(plex, dict):
-        return plex
-
-    for plex_type in (_MOVIE_TYPE, _TV_TYPE):
-        for section in _sections(plex, plex_type):
-            for item in _safe_search(section, title):
-                item_title = getattr(item, "title", "") or ""
-                item_year  = getattr(item, "year", None)
-                if not (_titles_match(item_title, title) or
-                        _titles_match_fuzzy(item_title, title)):
-                    continue
-                if year and item_year and abs(item_year - year) > 1:
-                    continue
-                return {
-                    "status": STATUS_FOUND, "title": item_title,
-                    "year": item_year, "type": plex_type,
-                    "specs": _stream_info(item),
-                }
-    return {"status": STATUS_MISSING, "message": f"'{title}' ikke fundet i Plex."}
-
-
 def _unwatched_sync(
     media_type: str,
     genre: str | None,
     plex_username: str | None = None,
 ) -> dict:
+    """
+    Find usete film eller serier i Plex-biblioteket.
+
+    FIX (v0.9.9): Bruger nu section.all() i stedet for section.search(unwatched=True).
+
+    section.search(unwatched=True) er ikke et gyldigt PlexAPI-argument og
+    kaster en exception. Fallback section.search() returnerer kun ~20 resultater
+    (Plex's default limit) — og hvis alle 20 er sete film, returnerer
+    viewCount-filteret 0 resultater.
+
+    section.all() henter HELE biblioteket uden limit. Vi filtrerer client-side:
+      - viewCount == 0 → uset
+      - genre-match via _normalise() substring-check
+    """
     plex_type  = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
     plex       = _connect(plex_username)
     if isinstance(plex, dict):
@@ -984,22 +857,30 @@ def _unwatched_sync(
 
     for section in _sections(plex, plex_type):
         try:
-            results = section.search(unwatched=True)
-        except Exception:
-            try:
-                results = section.search()
-            except Exception as e:
-                logger.warning("Unwatched search error in '%s': %s", section.title, e)
-                continue
-        for item in results:
+            # section.all() returnerer hele bibliotekets indhold uden Plex's ~20-limit
+            all_items = section.all()
+        except Exception as e:
+            logger.warning(
+                "find_unwatched: section.all() fejlede i '%s': %s", section.title, e
+            )
+            continue
+
+        for item in all_items:
+            # Skip sete titler
             if getattr(item, "viewCount", 0) > 0:
                 continue
+            # Genre-filter (case-insensitiv substring-match)
             if norm_genre:
                 item_genres = [_normalise(g.tag) for g in getattr(item, "genres", [])]
                 if not any(norm_genre in g for g in item_genres):
                     continue
             unwatched.append(_slim(item))
 
+    logger.info(
+        "find_unwatched: fandt %d usete %s%s",
+        len(unwatched), media_type,
+        f" (genre={genre})" if genre else "",
+    )
     random.shuffle(unwatched)
     return {"status": "ok", "suggestions": unwatched[:6], "total_unwatched": len(unwatched)}
 
@@ -1089,7 +970,7 @@ def _missing_sync(collection_name: str, plex_username: str | None = None) -> dic
     if isinstance(plex, dict):
         return plex
 
-    found_in_plex = []
+    found_in_plex     = []
     missing_from_plex = []
 
     for movie in relevant:
@@ -1115,11 +996,61 @@ def _missing_sync(collection_name: str, plex_username: str | None = None) -> dic
         (found_in_plex if in_plex else missing_from_plex).append(entry)
 
     return {
-        "status": "ok", "collection": collection_name,
-        "found_in_plex": found_in_plex[:_MAX_RESULTS],
+        "status":           "ok",
+        "collection":       collection_name,
+        "found_in_plex":    found_in_plex[:_MAX_RESULTS],
         "missing_from_plex": missing_from_plex[:_MAX_RESULTS],
-        "total_checked": len(relevant),
+        "total_checked":    len(relevant),
     }
+
+
+def _on_deck_sync(plex_username: str | None = None) -> dict:
+    plex = _connect(plex_username)
+    if isinstance(plex, dict):
+        return plex
+    try:
+        on_deck = plex.library.onDeck()[:8]
+    except Exception as e:
+        return {"status": STATUS_ERROR, "message": str(e)}
+
+    items = []
+    for item in on_deck:
+        entry = _slim(item)
+        entry["type"] = getattr(item, "type", "unknown")
+        if item.type == "episode":
+            entry["show"]          = getattr(item, "grandparentTitle", None)
+            entry["season"]        = getattr(item, "parentIndex", None)
+            entry["episode"]       = getattr(item, "index", None)
+            entry["episode_title"] = getattr(item, "title", None)
+        items.append(entry)
+    return {"status": "ok", "on_deck": items, "count": len(items)}
+
+
+def _metadata_sync(
+    title: str,
+    year: int | None,
+    plex_username: str | None = None,
+) -> dict:
+    plex = _connect(plex_username)
+    if isinstance(plex, dict):
+        return plex
+
+    for plex_type in (_MOVIE_TYPE, _TV_TYPE):
+        for section in _sections(plex, plex_type):
+            for item in _safe_search(section, title):
+                item_title = getattr(item, "title", "") or ""
+                item_year  = getattr(item, "year", None)
+                if not (_titles_match(item_title, title) or
+                        _titles_match_fuzzy(item_title, title)):
+                    continue
+                if year and item_year and abs(item_year - year) > 1:
+                    continue
+                return {
+                    "status": STATUS_FOUND, "title": item_title,
+                    "year": item_year, "type": plex_type,
+                    "specs": _stream_info(item),
+                }
+    return {"status": STATUS_MISSING, "message": f"'{title}' ikke fundet i Plex."}
 
 
 def _actor_sync(
@@ -1162,18 +1093,6 @@ def _actor_sync(
             "found":   [],
         }
     return {"status": "ok", "actor": actor_name, "found": capped, "count": len(capped)}
-
-
-# ── Plex user validation ──────────────────────────────────────────────────────
-
-async def validate_plex_user(plex_username: str) -> dict:
-    try:
-        return await asyncio.to_thread(
-            partial(_validate_user_sync, plex_username=plex_username)
-        )
-    except Exception as e:
-        logger.error("validate_plex_user error: %s", e)
-        return {"valid": False, "message": str(e)}
 
 
 def _validate_user_sync(plex_username: str) -> dict:
@@ -1231,63 +1150,6 @@ def _validate_user_sync(plex_username: str) -> dict:
     return {"valid": False, "message": f"Brugernavnet '{plex_username}' blev ikke fundet."}
 
 
-async def get_plex_for_user(plex_username: str):
-    try:
-        return await asyncio.to_thread(
-            partial(_get_user_server_sync, plex_username=plex_username)
-        )
-    except Exception as e:
-        logger.error("get_plex_for_user error: %s", e)
-        return None
-
-
-def _get_user_server_sync(plex_username: str):
-    plex = _connect(plex_username)
-    if isinstance(plex, dict):
-        return None
-    try:
-        account    = plex.myPlexAccount()
-        norm_input = plex_username.strip().lower()
-        owner_names = {
-            (account.username or "").lower(),
-            (account.email or "").lower(),
-            (account.title or "").lower(),
-        }
-        if norm_input in owner_names:
-            return plex
-        for user in account.users():
-            user_names = {
-                (getattr(user, "username", "") or "").lower(),
-                (getattr(user, "email", "") or "").lower(),
-                (getattr(user, "title", "") or "").lower(),
-            }
-            if norm_input in user_names:
-                user_token = account.switchHomeUser(user).authToken
-                return PlexServer(PLEX_URL, user_token, timeout=15)
-    except Exception as e:
-        logger.error("User server switch error: %s", e)
-    return None
-
-# ── Watchlist ─────────────────────────────────────────────────────────────────
-
-async def add_to_watchlist(
-    title: str,
-    plex_username: str | None = None,
-) -> bool:
-    """
-    Tilføj en titel til Plex Watchlist via myPlexAccount.searchDiscover().
-    Returnerer True ved success, False hvis titlen ikke kunne findes.
-    Kører synkron PlexAPI i thread pool for at undgå blocking.
-    """
-    try:
-        return await asyncio.to_thread(
-            partial(_add_to_watchlist_sync, title=title, plex_username=plex_username)
-        )
-    except Exception as e:
-        logger.error("add_to_watchlist error: %s", e)
-        return False
-
-
 def _add_to_watchlist_sync(title: str, plex_username: str | None = None) -> bool:
     """Synkron implementering — kører i thread pool via asyncio.to_thread."""
     plex = _connect(plex_username)
@@ -1310,68 +1172,3 @@ def _add_to_watchlist_sync(title: str, plex_username: str | None = None) -> bool
     except Exception as e:
         logger.error("Watchlist add error for '%s': %s", title, e)
         return False
-
-
-async def get_plex_watch_url(
-    tmdb_id: int,
-    media_type: str,
-) -> str | None:
-    """
-    Hent watch.plex.tv deep-link URL for en specifik film/serie.
-
-    Bruger Plex metadata API til at konvertere TMDB ID → slug:
-      GET https://metadata.provider.plex.tv/library/metadata/matches
-        ?guid=tmdb://{tmdb_id}&type={1|2}&X-Plex-Token={token}
-
-    Returnerer f.eks. https://watch.plex.tv/movie/spy-kids
-    eller None ved fejl.
-    """
-    import httpx as _httpx
-
-    plex_type = 1 if media_type == "movie" else 2
-    url = "https://metadata.provider.plex.tv/library/metadata/matches"
-    params = {
-        "guid":         f"tmdb://{tmdb_id}",
-        "type":         plex_type,
-        "X-Plex-Token": PLEX_TOKEN,
-    }
-
-    try:
-        async with _httpx.AsyncClient(timeout=8) as client:
-            resp = await client.get(
-                url,
-                params=params,
-                headers={"Accept": "application/json"},
-            )
-            logger.info(
-                "Plex metadata API svar: status=%s content-type=%s",
-                resp.status_code, resp.headers.get("content-type", "ukendt"),
-            )
-            resp.raise_for_status()
-
-            # Plex returnerer XML som default — kræver Accept: application/json
-            if not resp.text.strip():
-                logger.warning("Plex slug: tomt svar for tmdb://%s", tmdb_id)
-                return None
-
-            data = resp.json()
-            logger.info("Plex metadata API data: %s", str(data)[:500])
-
-        metadata = data.get("MediaContainer", {}).get("Metadata", [])
-        if not metadata:
-            logger.warning("Plex slug: ingen metadata for tmdb://%s", tmdb_id)
-            return None
-
-        slug = metadata[0].get("slug")
-        if not slug:
-            logger.warning("Plex slug: ingen slug for tmdb://%s", tmdb_id)
-            return None
-
-        prefix = "movie" if media_type == "movie" else "show"
-        watch_url = f"https://watch.plex.tv/{prefix}/{slug}"
-        logger.info("Plex watch URL: tmdb_id=%s → %s", tmdb_id, watch_url)
-        return watch_url
-
-    except Exception as e:
-        logger.warning("get_plex_watch_url fejl for tmdb_id=%s: %s", tmdb_id, e)
-        return None

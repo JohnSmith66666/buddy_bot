@@ -1,18 +1,16 @@
 """
 services/sonarr_service.py - Direkte Sonarr API integration.
 
-CHANGES vs previous version:
-  - Tag-strategi ændret: bruger nu telegram_id-baserede tags (tg_<id>)
-    i stedet for plex_username. Dette gør det muligt for webhook_service
-    at udtrække telegram_id direkte fra tag-labelnavnet uden DB-opslag.
-  - add_series() tager nu telegram_id (int) i stedet for plex_username.
-  - get_all_tags() tilføjet — bruges af webhook_service til at resolve
-    integer tag-IDs fra Sonarr-payloadet til label-navne.
-  - Fallback til Sonarr titelsøgning hvis tvdb_id mangler — uændret.
+CHANGES vs previous version (v0.9.9 — tag-format fix):
+  - KRITISK FIX: Tag-label format ændret fra "tg_<id>" til "tg-<id>".
+    Samme fix som radarr_service.py — bindestreg bruges fordi Sonarr
+    (ligesom Radarr) kan afvise labels med underscore i visse versioner.
+    webhook_service.py parser nu "tg-" i stedet for "tg_".
 
-Sorteringslogik (rodmapper):
-  - original_language == 'da' → /mnt/unionfs/Media/TV/TV   (dansk indhold)
-  - alt andet                 → /mnt/unionfs/Media/TV/Serier
+UNCHANGED:
+  - check_sonarr_library(), lookup_series(), _lookup_series_by_title() — uændrede.
+  - add_series(): rodmappe-logik, TVDB ID fallback, seasons-håndtering — uændret.
+  - get_all_tags() — uændret.
 """
 
 import logging
@@ -28,6 +26,9 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Tag-præfiks — bindestreg bruges fordi Sonarr/Radarr kan afvise underscore i labels
+_TAG_PREFIX = "tg-"
 
 
 def _base() -> str:
@@ -46,18 +47,40 @@ async def _get_or_create_tag(label: str) -> int | None:
         try:
             resp = await client.get(f"{_base()}/api/v3/tag", headers=_headers())
             resp.raise_for_status()
+            label_lower = label.lower().strip()
             for tag in resp.json():
-                if tag.get("label", "").lower() == label.lower():
+                if tag.get("label", "").lower().strip() == label_lower:
                     return tag["id"]
+
             resp = await client.post(
                 f"{_base()}/api/v3/tag",
                 headers=_headers(),
                 json={"label": label},
             )
+
+            if resp.status_code == 400:
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = resp.text
+                logger.warning(
+                    "Sonarr: POST /tag 400 for '%s' — response: %s — forsøger GET igen",
+                    label, body,
+                )
+                resp2 = await client.get(f"{_base()}/api/v3/tag", headers=_headers())
+                resp2.raise_for_status()
+                for tag in resp2.json():
+                    if tag.get("label", "").lower().strip() == label_lower:
+                        logger.info("Sonarr: fandt tag '%s' efter 400-fallback id=%s", label, tag["id"])
+                        return tag["id"]
+                logger.warning("Sonarr: kunne ikke oprette tag '%s' — bruges uden tag", label)
+                return None
+
             resp.raise_for_status()
             tag_id = resp.json().get("id")
             logger.info("Sonarr: created tag '%s' with id=%s", label, tag_id)
             return tag_id
+
         except httpx.HTTPError as e:
             logger.error("Sonarr tag error: %s", e)
             return None
@@ -172,8 +195,9 @@ async def add_series(
     """
     Add a series to Sonarr.
 
-    Tag-strategi: opretter/henter tagget "tg_<telegram_id>" så webhook_service
-    kan udtrække telegram_id direkte fra label-navnet uden DB-opslag.
+    Tag-strategi: opretter/henter tagget "tg-<telegram_id>" (bindestreg)
+    så webhook_service kan udtrække telegram_id direkte fra label-navnet
+    uden DB-opslag. Bindestreg bruges fordi Sonarr/Radarr kan afvise underscore.
 
     Rodmappe-logik:
       - original_language == 'da' → ROOT_TV_DANSK
@@ -212,10 +236,15 @@ async def add_series(
 
     tag_ids = []
     if telegram_id:
-        tag_label = f"tg_{telegram_id}"
+        tag_label = f"{_TAG_PREFIX}{telegram_id}"   # f.eks. "tg-731397952"
         tag_id = await _get_or_create_tag(tag_label)
         if tag_id is not None:
             tag_ids = [tag_id]
+        else:
+            logger.warning(
+                "Sonarr: tag '%s' ikke oprettet — '%s' tilføjes uden notifikations-tag",
+                tag_label, title,
+            )
 
     seasons = [{"seasonNumber": s, "monitored": True} for s in season_numbers]
 
@@ -269,6 +298,12 @@ async def add_series(
                         "status":  "already_exists",
                         "message": f"'{title}' er allerede i Sonarr.",
                     }
+                logger.error("Sonarr 400: %s", body)
+                return {
+                    "success": False,
+                    "status": "error",
+                    "message": f"Sonarr 400: {body}",
+                }
 
             resp.raise_for_status()
 
