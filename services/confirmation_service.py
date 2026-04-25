@@ -150,6 +150,7 @@ async def show_confirmation(
     context: ContextTypes.DEFAULT_TYPE,
     token: str,
     plex_username: str | None,
+    loading_msg=None,
 ) -> None:
     """
     Hent fuld detaljer og vis Netflix-look infokort med plakat.
@@ -273,6 +274,13 @@ async def show_confirmation(
             pass
 
     # ── Send infokort via context.bot (Markdown — ikke MarkdownV2) ───────────
+    # Slet loading-besked lige inden infokort vises — ingen synlig ventetid
+    if loading_msg:
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
+
     try:
         if poster_url:
             await context.bot.send_photo(

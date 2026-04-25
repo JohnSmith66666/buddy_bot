@@ -317,18 +317,14 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "step":       "picked",
     })
 
-    # Slet brugerens kommando-besked og loading-beskeden for at holde chatten ren
+    # Slet KUN brugerens kommando-besked — loading-beskeden lever til infokort er sendt
     try:
         await update.message.delete()
     except Exception:
-        pass  # Telegram tillader ikke altid sletning — ignorer stille
-
-    try:
-        await loading_msg.delete()
-    except Exception:
         pass
 
-    await show_confirmation(update.message, context, token, plex_username)
+    await show_confirmation(update.message, context, token, plex_username,
+                            loading_msg=loading_msg)
 
 
 # ── Watchlist callback ────────────────────────────────────────────────────────
