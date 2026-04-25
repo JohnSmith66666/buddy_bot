@@ -1,22 +1,25 @@
 """
 services/webhook_service.py - Webhook handler for Radarr og Sonarr.
 
-CHANGES vs previous version:
-  - Tag-strategi ændret fra plex_username til telegram_id-baserede tags.
-    Radarr/Sonarr sender nu integer tag-IDs i payloadet (f.eks. [3]).
-    _resolve_telegram_ids() slår disse IDs op mod Radarr/Sonarr's tag-liste
-    og udtrækker telegram_id fra labels med præfikset "tg_" (f.eks. "tg_123456789").
-  - Broadcast-logikken er FJERNET fra _notify_users() og Sonarr-handleren.
-    Notifikationer sendes KUN til den bruger der bestilte via tg_-tagget.
-  - _notify_users() tager nu direkte en liste af telegram_ids i stedet for
-    at slå op i databasen.
-  - Sonarr-handleren bruger samme _resolve_telegram_ids() som Radarr.
-  - Debounce-logik og poster-fetch er uændret.
+CHANGES vs previous version (v0.9.8 — Sonarr tag-format fix):
+  - KRITISK FIX: _resolve_telegram_ids() håndterer nu BEGGE tag-formater:
+    * Radarr sender integer tag-IDs i payloadet: tags=[3]
+      → slås op mod tag-map: {3: "tg_123456789"} → telegram_id=123456789
+    * Sonarr sender string labels direkte i payloadet: tags=["tg_6465421173"]
+      → parses direkte uden API-opslag
+    Logs viste: tag_ids=['tg_6465421173'] → "ingen tg_-tags fundet"
+    fordi tag_map.get('tg_6465421173', '') matcher ikke integer-keys.
+    Notifikationer for Sonarr-downloads virkede aldrig — nu er det fixet.
+
+UNCHANGED:
+  - Debounce-logik (90 sekunder), _SeriesBatch, _schedule_flush — uændret.
+  - _notify_users(), _fetch_poster_url(), _escape_md() — uændret.
+  - handle_radarr_webhook(), handle_sonarr_webhook() — uændret.
+  - Broadcast-logik er stadig FJERNET — kun bestiller modtager notifikation.
 """
 
 import asyncio
 import logging
-from collections import defaultdict
 from dataclasses import dataclass, field
 
 import httpx
@@ -57,34 +60,67 @@ _batches: dict[tuple, _SeriesBatch] = {}
 
 async def _resolve_telegram_ids(tag_ids: list, source: str) -> list[int]:
     """
-    Slår integer tag-IDs op mod Radarr/Sonarr's tag-liste og returnerer
-    en liste af telegram_ids for tags med præfikset "tg_".
+    Resolver tag-IDs fra Radarr/Sonarr webhook-payloads til telegram_ids.
 
-    Eksempel: tag_ids=[3], Radarr har tag {3: "tg_123456789"}
-              → returnerer [123456789]
+    Radarr og Sonarr sender tag-data i forskellige formater:
+      - Radarr: integer tag-IDs → tags=[3, 7]
+        Disse slås op mod Radarr's tag-liste: {3: "tg_123456789"} → 123456789
+      - Sonarr: string labels direkte → tags=["tg_6465421173"]
+        Disse parses direkte uden API-opslag (label starter med "tg_")
 
-    Args:
-        tag_ids: Liste af integer tag-IDs fra webhook-payloadet.
-        source:  "radarr" eller "sonarr" — bestemmer hvilken service der spørges.
+    Funktionen håndterer begge formater i samme løkke:
+      1. Hvis elementet er en string der starter med "tg_" → parse direkte
+      2. Hvis elementet er et integer → slå op i tag-map fra API
     """
     if not tag_ids:
         return []
 
-    if source == "radarr":
-        tag_map = await radarr_get_all_tags()
-    else:
-        tag_map = await sonarr_get_all_tags()
+    # Lazy-load tag-map — kun nødvendigt hvis der er integer IDs
+    _tag_map_cache: dict[int, str] | None = None
+
+    async def _get_tag_map() -> dict[int, str]:
+        nonlocal _tag_map_cache
+        if _tag_map_cache is None:
+            if source == "radarr":
+                _tag_map_cache = await radarr_get_all_tags()
+            else:
+                _tag_map_cache = await sonarr_get_all_tags()
+        return _tag_map_cache
 
     telegram_ids = []
+
     for tid in tag_ids:
-        label = tag_map.get(tid, "")
-        if label.startswith("tg_"):
-            try:
-                telegram_id = int(label[3:])
-                telegram_ids.append(telegram_id)
-                logger.debug("Tag %s ('%s') → telegram_id=%s", tid, label, telegram_id)
-            except ValueError:
-                logger.warning("Ugyldigt tg_-tag format: '%s'", label)
+        # ── Format A: string label direkte (Sonarr) ───────────────────────────
+        # Sonarr sender labels som strings: ["tg_6465421173"]
+        if isinstance(tid, str):
+            if tid.startswith("tg_"):
+                try:
+                    telegram_id = int(tid[3:])
+                    telegram_ids.append(telegram_id)
+                    logger.debug("Tag string '%s' → telegram_id=%s", tid, telegram_id)
+                except ValueError:
+                    logger.warning("Ugyldigt tg_-tag format (string): '%s'", tid)
+            else:
+                logger.debug("String tag '%s' er ikke et tg_-tag — ignorerer", tid)
+            continue
+
+        # ── Format B: integer tag-ID (Radarr) ────────────────────────────────
+        # Radarr sender integer IDs: [3] → slå op: {3: "tg_123456789"}
+        if isinstance(tid, int):
+            tag_map = await _get_tag_map()
+            label   = tag_map.get(tid, "")
+            if label.startswith("tg_"):
+                try:
+                    telegram_id = int(label[3:])
+                    telegram_ids.append(telegram_id)
+                    logger.debug("Tag int %s ('%s') → telegram_id=%s", tid, label, telegram_id)
+                except ValueError:
+                    logger.warning("Ugyldigt tg_-tag format (int-lookup): '%s'", label)
+            else:
+                logger.debug("Tag int %s label='%s' er ikke et tg_-tag — ignorerer", tid, label)
+            continue
+
+        logger.warning("Ukendt tag-type: %r (%s)", tid, type(tid).__name__)
 
     return telegram_ids
 
