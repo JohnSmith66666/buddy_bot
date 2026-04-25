@@ -209,6 +209,7 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
             tool_input.get("year"),
             tool_input["media_type"],
             plex_username,
+            tmdb_id=tool_input.get("tmdb_id"),
         ))
     if tool_name == "check_franchise_status":
         return j(await check_franchise_on_plex(
