@@ -224,7 +224,8 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
                 logger.warning("TMDB en-US video fallback fejlede (id=%s): %s", tmdb_id, e)
 
     # ── Engelsk fallback hvis ingen dansk overview ────────────────────────────
-    overview = data.get("overview") or ""
+    overview  = data.get("overview") or ""
+    en_title  = None  # Gemmes til titel-fallback for ikke-latinske sprog
     if not overview:
         logger.debug("TMDB: ingen da-DK overview for tmdb_id=%s — prøver en-US", tmdb_id)
         async with httpx.AsyncClient(timeout=10) as client:
@@ -234,7 +235,12 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
                     params={"api_key": TMDB_API_KEY, "language": "en-US"},
                 )
                 en_resp.raise_for_status()
-                en_overview = en_resp.json().get("overview") or ""
+                en_data    = en_resp.json()
+                en_overview = en_data.get("overview") or ""
+                en_title   = (
+                    en_data.get("title") or en_data.get("name") or
+                    en_data.get("original_title") or en_data.get("original_name")
+                )
                 if en_overview:
                     logger.info("TMDB overview (en-US fallback): tmdb_id=%s — oversætter...", tmdb_id)
                     try:
@@ -261,6 +267,38 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
                 logger.warning("TMDB en-US overview fallback fejlede (id=%s): %s", tmdb_id, e)
     overview = overview or "Ingen beskrivelse."
 
+    # ── Titel-fallback: brug engelsk titel for ikke-latinske sprog ─────────────
+    # Sprog som koreansk (ko), japansk (ja), kinesisk (zh), arabisk (ar) osv.
+    _LATIN_LANGUAGES = {"en", "da", "de", "fr", "es", "it", "nl", "sv", "no", "fi", "pl", "pt", "ro", "cs", "hu"}
+    original_language = data.get("original_language") or "en"
+    da_title = (
+        data.get("title") or data.get("name") or
+        data.get("original_title") or data.get("original_name")
+    )
+    if original_language not in _LATIN_LANGUAGES:
+        if not en_title:
+            # Hent engelsk titel separat (overview var udfyldt på dansk)
+            async with httpx.AsyncClient(timeout=5) as client:
+                try:
+                    en_resp = await client.get(
+                        f"{_BASE_URL}/{endpoint}/{tmdb_id}",
+                        params={"api_key": TMDB_API_KEY, "language": "en-US"},
+                    )
+                    en_resp.raise_for_status()
+                    en_data = en_resp.json()
+                    en_title = (
+                        en_data.get("title") or en_data.get("name") or
+                        en_data.get("original_title") or en_data.get("original_name")
+                    )
+                except Exception:
+                    pass
+        if en_title and en_title != da_title:
+            logger.info(
+                "TMDB titel-fallback: '%s' → '%s' (sprog: %s)",
+                da_title, en_title, original_language,
+            )
+            da_title = en_title
+
     if trailer_url:
         logger.info("TMDB trailer: tmdb_id=%s → %s", tmdb_id, trailer_url)
     else:
@@ -269,7 +307,7 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
     if media_type == "movie":
         return _strip({
             "id":                data.get("id"),
-            "title":             data.get("title") or data.get("original_title"),
+            "title":             da_title,
             "tagline":           data.get("tagline"),
             "overview":          overview,
             "release_date":      data.get("release_date", "Ukendt"),
@@ -301,7 +339,7 @@ async def get_media_details(tmdb_id: int, media_type: str) -> dict | None:
 
     return _strip({
         "id":                   data.get("id"),
-        "title":                data.get("name") or data.get("original_name"),
+        "title":                da_title,
         "tagline":              data.get("tagline"),
         "overview":             overview,
         "first_air_date":       data.get("first_air_date", "Ukendt"),
