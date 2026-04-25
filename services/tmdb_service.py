@@ -515,12 +515,22 @@ async def get_person_filmography(person_id: int) -> dict | None:
         if existing is None or item.get("release_date", "") > existing.get("release_date", ""):
             directed[key] = item
 
-    # Fallback til cast hvis ingen crew-credits (ren skuespiller)
-    if not directed:
-        logger.info(
-            "get_person_filmography: ingen Director-credits for person_id=%s — falder tilbage til cast",
-            person_id,
-        )
+    # Fallback til cast-liste for rene skuespillere (known_for_department != "Directing")
+    # OG hvis ingen director-credits overhovedet.
+    # Tom Hanks har 3 instruktørfilm — men er skuespiller — skal have cast-kreditter.
+    is_primarily_director = bio.get("known_for_department", "") == "Directing"
+
+    if not directed or not is_primarily_director:
+        if directed and not is_primarily_director:
+            logger.info(
+                "get_person_filmography: person_id=%s '%s' er skuespiller (known_for=%s) — bruger cast i stedet for Director-credits",
+                person_id, bio.get("name"), bio.get("known_for_department"),
+            )
+        elif not directed:
+            logger.info(
+                "get_person_filmography: ingen Director-credits for person_id=%s — falder tilbage til cast",
+                person_id,
+            )
         cast_raw = movie_data.get("cast", [])
         seen: dict[int, dict] = {}
         for item in cast_raw:
