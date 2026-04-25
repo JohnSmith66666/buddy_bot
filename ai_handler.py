@@ -62,6 +62,8 @@ logger = logging.getLogger(__name__)
 _client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 _histories: dict[int, list[dict]] = defaultdict(list)
+_last_activity: dict[int, float] = {}          # telegram_id → Unix timestamp
+_SESSION_TIMEOUT = 10 * 60                      # 10 minutter i sekunder
 _MAX_HISTORY = 6          # Reduceret fra 10 → sparer ~400 uncached tokens per kald
 _MAX_TOOL_RESULT_CHARS = 6000
 
@@ -477,3 +479,25 @@ async def get_ai_response(
 
 def clear_history(telegram_id: int) -> None:
     _histories.pop(telegram_id, None)
+    _last_activity.pop(telegram_id, None)
+
+
+def check_session_timeout(telegram_id: int) -> bool:
+    """
+    Returnerer True hvis sessionen er udløbet (ingen aktivitet i _SESSION_TIMEOUT sekunder).
+    Nulstiller automatisk historikken ved timeout.
+    Kaldes fra main.py inden get_ai_response.
+    """
+    import time
+    now  = time.monotonic()
+    last = _last_activity.get(telegram_id)
+    if last is not None and (now - last) > _SESSION_TIMEOUT:
+        _histories.pop(telegram_id, None)
+        logger.info(
+            "Session timeout for telegram_id=%s (%.0f sek) — historik nulstillet",
+            telegram_id, now - last,
+        )
+        _last_activity[telegram_id] = now
+        return True
+    _last_activity[telegram_id] = now
+    return False
