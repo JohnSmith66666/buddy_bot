@@ -828,6 +828,63 @@ def _collection_sync(
     }
 
 
+# ── Genre-synonym mapping ─────────────────────────────────────────────────────
+# Plex gemmer genre-tags på blandet dansk/engelsk afhængig af biblioteksindstilling.
+# Claude sender altid engelske genre-navne fra system-promptens leksikon.
+# Denne mapping udvider søgningen til at matche begge sprog.
+# Nøgle: normaliseret engelsk genre-term → liste af normaliserede synonymer der også matches.
+_GENRE_SYNONYMS: dict[str, list[str]] = {
+    "crime":       ["kriminalitet", "krimi", "crime"],
+    "kriminalitet": ["crime", "krimi", "kriminalitet"],
+    "comedy":      ["komedie", "comedy"],
+    "komedie":     ["comedy", "komedie"],
+    "drama":       ["drama"],
+    "thriller":    ["thriller", "suspense"],
+    "horror":      ["gyser", "horror"],
+    "gyser":       ["horror", "gyser"],
+    "action":      ["action"],
+    "animation":   ["animation", "anime"],
+    "documentary": ["dokumentar", "documentary"],
+    "romance":     ["romantik", "romance", "romantic"],
+    "romantik":    ["romance", "romantic", "romantik"],
+    "scifi":       ["sciencefiction", "sci fi", "scifi"],
+    "fantasy":     ["fantasy"],
+    "mystery":     ["mysterium", "mystery"],
+    "mysterium":   ["mystery", "mysterium"],
+    "war":         ["krig", "war"],
+    "krig":        ["war", "krig"],
+    "western":     ["western"],
+    "biography":   ["biografi", "biography"],
+    "history":     ["historie", "history"],
+    "historie":    ["history", "historie"],
+    "music":       ["musik", "music", "musical"],
+    "musik":       ["music", "musical", "musik"],
+    "family":      ["familie", "family", "children"],
+    "familie":     ["family", "children", "familie"],
+    "sport":       ["sport"],
+    "adventure":   ["eventyr", "adventure"],
+    "eventyr":     ["adventure", "eventyr"],
+}
+
+
+def _genre_matches(norm_genre: str, item_genre_tags: list[str]) -> bool:
+    """
+    Tjek om et genre-filter matcher en films genre-tags.
+
+    Matcher på tværs af dansk/engelsk via _GENRE_SYNONYMS.
+    Bruger substring-check så 'crime' matcher 'crime drama' osv.
+    """
+    # Byg sæt af alle genre-termer der skal matches (input + synonymer)
+    search_terms = {norm_genre}
+    search_terms.update(_GENRE_SYNONYMS.get(norm_genre, []))
+
+    for item_genre in item_genre_tags:
+        for term in search_terms:
+            if term in item_genre:
+                return True
+    return False
+
+
 def _unwatched_sync(
     media_type: str,
     genre: str | None,
@@ -836,16 +893,10 @@ def _unwatched_sync(
     """
     Find usete film eller serier i Plex-biblioteket.
 
-    FIX (v0.9.9): Bruger nu section.all() i stedet for section.search(unwatched=True).
-
-    section.search(unwatched=True) er ikke et gyldigt PlexAPI-argument og
-    kaster en exception. Fallback section.search() returnerer kun ~20 resultater
-    (Plex's default limit) — og hvis alle 20 er sete film, returnerer
-    viewCount-filteret 0 resultater.
-
-    section.all() henter HELE biblioteket uden limit. Vi filtrerer client-side:
-      - viewCount == 0 → uset
-      - genre-match via _normalise() substring-check
+    FIX (v0.9.9): section.all() henter hele biblioteket uden Plex default-limit.
+    FIX (v1.0.0): Genre-matching bruger nu _genre_matches() med synonym-tabel
+      der dækker dansk/engelsk genre-labels. Tidligere matchede 'crime' ikke
+      'Kriminalitet' fordi Plex bruger dansk på denne server.
     """
     plex_type  = _MOVIE_TYPE if media_type == "movie" else _TV_TYPE
     plex       = _connect(plex_username)
@@ -857,7 +908,6 @@ def _unwatched_sync(
 
     for section in _sections(plex, plex_type):
         try:
-            # section.all() returnerer hele bibliotekets indhold uden Plex's ~20-limit
             all_items = section.all()
         except Exception as e:
             logger.warning(
@@ -866,13 +916,11 @@ def _unwatched_sync(
             continue
 
         for item in all_items:
-            # Skip sete titler
             if getattr(item, "viewCount", 0) > 0:
                 continue
-            # Genre-filter (case-insensitiv substring-match)
             if norm_genre:
                 item_genres = [_normalise(g.tag) for g in getattr(item, "genres", [])]
-                if not any(norm_genre in g for g in item_genres):
+                if not _genre_matches(norm_genre, item_genres):
                     continue
             unwatched.append(_slim(item))
 
