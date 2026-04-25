@@ -197,17 +197,19 @@ async def handle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Fanger /info_movie_<tmdb_id> og /info_tv_<tmdb_id> kommandoer.
-    Bruger (filters.COMMAND | filters.TEXT) & filters.Regex — fanger begge varianter.
-    Logger altid hvilket ID der blev klikket for at debugge ID-parring fejl.
+    Regex er fleksibel: underscores er valgfrie for at fange Buddys fejlskrivninger.
+    Logger altid den fulde kommando for at debugge ID-parring fejl.
     """
     if not await _guard(update):
         return
+
+    logger.info("HANDLER TRIGGERET: Modtog kommando %s", update.message.text)
 
     if context.matches:
         match = context.matches[0]
     else:
         text  = (update.message.text or "").strip()
-        match = re.match(r"^/info_(movie|tv)_(\d+)$", text)
+        match = re.match(r"^/info_?(movie|tv)_?(\d+)$", text)
         if not match:
             return
 
@@ -448,10 +450,9 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_cancel_callback,    pattern=r"^cancel:"))
     app.add_handler(CallbackQueryHandler(handle_watchlist_callback, pattern=r"^watchlist:"))
 
-    # Info-links fra lister (/info_movie_<id>, /info_tv_<id>)
-    # Fanger både kommando-form og tekst-form via COMMAND|TEXT filter
+    # Info-links fra lister — fleksibelt regex fanger både /info_movie_123 og /infomovie123
     app.add_handler(MessageHandler(
-        (filters.COMMAND | filters.TEXT) & filters.Regex(r"^/info_(movie|tv)_(\d+)$"),
+        (filters.COMMAND | filters.TEXT) & filters.Regex(r"^/info_?(movie|tv)_?(\d+)$"),
         handle_info_link,
     ))
 
