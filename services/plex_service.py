@@ -1337,12 +1337,22 @@ async def get_plex_watch_url(
 
     try:
         async with _httpx.AsyncClient(timeout=8) as client:
-            resp = await client.get(url, params=params)
+            resp = await client.get(
+                url,
+                params=params,
+                headers={"Accept": "application/json"},
+            )
             logger.info(
-                "Plex metadata API svar: status=%s url=%s",
-                resp.status_code, str(resp.url),
+                "Plex metadata API svar: status=%s content-type=%s",
+                resp.status_code, resp.headers.get("content-type", "ukendt"),
             )
             resp.raise_for_status()
+
+            # Plex returnerer XML som default — kræver Accept: application/json
+            if not resp.text.strip():
+                logger.warning("Plex slug: tomt svar for tmdb://%s", tmdb_id)
+                return None
+
             data = resp.json()
             logger.info("Plex metadata API data: %s", str(data)[:500])
 
