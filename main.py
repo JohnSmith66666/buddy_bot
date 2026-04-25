@@ -223,8 +223,13 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     await update.message.chat.send_action("typing")
 
+    loading_msg = await update.message.reply_text(
+        "🤖 Beregner svar med lynets hast... næsten..."
+    )
+
     details = await get_media_details(tmdb_id, media_type)
     if not details:
+        await loading_msg.delete()
         await update.message.reply_text("Kunne ikke hente info — prøv igen.")
         return
 
@@ -241,11 +246,16 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "step":       "picked",
     })
 
-    # Slet brugerens kommando-besked for at holde chatten ren
+    # Slet brugerens kommando-besked og loading-beskeden for at holde chatten ren
     try:
         await update.message.delete()
     except Exception:
         pass  # Telegram tillader ikke altid sletning — ignorer stille
+
+    try:
+        await loading_msg.delete()
+    except Exception:
+        pass
 
     await show_confirmation(update.message, context, token, plex_username)
 
