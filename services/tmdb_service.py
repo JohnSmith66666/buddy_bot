@@ -491,18 +491,29 @@ async def get_person_filmography(person_id: int) -> dict | None:
             return None
 
     # ── Hent kun instruktørfilm fra crew-listen ───────────────────────────────
+    # Deduplicerer på original_title (ikke id) — TMDB har ofte to entries for
+    # samme film: én tidlig festival-version og den rigtige release.
+    # Crew-entries har IKKE vote_count, så vi bruger seneste release_date
+    # som proxy: festival-screenings har altid en tidligere dato end den
+    # officielle release.
+    # Eksempel Reservoir Dogs: id=443129 (1991-06-01 festival) vs id=500 (1992-09-02 release)
+    # Eksempel Inglourious Basterds: id=16869 (tidlig) vs id=44008 (2009-08-21 release)
     crew_raw = movie_data.get("crew", [])
-    directed: dict[int, dict] = {}
+    directed: dict[str, dict] = {}   # original_title.lower() → item med seneste release_date
     for item in crew_raw:
         if item.get("job") != "Director":
             continue
         if not item.get("release_date"):
             continue
-        mid = item.get("id")
-        if mid is None:
+        if item.get("id") is None:
             continue
-        if mid not in directed:
-            directed[mid] = item
+        key = (item.get("original_title") or item.get("title") or "").lower().strip()
+        if not key:
+            continue
+        existing = directed.get(key)
+        # Behold entry med senest release_date — festival-versioner kommer altid før
+        if existing is None or item.get("release_date", "") > existing.get("release_date", ""):
+            directed[key] = item
 
     # Fallback til cast hvis ingen crew-credits (ren skuespiller)
     if not directed:

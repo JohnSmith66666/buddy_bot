@@ -315,24 +315,37 @@ def _check_sync(
             # Ingen hit på GUID — fortsæt til lag 1
 
         # ── Lag 1 + 2/3: Titel-søgning ────────────────────────────────────────
-        for item in _safe_search(section, title):
-            item_title = getattr(item, "title", "") or ""
-            item_year  = getattr(item, "year", None)
+        # Prøv også med stripped titel (fjern '...' og lignende) som fallback.
+        # "Once Upon a Time... in Hollywood" søges som "Once Upon a Time in Hollywood"
+        stripped_title = re.sub(r"\.{2,}", "", title).strip()
+        search_titles = [title] if stripped_title == title else [title, stripped_title]
 
-            if not (_titles_match(item_title, title) or
-                    _titles_match_fuzzy(item_title, title)):
-                continue
+        matched = False
+        for search_title in search_titles:
+            for item in _safe_search(section, search_title):
+                item_title = getattr(item, "title", "") or ""
+                item_year  = getattr(item, "year", None)
 
-            match_lag = 1 if _titles_match(item_title, title) else "2/3"
-
-            if is_tv:
-                if not _year_ok_for_tv(item_year, year):
+                if not (_titles_match(item_title, title) or
+                        _titles_match_fuzzy(item_title, title) or
+                        (stripped_title != title and (
+                            _titles_match(item_title, stripped_title) or
+                            _titles_match_fuzzy(item_title, stripped_title)
+                        ))):
                     continue
-            else:
-                if year and item_year and abs(item_year - year) > 1:
-                    continue
 
-            return _build_result(item, match_lag)
+                match_lag = 1 if _titles_match(item_title, title) else "2/3"
+
+                if is_tv:
+                    if not _year_ok_for_tv(item_year, year):
+                        continue
+                else:
+                    if year and item_year and abs(item_year - year) > 1:
+                        continue
+
+                return _build_result(item, match_lag)
+            if matched:
+                break
 
     return {"status": STATUS_MISSING}
 
