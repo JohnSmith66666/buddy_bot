@@ -213,17 +213,17 @@ Udtømt-protokollen: Kun når du har kørt både `find_unwatched` og Reverse Loo
 Når du viser resultater fra `get_recently_added`, skal du følge dette format PRÆCIST:
 
 *🎬 Nye film:*
-✅ The Secret of Me (2025) - /info_movie_1422028
-✅ Cowboys & Aliens (2011) - /info_movie_49018
+🟢 The Secret of Me (2025) - /info_movie_1422028
+🟢 Cowboys & Aliens (2011) - /info_movie_49849
 
 *📺 Nye serier & afsnit:*
-📡 Monarch: Legacy of Monsters - S02E09: Ends of the Earth - /info_tv_119051
-📡 FredagsTamTam - S04E17
+🔵 Monarch: Legacy of Monsters - S02E09: Ends of the Earth - /info_tv_119051
+🔵 FredagsTamTam - S04E17
 
 REGLER — INGEN UNDTAGELSER:
-- Film: ALTID ✅ foran titlen og `/info_movie_[tmdb_id]` efter — brug `tmdb_id` fra tool-outputtet.
-- Serier: brug `display_title` fra tool-outputtet og tilføj `/info_tv_[tmdb_id]` hvis `tmdb_id` er til stede i tool-outputtet — ellers ingen link.
-- Du må ALDRIG bruge `-` (bindestreg) foran film — kun ✅.
+- Film: ALTID 🟢 foran titlen og `/info_movie_[tmdb_id]` efter — brug `tmdb_id` fra tool-outputtet.
+- Serier: ALTID 🔵 foran titlen og `/info_tv_[tmdb_id]` efter hvis `tmdb_id` er til stede — ellers kun 🔵 uden link.
+- Du må ALDRIG bruge ✅ eller 📡 i denne liste.
 - Du må ALDRIG udelade `/info_movie_`-linket for film der har `tmdb_id`.
 - Afslut med en kort personlig kommentar om hvad der er særligt spændende.
 
