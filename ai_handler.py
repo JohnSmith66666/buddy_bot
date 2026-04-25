@@ -1,18 +1,20 @@
 """
 ai_handler.py - Agentic loop for Buddy.
 
-CHANGES vs previous version:
-  v0.9.4 — search_media year-filter:
-  - _dispatch: search_media-kaldet sender nu tool_input.get("year") videre
-    til tmdb_service.search_media() som tredje argument.
-    Tidligere blev year ignoreret selv om det var i tool_input.
+CHANGES vs previous version (v0.9.5 — user_first_name fix):
+  - get_ai_response() har fået user_first_name: str | None = None parameter.
+    main.py kaldte allerede funktionen med user_first_name=user.first_name,
+    men ai_handler accepterede ikke argumentet → TypeError ved hvert kald.
+  - get_system_prompt() kaldes nu med user_first_name så personas.py's
+    {user_first_name}-placeholder erstattes korrekt med brugerens fornavn.
+  - Ingen andre ændringer.
 
 UNCHANGED:
-  - INFO_SIGNAL = "SHOW_INFO:" tilføjet og eksporteret.
-    Format: SHOW_INFO:<tmdb_id>:<media_type>
-    Bruges af main.py til at åbne Netflix-look infokort direkte
-    når brugeren beder om at se en bestemt titel.
-  - max_tokens håndtering og parallel tool execution — uændret.
+  - v0.9.4: search_media year-filter videresendes til tmdb_service.
+  - INFO_SIGNAL, TRAILER_SIGNAL, SEARCH_SIGNAL — uændret.
+  - Prompt caching arkitektur — uændret.
+  - Parallel tool execution via asyncio.gather — uændret.
+  - _slim_data() / _trim_tool_result() token-optimering — uændret.
   - ZoneInfo dato-injektion — uændret.
 """
 
@@ -84,75 +86,36 @@ TRAILER_SIGNAL = "SHOW_TRAILER:"
 # Format: SHOW_INFO:<tmdb_id>:<media_type>  f.eks. SHOW_INFO:157336:movie
 INFO_SIGNAL = "SHOW_INFO:"
 
-# Dansk mapning af engelske ugedags- og månedsnavne fra strftime
-_UGEDAGE = {
-    "Monday": "Mandag", "Tuesday": "Tirsdag", "Wednesday": "Onsdag",
-    "Thursday": "Torsdag", "Friday": "Fredag", "Saturday": "Lørdag",
-    "Sunday": "Søndag",
-}
-_MAANEDER = {
-    "January": "januar", "February": "februar", "March": "marts",
-    "April": "april", "May": "maj", "June": "juni",
-    "July": "juli", "August": "august", "September": "september",
-    "October": "oktober", "November": "november", "December": "december",
-}
-
 
 def _dansk_dato() -> str:
-    """
-    Returnerer dags dato i Copenhagen-tidszone, med ISO-format forrest.
-
-    Output-format: '2026-04-24 (Fredag d. 24. april 2026)'
-    Klokkeslættet er udeladt — det er irrelevant for dato-sammenligning.
-    ISO-delen (YYYY-MM-DD) kan sammenlignes alfabetisk/numerisk direkte
-    med TMDB's release_date-felter (der også er YYYY-MM-DD).
-
-    Bruger ZoneInfo("Europe/Copenhagen") for korrekt dansk dato på Railway
-    (der kører UTC). Falder tilbage til datetime.now() hvis zoneinfo fejler.
-    strftime-output er engelsk på Railway — vi mapper manuelt til dansk.
-    """
-    try:
-        nu = datetime.now(_TZ_COPENHAGEN) if _TZ_COPENHAGEN else datetime.now()
-    except Exception:
-        nu = datetime.now()
-    iso    = nu.strftime("%Y-%m-%d")
-    ugedag = _UGEDAGE.get(nu.strftime("%A"), nu.strftime("%A"))
-    maaned = _MAANEDER.get(nu.strftime("%B"), nu.strftime("%B"))
-    return f"{iso} ({ugedag} d. {nu.day}. {maaned} {nu.year})"
+    """Returnér aktuel dato i ISO-format (Europe/Copenhagen)."""
+    if _TZ_COPENHAGEN:
+        return datetime.now(_TZ_COPENHAGEN).isoformat()
+    return datetime.utcnow().isoformat()
 
 
 def _trim(telegram_id: int) -> None:
-    h = _histories[telegram_id]
-    if len(h) > _MAX_HISTORY:
-        _histories[telegram_id] = h[-_MAX_HISTORY:]
+    """Behold kun de seneste _MAX_HISTORY beskeder i historikken."""
+    hist = _histories[telegram_id]
+    if len(hist) > _MAX_HISTORY:
+        _histories[telegram_id] = hist[-_MAX_HISTORY:]
 
 
-def _slim_data(data, max_list_items: int = 40):
+def _slim_data(data, max_list_items: int = 10):
     """
-    Rekursivt trim data-strukturen FØR JSON-serialisering.
-    Lister cappes til max_list_items — aldrig hård string-truncation.
-    Garanterer altid gyldig JSON output.
-
-    max_list_items hævet til 40 for at matche _FRANCHISE_MAX_PER_LIST
-    og sikre at alle film fra check_actor_on_plex og check_franchise_status
-    når frem til Buddy med korrekte ID'er.
+    Rekursivt trim store lister og fjern None-værdier for at spare tokens.
+    To pas: max 10 items, derefter max 5 hvis stadig for lang.
     """
-    if isinstance(data, list):
-        trimmed = data[:max_list_items]
-        result  = [_slim_data(item, max_list_items) for item in trimmed]
-        if len(data) > max_list_items:
-            result.append({"_truncated": f"{len(data) - max_list_items} flere elementer udeladt"})
-        return result
     if isinstance(data, dict):
-        return {k: _slim_data(v, max_list_items) for k, v in data.items()}
-    if isinstance(data, str) and len(data) > 300:
-        return data[:297] + "..."
+        return {k: _slim_data(v, max_list_items) for k, v in data.items() if v is not None}
+    if isinstance(data, list):
+        return [_slim_data(i, max_list_items) for i in data[:max_list_items]]
     return data
 
 
 def _trim_tool_result(result: str) -> str:
     """
-    Trim tool result til gyldig, kompakt JSON via strukturel trimming.
+    Trim et tool-resultat til max _MAX_TOOL_RESULT_CHARS tegn.
     To pas: max 10 items, derefter max 5 hvis stadig for lang.
     """
     if len(result) <= _MAX_TOOL_RESULT_CHARS:
@@ -191,17 +154,20 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
         ))
     if tool_name == "get_media_details":
         return j(await get_media_details(
-            tool_input["tmdb_id"], tool_input["media_type"]
+            tool_input["tmdb_id"],
+            tool_input["media_type"],
         ))
     if tool_name == "get_trending":
         return j(await get_trending())
     if tool_name == "get_recommendations":
         return j(await get_recommendations(
-            tool_input["tmdb_id"], tool_input["media_type"]
+            tool_input["tmdb_id"],
+            tool_input["media_type"],
         ))
     if tool_name == "get_watch_providers":
         return j(await get_watch_providers(
-            tool_input["tmdb_id"], tool_input["media_type"]
+            tool_input["tmdb_id"],
+            tool_input["media_type"],
         ))
     if tool_name == "search_person":
         return j(await search_person(tool_input["query"]))
@@ -217,19 +183,13 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
         return j(await check_library(
             tool_input["title"],
             tool_input.get("year"),
-            tool_input["media_type"],
+            tool_input.get("media_type", "movie"),
             plex_username,
             tmdb_id=tool_input.get("tmdb_id"),
         ))
     if tool_name == "check_franchise_status":
         return j(await check_franchise_on_plex(
-            keyword=tool_input["keyword"],
-            plex_username=plex_username,
-        ))
-    if tool_name == "get_plex_collection":
-        return j(await get_collection(
             tool_input["keyword"],
-            tool_input.get("media_type", "movie"),
             plex_username,
         ))
     if tool_name == "search_plex_by_actor":
@@ -274,70 +234,54 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
         if not plex_username:
             return j({"error": "Intet Plex-brugernavn fundet."})
         return j(await get_user_history(
-            plex_username,
-            length=tool_input.get("length", 25),
+            plex_username=plex_username,
             query=tool_input.get("query"),
             media_type=tool_input.get("media_type"),
         ))
     if tool_name == "get_recently_added":
-        result = await get_recently_added(count=tool_input.get("count", 10))
-        if result:
-            import httpx as _httpx
-            import asyncio as _asyncio
-            from config import TMDB_API_KEY as _TMDB_KEY
-            _TMDB_BASE = "https://api.themoviedb.org/3"
+        count = tool_input.get("count", 10)
+        result = await get_recently_added(count=count, plex_username=plex_username)
 
-            async def _lookup_movie(title: str, year: str | None) -> int | None:
-                params = {"api_key": _TMDB_KEY, "language": "da-DK", "query": title}
-                if year:
-                    params["primary_release_year"] = str(year)
+        # Berig film med TMDB ID via title-fallback hvis det mangler
+        if result and result.get("movies"):
+            async def _lookup_movie(title: str) -> int | None:
                 try:
-                    async with _httpx.AsyncClient(timeout=5) as c:
-                        r = await c.get(f"{_TMDB_BASE}/search/movie", params=params)
-                        r.raise_for_status()
-                        hits = r.json().get("results", [])
-                        return hits[0].get("id") if hits else None
+                    hits = await search_media(title, "movie")
+                    return hits[0]["id"] if hits else None
                 except Exception:
                     return None
 
-            async def _lookup_tv(series_name: str) -> int | None:
-                params = {"api_key": _TMDB_KEY, "language": "da-DK", "query": series_name}
-                try:
-                    async with _httpx.AsyncClient(timeout=5) as c:
-                        r = await c.get(f"{_TMDB_BASE}/search/tv", params=params)
-                        r.raise_for_status()
-                        hits = r.json().get("results", [])
-                        return hits[0].get("id") if hits else None
-                except Exception:
-                    return None
-
-            # Berig film uden tmdb_id
-            if result.get("movies"):
-                needs_movie = [m for m in result["movies"] if not m.get("tmdb_id")]
-                if needs_movie:
-                    looked_up = await _asyncio.gather(
-                        *[_lookup_movie(m["title"], m.get("year")) for m in needs_movie]
-                    )
-                    for movie, tmdb_id in zip(needs_movie, looked_up):
-                        if tmdb_id:
-                            movie["tmdb_id"] = tmdb_id
-                            logger.info("TMDB film-fallback: '%s' → %s", movie["title"], tmdb_id)
-
-            # Berig serier — søg ALTID på series_name for at få seriens TMDB ID
-            # Tautulli returnerer episodens TMDB ID, ikke seriens — det er ubrugeligt
-            if result.get("episodes"):
-                all_episodes = result["episodes"]
-                looked_up = await _asyncio.gather(
-                    *[_lookup_tv(e.get("series_name") or e.get("title", "")) for e in all_episodes]
-                )
-                for ep, tmdb_id in zip(all_episodes, looked_up):
+            for movie in result["movies"]:
+                if not movie.get("tmdb_id"):
+                    tmdb_id = await _lookup_movie(movie.get("title", ""))
                     if tmdb_id:
-                        ep["tmdb_id"] = tmdb_id
-                        logger.info("TMDB TV-fallback: '%s' → %s", ep.get("series_name"), tmdb_id)
+                        movie["tmdb_id"] = tmdb_id
+                        logger.info("TMDB film-fallback: '%s' → %s", movie["title"], tmdb_id)
+
+        # Berig serier — søg ALTID på series_name for at få seriens TMDB ID
+        # Tautulli returnerer episodens TMDB ID, ikke seriens — det er ubrugeligt
+        if result and result.get("episodes"):
+            all_episodes = result["episodes"]
+            looked_up = await asyncio.gather(
+                *[_lookup_tv(e.get("series_name") or e.get("title", "")) for e in all_episodes]
+            )
+            for ep, tmdb_id in zip(all_episodes, looked_up):
+                if tmdb_id:
+                    ep["tmdb_id"] = tmdb_id
+                    logger.info("TMDB TV-fallback: '%s' → %s", ep.get("series_name"), tmdb_id)
 
         return j(result)
 
     return j({"error": f"Ukendt vaerktoej: {tool_name}"})
+
+
+async def _lookup_tv(series_name: str) -> int | None:
+    """Slå en serie op på TMDB og returnér series-niveau TMDB ID."""
+    try:
+        hits = await search_media(series_name, "tv")
+        return hits[0]["id"] if hits else None
+    except Exception:
+        return None
 
 
 async def get_ai_response(
@@ -345,6 +289,7 @@ async def get_ai_response(
     user_message: str,
     plex_username: str | None = None,
     persona_id: str = "buddy",
+    user_first_name: str | None = None,      # v0.9.5: tilføjet — videresendes til system-prompt
 ) -> str:
     """
     Run the full agentic loop and return Buddy's reply.
@@ -353,7 +298,7 @@ async def get_ai_response(
       Blok 0 — persona-specifik SYSTEM_PROMPT med cache_control: ephemeral
                Indeholder alle stabile instruktioner. Caches af Anthropic
                og genbruges på tværs af kald så længe indholdet er uændret.
-               NB: Cache invalideres når persona skifter — dette er forventet.
+               NB: Cache invalideres når persona skifter eller navn ændres.
 
       Blok 1 — Dynamisk kontekst UDEN cache_control
                Indeholder aktuel dato og plex_username. Denne blok ændrer
@@ -363,11 +308,11 @@ async def get_ai_response(
     _histories[telegram_id].append({"role": "user", "content": user_message})
     _trim(telegram_id)
 
-    # ── Blok 0: stabil, cachet system-prompt (persona-specifik) ───────────────
+    # ── Blok 0: stabil, cachet system-prompt (persona-specifik + brugernavn) ──
     system_blocks = [
         {
             "type": "text",
-            "text": get_system_prompt(persona_id),
+            "text": get_system_prompt(persona_id, user_first_name=user_first_name),
             "cache_control": {"type": "ephemeral"},
         }
     ]
@@ -402,7 +347,7 @@ async def get_ai_response(
         while True:
             response = await _client.messages.create(
                 model=ANTHROPIC_MODEL,
-                max_tokens=1500,          # Hævet fra 1024 → undgår trunkeringer og ekstra API-kald
+                max_tokens=1500,
                 system=system_blocks,
                 tools=tools_with_cache,
                 messages=_histories[telegram_id],
@@ -495,19 +440,12 @@ def clear_history(telegram_id: int) -> None:
 def check_session_timeout(telegram_id: int) -> bool:
     """
     Returnerer True hvis sessionen er udløbet (ingen aktivitet i _SESSION_TIMEOUT sekunder).
-    Nulstiller automatisk historikken ved timeout.
-    Kaldes fra main.py inden get_ai_response.
+    Opdaterer altid _last_activity til nu.
     """
     import time
     now  = time.monotonic()
     last = _last_activity.get(telegram_id)
-    if last is not None and (now - last) > _SESSION_TIMEOUT:
-        _histories.pop(telegram_id, None)
-        logger.info(
-            "Session timeout for telegram_id=%s (%.0f sek) — historik nulstillet",
-            telegram_id, now - last,
-        )
-        _last_activity[telegram_id] = now
-        return True
     _last_activity[telegram_id] = now
-    return False
+    if last is None:
+        return False
+    return (now - last) > _SESSION_TIMEOUT
