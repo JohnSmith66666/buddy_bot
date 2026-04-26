@@ -1,6 +1,13 @@
 """
 main.py - Buddy bot entry point.
 
+CHANGES vs previous version (v0.10.1 — genre-parameter fix):
+  - BUG FIX: _build_watch_prompt() instruerede Buddy til at sende flere genrer
+    som comma-separeret string ("Komedie, Romantik"), hvilket fik Plex til at
+    søge efter én bogstavelig genre med komma-tegn i navnet → 0 film fundet.
+    Fix: Promptet instruerer nu eksplicit Buddy til at lave SEPARATE parallelle
+    find_unwatched-kald, ét per genre, og samle resultaterne.
+
 CHANGES vs previous version (v0.10.0 — 'Hvad skal jeg se?' interaktivt flow):
   - NY FEATURE: Stemnings-baseret browse-flow med pagination.
     * Fast ReplyKeyboard-knap '🍿 Hvad skal jeg se?' tilføjet til cmd_start
@@ -16,7 +23,6 @@ CHANGES vs previous version (v0.10.0 — 'Hvad skal jeg se?' interaktivt flow):
     * AI handoff: build_watch_prompt() bygger en kontekst-prompt og sender
       til get_ai_response (samme path som handle_text — bevarer signal-parsing
       til SHOW_INFO/TRAILER/SEARCH_RESULTS).
-  - VERSION CHECK opdateret til v0.10.0-beta.
 
 UNCHANGED (v0.9.8 — Annuller-knap photo-fix):
   - handle_cancel_callback bruger edit_message_caption() for photo-beskeder.
@@ -251,6 +257,11 @@ def _build_watch_prompt(state: dict, mode: str) -> str:
     mode='search'    → genre-baseret søgning (4-5 forslag)
     mode='surprise'  → tilfældig perle (4-5 forslag inden for typen)
     mode='wildcard'  → tilfældig perle uden type-filter (4-5 forslag, fra hovedmenu)
+
+    BUG FIX (v0.10.1): Tidligere blev genrer formateret som comma-separeret
+    streng ("Komedie, Romantik") — Buddy sendte den som ÉN genre-string til
+    find_unwatched, hvilket gav 0 hits. Nu instrueres Buddy eksplicit til
+    SEPARATE parallelle find_unwatched-kald, ét per genre.
     """
     media_type = state.get("media_type")
     media_word = "film" if media_type == "movie" else ("serier" if media_type == "tv" else "film eller serier")
@@ -262,13 +273,23 @@ def _build_watch_prompt(state: dict, mode: str) -> str:
             for g in WATCH_MOODS[mood_id]["genres"]:
                 if g not in all_genres:
                     all_genres.append(g)
-        genre_str = ", ".join(all_genres)
+
+        # Format genre-listen som en bullet-list så Buddy ser dem som
+        # separate items, ikke som én streng
+        genre_list = "\n".join(f"- {g}" for g in all_genres)
+        media_arg  = "movie" if media_type == "movie" else "tv"
 
         return (
-            f"Find 4-5 gode {media_word} på serveren inden for genrerne: {genre_str}. "
-            f"Brugeren har ikke set dem endnu. Anbefal med kort begrundelse for hver. "
-            f"Svar i din persona — kort, præcis, venlig. Brug ✅-listeformat med "
-            f"klikbare /info_movie_X eller /info_tv_X links."
+            f"Brugeren vil have anbefalinger til {media_word} fra disse genrer:\n"
+            f"{genre_list}\n\n"
+            f"VIGTIGT — gør PRÆCIS dette:\n"
+            f"1. Kald find_unwatched ÉN GANG PER GENRE — separate parallelle kald. "
+            f"Hvert kald skal have media_type='{media_arg}' og genre=<præcis ét genre-navn fra listen>. "
+            f"Send ALDRIG flere genrer som komma-separeret streng — det fejler.\n"
+            f"2. Når du har resultaterne, vælg de 4-5 bedste {media_word} på tværs af alle "
+            f"resultat-sættene.\n"
+            f"3. Vis dem i ✅-listeformat med klikbare /info_movie_X eller /info_tv_X links "
+            f"og en kort begrundelse for hver. Svar i din persona — kort, præcis, venlig."
         )
 
     if mode == "surprise":
@@ -1082,10 +1103,10 @@ async def on_startup(application: Application) -> None:
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — v0.10.0-beta | "
+        "VERSION CHECK — v0.10.1-beta | "
         "søgeresultater-UX: JA | foto-fix: JA | årstal-fallback: JA | "
         "tilbage-knap: JA | already-anmodet-check: JA | user_first_name: JA | "
-        "annuller-photo-fix: JA | watch-flow: JA"
+        "annuller-photo-fix: JA | watch-flow: JA | watch-genre-split-fix: JA"
     )
 
 
