@@ -1,31 +1,49 @@
 """
 main.py - Buddy bot entry point.
 
-CHANGES vs previous version (v0.10.8 — /test_v2 admin DEBUG-kommando):
-  - NY ENGANGS-FEATURE: /test_v2 <subgenre_id>
-    * Tester den nye find_unwatched_v2 fra services/v2_service.py
-    * Validerer hele kæden: DB-cache → Plex cross-check → unwatched-filter
-    * Bruges KUN af admin til at debugge før vi bygger UI'en (Etape 3)
-    * Vil blive slettet sammen med /seed_metadata, /fetch_metadata mv. når
-      Etape 4 er færdig og vi rydder op.
-  - Output viser:
-      - Subgenre-label (sjove navne)
-      - Stats: kandidater → i Plex → usete → returneret
-      - Liste af 5 film med titel + år + rating
-      - Hjælper-mode: /test_v2 list viser alle 36 subgenre-IDs
-  - VERSION CHECK opdateret til v0.10.8-beta.
+CHANGES vs previous version (v0.11.0 — Etape 3 af subgenre-projekt):
+  - 🎉 STOR REFAKTORERING: Hele 'Hvad skal jeg se?' flow erstattet.
+    Det gamle AI-prompt-baserede flow med 17 stemninger er fjernet.
+    Det nye flow er datadrevet via subgenre_service + find_unwatched_v2.
 
-UNCHANGED (v0.10.7 — fuld keyword-eksport):
-  - /top_keywords <type> all <min_count> dumper JSON+CSV
-UNCHANGED (v0.10.6 — Step 2 af subgenre-projekt):
-  - 4 admin-kommandoer: /seed_metadata, /fetch_metadata, /metadata_status, /top_keywords
-UNCHANGED (v0.10.5 — /test_metadata kommando, Step 1).
-UNCHANGED (v0.10.4 — /test_enrich DRY-RUN kommando).
+  - NYT 4-TRINS UI:
+    * Trin 1: Bundknap '🍿 Hvad skal jeg se?' (uændret reply keyboard)
+    * Trin 2: 9 kategori-knapper (1 pr. række) + Overrask + Afbryd
+    * Trin 3: 3-6 subgenre-knapper (1 pr. række) + Overrask + Tilbage + Afbryd
+    * Trin 4: 5 film-resultater (titel + ⭐ rating + /info_movie_X) +
+              4 actions (🔄 nye / ⏭️ næste subgenre / ⬅️ tilbage / ❌ færdig)
+
+  - KALDER find_unwatched_v2 DIREKTE — ingen AI-prompt construction.
+    Hurtigere (~2 sek vs 8-10 sek), billigere ($0 vs $0.01 per kald),
+    præcisere (datadrevet keyword-matching i stedet for genre-tag).
+
+  - SLETTET (~250 linjer død kode):
+    * WATCH_MOODS dictionary (17 stemninger med dansk/engelsk genre-mapping)
+    * WATCH_PAGES paginering (3 sider × 5-6 stemninger)
+    * _build_type_selection_keyboard, _build_mood_keyboard, _build_mood_message_text
+    * _build_watch_prompt (AI-prompt construction)
+    * handle_watch_type_callback, handle_watch_mood_callback, handle_watch_page_callback
+    * handle_watch_search_callback, handle_watch_surprise_callback (gammel version)
+    * _execute_ai_handoff (kæmpe AI-flow)
+
+  - BEVARET (al ikke-watch-flow funktionalitet):
+    * Bundknap-tekst '🍿 Hvad skal jeg se?' (brugervante)
+    * Alle admin-kommandoer (/test_v2, /seed_metadata, /fetch_metadata, etc.)
+    * Bestillingsflow (pick / confirm / cancel / back / watchlist)
+    * Info-links (/info_movie_X, /info_tv_X)
+    * AI-handler for fri-tekst (Claude med tools)
+    * Webhook-server (Radarr/Sonarr)
+    * Onboarding (Plex-username verification)
+
+  - VERSION CHECK opdateret til v0.11.0-beta.
+
+UNCHANGED (v0.10.8 — /test_v2 admin DEBUG).
+UNCHANGED (v0.10.7 — fuld keyword-eksport).
+UNCHANGED (v0.10.6 — Step 2 af subgenre-projekt).
+UNCHANGED (v0.10.5 — /test_metadata kommando).
+UNCHANGED (v0.10.4 — /test_enrich DRY-RUN).
 UNCHANGED (v0.10.3 — /dump_genres admin-kommando).
 UNCHANGED (v0.10.2 — /genres admin-kommando).
-UNCHANGED (v0.10.1 — genre-parameter fix).
-UNCHANGED (v0.10.0 — 'Hvad skal jeg se?' interaktivt flow).
-UNCHANGED (v0.9.8 — Annuller-knap photo-fix).
 """
 
 import asyncio
@@ -85,6 +103,8 @@ from services.subgenre_service import (
     SUBGENRE_CATEGORIES,
     SUBGENRES,
     get_all_categories,
+    get_category,
+    get_category_for_subgenre,
     get_subgenre,
     list_subgenre_ids,
     validate_subgenre_id,
@@ -103,41 +123,19 @@ _URL_RE = re.compile(r"(https?://[^\s)\]>\"]+)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 'HVAD SKAL JEG SE?' — Konstanter og helpers (uændret fra v0.10.7)
+# WATCH FLOW (NY v0.11.0) — Konstanter og helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Bundknap-tekst (uændret for at bevare brugervante)
 WATCH_FLOW_TRIGGER = "🍿 Hvad skal jeg se?"
-MAX_MOODS = 2
 
-WATCH_MOODS: dict[int, dict] = {
-    1:  {"emoji": "🛋️",  "name": "Netflix and Chill",       "genres": ["Komedie", "Romantik"]},
-    2:  {"emoji": "😂",  "name": "Grin til jeg græder",     "genres": ["Komedie"]},
-    3:  {"emoji": "💥",  "name": "Hjernedød Action",        "genres": ["Action", "Action/Eventyr"]},
-    4:  {"emoji": "😱",  "name": "Gem mig bag puden",       "genres": ["Gyser", "Suspense"]},
-    5:  {"emoji": "🤯",  "name": "Mindfuck",                 "genres": ["Mysterium", "Sci-fi", "Thriller"]},
-    6:  {"emoji": "😭",  "name": "Find lommetørklædet",     "genres": ["Drama"]},
-    7:  {"emoji": "🕵️", "name": "Hvem gjorde det?",         "genres": ["Kriminalitet", "Mysterium"]},
-    8:  {"emoji": "❤️",  "name": "Kærlighed & Kliché",      "genres": ["Romantik", "Komedie"]},
-    9:  {"emoji": "🧸",  "name": "Ungerne styrer",           "genres": ["Familie", "Children", "Animation"]},
-    10: {"emoji": "🐉",  "name": "Væk fra virkeligheden",   "genres": ["Fantasy", "Adventure", "Sci-Fi & Fantasy"]},
-    11: {"emoji": "🍷",  "name": "Snobbet Mesterværk",       "genres": ["Drama", "Biography"]},
-    12: {"emoji": "🧠",  "name": "Gør mig klogere",          "genres": ["Documentary", "Historie"]},
-    13: {"emoji": "🎇",  "name": "Visuelt festfyrværkeri",  "genres": ["Action", "Sci-fi", "Fantasy"]},
-    14: {"emoji": "🔪",  "name": "Mørkt og sandt",           "genres": ["Crime", "Documentary"]},
-    15: {"emoji": "🥷",  "name": "Slå på tæven",             "genres": ["Martial Arts", "Action"]},
-    16: {"emoji": "🎸",  "name": "Skru op for anlægget",    "genres": ["Musik", "Musical"]},
-    17: {"emoji": "🔫",  "name": "Tilbage til skyttegraven","genres": ["Krig", "Historie", "War & Politics"]},
-}
-
-WATCH_PAGES: dict[int, list[int]] = {
-    1: [1, 2, 3, 4, 5, 6],
-    2: [7, 8, 9, 10, 11, 12],
-    3: [13, 14, 15, 16, 17],
-}
-TOTAL_PAGES = 3
+# Header-tekster i de forskellige trin
+TRIN2_HEADER = "🍿 *Find en film*\n\nVælg en stemning 👇"
+TRIN3_HEADER_TPL = "{label}\n\nVælg en undergenre 👇"
 
 
 def _build_main_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Persistent bundknap — vises i bunden af chatten."""
     return ReplyKeyboardMarkup(
         [[KeyboardButton(WATCH_FLOW_TRIGGER)]],
         resize_keyboard=True,
@@ -145,132 +143,501 @@ def _build_main_reply_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def _get_watch_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
-    if "watch_flow" not in context.user_data:
-        context.user_data["watch_flow"] = {
-            "media_type":     None,
-            "selected_moods": [],
-            "page":           1,
-        }
-    return context.user_data["watch_flow"]
+# ══════════════════════════════════════════════════════════════════════════════
+# Watch Flow keyboards — bygges fra subgenre_service data
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-def _clear_watch_state(context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.pop("watch_flow", None)
-
-
-def _build_type_selection_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🎬 Film",   callback_data="watch_type:movie"),
-            InlineKeyboardButton("📺 Serie",  callback_data="watch_type:tv"),
-        ],
-        [InlineKeyboardButton("🎲 Overrask mig!", callback_data="watch_type:surprise")],
-        [InlineKeyboardButton("❌ Afbryd",        callback_data="watch_cancel")],
-    ])
-
-
-def _build_mood_keyboard(state: dict) -> InlineKeyboardMarkup:
-    page          = state["page"]
-    selected      = set(state["selected_moods"])
-    media_type    = state["media_type"]
-    mood_ids      = WATCH_PAGES[page]
-
+def _build_categories_keyboard() -> InlineKeyboardMarkup:
+    """
+    Trin 2: 9 hovedkategorier (1 knap pr. række) + Overrask + Afbryd.
+    Callback-data: 'sg_cat:<category_id>' eller 'sg_cat:random'
+    """
     rows: list[list[InlineKeyboardButton]] = []
 
-    row: list[InlineKeyboardButton] = []
-    for mood_id in mood_ids:
-        mood   = WATCH_MOODS[mood_id]
-        prefix = "✅ " if mood_id in selected else ""
-        label  = f"{prefix}{mood['emoji']} {mood['name']}"
-        row.append(InlineKeyboardButton(label, callback_data=f"watch_mood:{mood_id}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+    for cat in get_all_categories():
+        rows.append([
+            InlineKeyboardButton(cat["label"], callback_data=f"sg_cat:{cat['id']}")
+        ])
 
-    nav_row: list[InlineKeyboardButton] = []
-    if page > 1:
-        nav_row.append(InlineKeyboardButton("⬅️ Forrige", callback_data=f"watch_page:{page-1}"))
-    if page < TOTAL_PAGES:
-        nav_row.append(InlineKeyboardButton("Næste ➡️",   callback_data=f"watch_page:{page+1}"))
-    if nav_row:
-        rows.append(nav_row)
-
-    if selected:
-        search_btn = InlineKeyboardButton("🚀 Søg nu!", callback_data="watch_search")
-    else:
-        search_btn = InlineKeyboardButton("🔒 Vælg en stemning", callback_data="watch_noop")
+    # Bundrække: Overrask + Afbryd
     rows.append([
-        search_btn,
-        InlineKeyboardButton("🎲 Overrask mig!", callback_data="watch_surprise"),
+        InlineKeyboardButton("🎲 Overrask mig", callback_data="sg_cat:random"),
     ])
-
-    rows.append([InlineKeyboardButton("❌ Afbryd", callback_data="watch_cancel")])
+    rows.append([
+        InlineKeyboardButton("❌ Afbryd", callback_data="sg_cancel"),
+    ])
 
     return InlineKeyboardMarkup(rows)
 
 
-def _build_mood_message_text(state: dict) -> str:
-    media_label = "🎬 *Film*" if state["media_type"] == "movie" else "📺 *Serie*"
-    selected    = state["selected_moods"]
-    page        = state["page"]
+def _build_subgenres_keyboard(category_id: str) -> InlineKeyboardMarkup:
+    """
+    Trin 3: 3-6 subgenrer i denne kategori (1 knap pr. række)
+    + Overrask (random subgenre i samme kasse) + Tilbage + Afbryd.
+    """
+    cat = get_category(category_id)
+    rows: list[list[InlineKeyboardButton]] = []
 
-    if not selected:
-        status = "_Vælg op til 2 stemninger_"
+    if cat:
+        for sub in cat["subgenres"]:
+            rows.append([
+                InlineKeyboardButton(sub["label"], callback_data=f"sg_pick:{sub['id']}")
+            ])
+
+    # Bundrække
+    rows.append([
+        InlineKeyboardButton(
+            "🎲 Overrask mig (i denne kategori)",
+            callback_data=f"sg_random:{category_id}",
+        )
+    ])
+    rows.append([
+        InlineKeyboardButton("⬅️ Tilbage", callback_data="sg_back:cats"),
+        InlineKeyboardButton("❌ Afbryd",   callback_data="sg_cancel"),
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_results_keyboard(subgenre_id: str, has_results: bool) -> InlineKeyboardMarkup:
+    """
+    Trin 4: Actions efter resultater.
+
+    Hvis der er resultater:
+      🔄 5 nye forslag / ⏭️ Næste subgenre / ⬅️ Tilbage / ❌ Færdig
+
+    Hvis der INGEN resultater er (alle set):
+      ⏭️ Næste subgenre / ⬅️ Tilbage / ❌ Færdig
+    """
+    cat_id = get_category_for_subgenre(subgenre_id) or "comedy"
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if has_results:
+        rows.append([
+            InlineKeyboardButton(
+                "🔄 5 nye forslag",
+                callback_data=f"sg_refresh:{subgenre_id}",
+            ),
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            "⏭️ Næste subgenre",
+            callback_data=f"sg_next:{cat_id}",
+        ),
+    ])
+    rows.append([
+        InlineKeyboardButton(
+            "⬅️ Tilbage til kategorier",
+            callback_data="sg_back:cats",
+        ),
+    ])
+    rows.append([
+        InlineKeyboardButton("❌ Færdig", callback_data="sg_cancel"),
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Result formatting — fra find_unwatched_v2 dict til Markdown-besked
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _format_results_message(result: dict) -> tuple[str, bool]:
+    """
+    Format find_unwatched_v2 resultat som Markdown-besked.
+
+    Returns:
+      (message_text, has_results)
+
+    Edge cases:
+      - status='error': fejl-besked
+      - status='missing' med stats.unwatched=0: 'godt gået'-besked
+      - status='ok' med <5 forslag: 'kun X forslag'-advarsel
+      - status='ok' med 5 forslag: normal liste
+    """
+    status         = result.get("status")
+    subgenre_label = result.get("subgenre_label", "?")
+    stats          = result.get("stats", {}) or {}
+    unwatched      = stats.get("unwatched", 0)
+
+    # ── Error case ─────────────────────────────────────────────────────────────
+    if status == "error":
+        return (
+            f"❌ Hov, noget gik galt!\n\n"
+            f"`{result.get('message', 'Ukendt fejl')}`\n\n"
+            f"Prøv en anden subgenre.",
+            False,
+        )
+
+    # ── Missing case (alle set ELLER ingen kandidater) ─────────────────────────
+    if status == "missing":
+        if stats.get("in_plex", 0) == 0:
+            # Ingen film i Plex matcher — det er sjældent men mulige edge case
+            return (
+                f"😕 Hmm, jeg kunne ikke finde nogen film der matcher "
+                f"*{subgenre_label}* i dit bibliotek.\n\n"
+                f"_Prøv en anden subgenre._",
+                False,
+            )
+        # Alle film i denne subgenre er allerede set
+        return (
+            f"🎉 *Du har set ALT i {subgenre_label} — godt gået!*\n\n"
+            f"_Prøv en anden subgenre._",
+            False,
+        )
+
+    # ── Success case ───────────────────────────────────────────────────────────
+    results = result.get("results", []) or []
+    if not results:
+        return (
+            f"🎉 *Du har set ALT i {subgenre_label} — godt gået!*\n\n"
+            f"_Prøv en anden subgenre._",
+            False,
+        )
+
+    lines = [f"*{subgenre_label}*", ""]
+
+    # Advarsel hvis færre end 5 forslag
+    if len(results) < 5:
+        lines.append(
+            f"⚠️ _Du har set det meste — kun {len(results)} forslag her_"
+        )
+        lines.append("")
+
+    for film in results:
+        title   = film.get("title") or "Ukendt"
+        year    = film.get("year")
+        rating  = film.get("rating")
+        tmdb_id = film.get("tmdb_id")
+
+        year_str   = f" ({year})" if year else ""
+        rating_str = f" ⭐ {rating:.1f}" if rating else ""
+        info_link  = f"\n   /info_movie_{tmdb_id}" if tmdb_id else ""
+
+        lines.append(f"🟢 *{title}*{year_str}{rating_str}{info_link}")
+        lines.append("")  # tom linje mellem film for læsbarhed
+
+    # Fjern sidste tomme linje før footer
+    if lines and lines[-1] == "":
+        lines.pop()
+
+    # Diskret stats nederst
+    lines.append("")
+    lines.append(f"_{unwatched} usete i denne kategori_")
+
+    return ("\n".join(lines), True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Watch Flow trigger + handlers (NY v0.11.0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_watch_flow_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Trin 1 → Trin 2: Bruger trykkede '🍿 Hvad skal jeg se?'
+    Vis kategori-keyboardet.
+    """
+    if not await _guard(update):
+        return
+
+    user = update.effective_user
+    await database.log_message(user.id, "incoming", WATCH_FLOW_TRIGGER)
+
+    if await _needs_plex_setup(update):
+        return
+
+    await update.message.reply_text(
+        TRIN2_HEADER,
+        parse_mode="Markdown",
+        reply_markup=_build_categories_keyboard(),
+    )
+    logger.info("Watch flow startet for telegram_id=%s", user.id)
+
+
+async def handle_subgenre_category_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Trin 2 → Trin 3: Bruger valgte en kategori.
+    Vis subgenre-keyboardet for den valgte kategori.
+
+    Specialcase: 'sg_cat:random' → vælg random kategori og vis dens subgenrer.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    if not await _guard(update):
+        return
+
+    payload = query.data.split(":", 1)[1]
+
+    # 🎲 Overrask mig på kategori-niveau
+    if payload == "random":
+        category_id = random.choice(list(SUBGENRE_CATEGORIES.keys()))
+        logger.info("Watch flow: random kategori valgt → '%s'", category_id)
     else:
-        names = [f"{WATCH_MOODS[m]['emoji']} {WATCH_MOODS[m]['name']}" for m in selected]
-        status = f"_Valgt:_ {', '.join(names)} ({len(selected)}/{MAX_MOODS})"
+        category_id = payload
 
-    return (
-        f"{media_label} — hvilken stemning er du i?\n\n"
-        f"{status}\n\n"
-        f"_Side {page} af {TOTAL_PAGES}_"
+    cat = get_category(category_id)
+    if cat is None:
+        logger.warning("handle_subgenre_category_callback: ukendt category_id='%s'", category_id)
+        await query.answer("Den kategori findes ikke", show_alert=True)
+        return
+
+    try:
+        await query.edit_message_text(
+            text=TRIN3_HEADER_TPL.format(label=f"*{cat['label']}*"),
+            parse_mode="Markdown",
+            reply_markup=_build_subgenres_keyboard(category_id),
+        )
+    except Exception as e:
+        logger.warning("handle_subgenre_category_callback edit fejl: %s", e)
+
+
+async def handle_subgenre_pick_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Trin 3 → Trin 4: Bruger valgte en specifik subgenre.
+    Kald find_unwatched_v2 og vis 5 forslag.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    if not await _guard(update):
+        return
+
+    subgenre_id = query.data.split(":", 1)[1]
+
+    if not validate_subgenre_id(subgenre_id):
+        logger.warning("handle_subgenre_pick_callback: ukendt subgenre_id='%s'", subgenre_id)
+        await query.answer("Den subgenre findes ikke", show_alert=True)
+        return
+
+    await _execute_subgenre_search(update, context, subgenre_id, edit_message=True)
+
+
+async def handle_subgenre_random_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Trin 3 special: Bruger trykkede '🎲 Overrask mig (i denne kategori)'.
+    Vælg random subgenre i kategorien og vis forslag.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    if not await _guard(update):
+        return
+
+    category_id = query.data.split(":", 1)[1]
+    cat = get_category(category_id)
+    if cat is None or not cat["subgenres"]:
+        await query.answer("Den kategori er tom", show_alert=True)
+        return
+
+    subgenre_id = random.choice([s["id"] for s in cat["subgenres"]])
+    logger.info(
+        "Watch flow: random subgenre i kategori '%s' → '%s'",
+        category_id, subgenre_id,
     )
 
+    await _execute_subgenre_search(update, context, subgenre_id, edit_message=True)
 
-def _build_watch_prompt(state: dict, mode: str) -> str:
-    media_type = state.get("media_type")
-    media_word = "film" if media_type == "movie" else ("serier" if media_type == "tv" else "film eller serier")
 
-    if mode == "search":
-        all_genres: list[str] = []
-        for mood_id in state["selected_moods"]:
-            for g in WATCH_MOODS[mood_id]["genres"]:
-                if g not in all_genres:
-                    all_genres.append(g)
+async def handle_subgenre_refresh_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Trin 4 action: '🔄 5 nye forslag' — kald find_unwatched_v2 igen
+    for samme subgenre. Smart-blanding sikrer nye film hver gang.
+    """
+    query = update.callback_query
+    await query.answer("🔄 Henter nye forslag...")
 
-        genre_list = "\n".join(f"- {g}" for g in all_genres)
-        media_arg  = "movie" if media_type == "movie" else "tv"
+    if not await _guard(update):
+        return
 
-        return (
-            f"Brugeren vil have anbefalinger til {media_word} fra disse genrer:\n"
-            f"{genre_list}\n\n"
-            f"VIGTIGT — gør PRÆCIS dette:\n"
-            f"1. Kald find_unwatched ÉN GANG PER GENRE — separate parallelle kald. "
-            f"Hvert kald skal have media_type='{media_arg}' og genre=<præcis ét genre-navn fra listen>. "
-            f"Send ALDRIG flere genrer som komma-separeret streng — det fejler.\n"
-            f"2. Når du har resultaterne, vælg de 4-5 bedste {media_word} på tværs af alle "
-            f"resultat-sættene.\n"
-            f"3. Vis dem i ✅-listeformat med klikbare /info_movie_X eller /info_tv_X links "
-            f"og en kort begrundelse for hver. Svar i din persona — kort, præcis, venlig."
+    subgenre_id = query.data.split(":", 1)[1]
+
+    if not validate_subgenre_id(subgenre_id):
+        await query.answer("Den subgenre findes ikke", show_alert=True)
+        return
+
+    await _execute_subgenre_search(update, context, subgenre_id, edit_message=True)
+
+
+async def handle_subgenre_next_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Trin 4 action: '⏭️ Næste subgenre' — vælg en ANDEN random subgenre
+    i samme kategori. Vis kategori-keyboardet hvis kun én subgenre.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    if not await _guard(update):
+        return
+
+    category_id = query.data.split(":", 1)[1]
+    cat = get_category(category_id)
+
+    if cat is None or len(cat["subgenres"]) < 2:
+        # Kun én subgenre i kategorien — gå tilbage til kategorier
+        await query.edit_message_text(
+            text=TRIN2_HEADER,
+            parse_mode="Markdown",
+            reply_markup=_build_categories_keyboard(),
         )
+        return
 
-    if mode == "surprise":
-        return (
-            f"Find 4-5 tilfældige, fremragende skjulte perler blandt {media_word} på Plex, "
-            f"som brugeren ikke har set endnu. Sælg dem godt med en kort, fængende "
-            f"begrundelse. Brug ✅-listeformat med klikbare /info_movie_X eller "
-            f"/info_tv_X links."
+    # Vi vil gerne vise kategorien igen så brugeren ser alle subgenrerne
+    # — det giver mere kontrol end at hoppe direkte til en random.
+    try:
+        await query.edit_message_text(
+            text=TRIN3_HEADER_TPL.format(label=f"*{cat['label']}*"),
+            parse_mode="Markdown",
+            reply_markup=_build_subgenres_keyboard(category_id),
         )
+    except Exception as e:
+        logger.warning("handle_subgenre_next_callback edit fejl: %s", e)
 
-    return (
-        "Find 4-5 tilfældige, fremragende skjulte perler på Plex (både film og serier "
-        "er fint), som brugeren ikke har set endnu. Sælg dem godt med en kort, fængende "
-        "begrundelse. Brug ✅-listeformat med klikbare /info_movie_X eller "
-        "/info_tv_X links."
+
+async def handle_subgenre_back_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Trin 3/4 action: '⬅️ Tilbage til kategorier' — vis kategori-keyboard.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    if not await _guard(update):
+        return
+
+    try:
+        await query.edit_message_text(
+            text=TRIN2_HEADER,
+            parse_mode="Markdown",
+            reply_markup=_build_categories_keyboard(),
+        )
+    except Exception as e:
+        logger.warning("handle_subgenre_back_callback edit fejl: %s", e)
+
+
+async def handle_subgenre_cancel_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    '❌ Afbryd' eller '❌ Færdig' — luk flowet.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        await query.edit_message_text(
+            "Tryk på 🍿-knappen igen når du vil have hjælp. 👍"
+        )
+    except Exception as e:
+        logger.warning("handle_subgenre_cancel_callback edit fejl: %s", e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Watch Flow shared logic — kald find_unwatched_v2 og render
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _execute_subgenre_search(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    subgenre_id: str,
+    edit_message: bool = True,
+) -> None:
+    """
+    Fælles logik for alle veje der ender i et v2-kald:
+      - handle_subgenre_pick_callback
+      - handle_subgenre_random_callback
+      - handle_subgenre_refresh_callback
+
+    Kalder find_unwatched_v2, formaterer resultatet og opdaterer beskeden.
+    Viser loading-tekst undervejs.
+    """
+    query = update.callback_query
+    user  = query.from_user
+    chat  = query.message.chat
+
+    # Loading-state — opdater beskeden med "henter..."
+    sub = get_subgenre(subgenre_id)
+    sub_label = sub["label"] if sub else subgenre_id
+
+    try:
+        await query.edit_message_text(
+            f"{sub_label}\n\n🤖 Beregner svar med lynets hast... næsten...",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+    # Hent plex_username
+    plex_username = await database.get_plex_username(user.id)
+
+    # Kald v2-funktionen
+    try:
+        result = await find_unwatched_v2(
+            subgenre_id=subgenre_id,
+            plex_username=plex_username,
+            limit=5,
+        )
+    except Exception as e:
+        logger.error("_execute_subgenre_search fejl for '%s': %s", subgenre_id, e)
+        try:
+            await query.edit_message_text(
+                f"❌ Hov, noget gik galt: `{e}`\n\nPrøv en anden subgenre.",
+                parse_mode="Markdown",
+                reply_markup=_build_results_keyboard(subgenre_id, has_results=False),
+            )
+        except Exception:
+            pass
+        return
+
+    # Format resultat
+    message_text, has_results = _format_results_message(result)
+    keyboard = _build_results_keyboard(subgenre_id, has_results=has_results)
+
+    # Log brugeraktivitet
+    await database.log_message(
+        user.id,
+        "incoming",
+        f"[watch_flow] subgenre={subgenre_id}",
     )
+    stats = result.get("stats", {}) or {}
+    await database.log_message(
+        user.id,
+        "outgoing",
+        f"[watch_flow] {subgenre_id} → "
+        f"{stats.get('returned', 0)} forslag (af {stats.get('unwatched', 0)} usete)",
+    )
+
+    # Opdater beskeden med resultater
+    try:
+        # Markdown kan fejle ved specielle tegn — escape underscores i URL'er
+        safe_text = escape_markdown(message_text)
+        await query.edit_message_text(
+            text=safe_text,
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        logger.warning("_execute_subgenre_search edit fejl: %s — sender plain", e)
+        try:
+            plain = message_text.replace("*", "").replace("_", "").replace("`", "")
+            await query.edit_message_text(
+                text=plain,
+                reply_markup=keyboard,
+            )
+        except Exception as e2:
+            logger.error("_execute_subgenre_search fallback fejl: %s", e2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -556,7 +923,7 @@ async def cmd_dump_genres(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# /test_metadata — uændret fra v0.10.5
+# /test_metadata — uændret
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _format_metadata_report(meta: dict) -> str:
@@ -735,7 +1102,7 @@ async def cmd_test_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Step 2 admin-kommandoer (uændret fra v0.10.6)
+# Step 2 admin-kommandoer (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _scan_plex_for_seeding_sync() -> list[dict]:
@@ -1054,7 +1421,7 @@ async def cmd_metadata_status(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# /top_keywords — uændret fra v0.10.7
+# /top_keywords — uændret
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_top_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1336,24 +1703,10 @@ async def _cmd_top_keywords_dump(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# /test_v2 — Engangs admin DEBUG-kommando (NY v0.10.8)
+# /test_v2 — admin DEBUG-kommando (uændret fra v0.10.8)
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# Tester hele kæden:
-#   1. subgenre_service.SUBGENRES → keywords
-#   2. database.find_films_by_subgenre → DB-kandidater
-#   3. v2_service._build_plex_movie_index → Plex cross-check
-#   4. v2_service._enrich_and_filter_sync → unwatched-filter + sample
-#
-# Brug:
-#   /test_v2 list                     → vis alle 36 subgenre-IDs grupperet pr. kategori
-#   /test_v2 horror_slasher           → test specifik subgenre
-#   /test_v2 special_revenge          → ...
-#
-# Admin-only — slettes når Etape 4 er færdig.
 
 def _format_subgenre_list() -> str:
-    """Bygg pæn oversigt af alle 36 subgenre-IDs grupperet pr. kategori."""
     lines = [
         "📋 *Alle subgenre-IDs*",
         "═══════════════════════",
@@ -1370,17 +1723,14 @@ def _format_subgenre_list() -> str:
 
 
 def _format_v2_result(result: dict) -> str:
-    """Format find_unwatched_v2 result som pæn Markdown-besked."""
     status = result.get("status")
 
-    # ── Error cases ───────────────────────────────────────────────────────────
     if status == "error":
         return (
             f"❌ *Fejl*\n\n"
             f"`{result.get('message', 'Ukendt fejl')}`"
         )
 
-    # ── Missing case (ingen usete film) ───────────────────────────────────────
     if status == "missing":
         label = result.get("subgenre_label", "?")
         stats = result.get("stats", {})
@@ -1399,7 +1749,6 @@ def _format_v2_result(result: dict) -> str:
             f"  • TMDB cachen mangler endnu"
         )
 
-    # ── Success case (ok med results) ─────────────────────────────────────────
     label    = result.get("subgenre_label", "?")
     sub_id   = result.get("subgenre", "?")
     stats    = result.get("stats", {})
@@ -1439,14 +1788,6 @@ def _format_v2_result(result: dict) -> str:
 
 
 async def cmd_test_v2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Engangs admin-kommando: /test_v2
-    Tester find_unwatched_v2 fra services/v2_service.py.
-
-    Modi:
-      /test_v2 list                  → vis alle 36 subgenre-IDs
-      /test_v2 <subgenre_id>         → test specifik subgenre
-    """
     user = update.effective_user
     if user is None or user.id != config.ADMIN_TELEGRAM_ID:
         return
@@ -1465,10 +1806,8 @@ async def cmd_test_v2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # ── Mode 1: list ──────────────────────────────────────────────────────────
     if args[0].lower() == "list":
         report = _format_subgenre_list()
-        # Split i chunks hvis for langt (Telegram har ~4000 tegn limit)
         if len(report) > 3500:
             mid = len(report) // 2
             split_at = report.rfind("\n", 0, mid)
@@ -1479,11 +1818,9 @@ async def cmd_test_v2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text(report, parse_mode="Markdown")
         return
 
-    # ── Mode 2: test specifik subgenre ────────────────────────────────────────
     subgenre_id = args[0].lower().strip()
 
     if not validate_subgenre_id(subgenre_id):
-        # Foreslå nærmeste matches
         all_ids = list_subgenre_ids()
         suggestions = [sid for sid in all_ids if subgenre_id in sid or sid.startswith(subgenre_id[:4])][:5]
         suggestion_text = ""
@@ -1498,7 +1835,6 @@ async def cmd_test_v2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # Hent plex_username fra DB
     plex_username = await database.get_plex_username(user.id)
 
     await update.message.chat.send_action("typing")
@@ -1614,7 +1950,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     user = update.effective_user
     clear_history(user.id)
-    _clear_watch_state(context)
     await database.log_message(user.id, "incoming", "/start")
     if await _needs_plex_setup(update):
         return
@@ -1644,191 +1979,6 @@ async def cmd_skift_plex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "Intet problem! 👌\nSkriv dit nye *Plex-brugernavn* herunder:",
         parse_mode="Markdown",
     )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 'Hvad skal jeg se?' callbacks (uændret)
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def handle_watch_flow_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _guard(update):
-        return
-    user = update.effective_user
-    await database.log_message(user.id, "incoming", WATCH_FLOW_TRIGGER)
-    if await _needs_plex_setup(update):
-        return
-    _clear_watch_state(context)
-    await update.message.reply_text(
-        "🍿 *Hvad skal jeg se?*\n\nVælg hvad du er i humør til:",
-        parse_mode="Markdown",
-        reply_markup=_build_type_selection_keyboard(),
-    )
-    logger.info("Watch flow startet for telegram_id=%s", user.id)
-
-
-async def handle_watch_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    if not await _guard(update):
-        return
-    media_type = query.data.split(":", 1)[1]
-    if media_type == "surprise":
-        state = _get_watch_state(context)
-        prompt = _build_watch_prompt(state, mode="wildcard")
-        await _execute_ai_handoff(update, context, query, prompt)
-        return
-    state = _get_watch_state(context)
-    state["media_type"]     = media_type
-    state["selected_moods"] = []
-    state["page"]           = 1
-    try:
-        await query.edit_message_text(
-            text=_build_mood_message_text(state),
-            parse_mode="Markdown",
-            reply_markup=_build_mood_keyboard(state),
-        )
-    except Exception as e:
-        logger.warning("handle_watch_type_callback edit fejl: %s", e)
-
-
-async def handle_watch_mood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not await _guard(update):
-        await query.answer()
-        return
-    state = _get_watch_state(context)
-    if not state.get("media_type"):
-        await query.answer("Sessionen er udløbet — start forfra med 🍿-knappen.", show_alert=True)
-        return
-    try:
-        mood_id = int(query.data.split(":", 1)[1])
-    except (ValueError, IndexError):
-        await query.answer()
-        return
-    selected: list[int] = state["selected_moods"]
-    if mood_id in selected:
-        selected.remove(mood_id)
-        await query.answer(f"Fjernet {WATCH_MOODS[mood_id]['name']}")
-    elif len(selected) >= MAX_MOODS:
-        await query.answer(
-            f"Du kan kun vælge {MAX_MOODS} stemninger. Fravælg en først.",
-            show_alert=True,
-        )
-        return
-    else:
-        selected.append(mood_id)
-        await query.answer(f"Valgt {WATCH_MOODS[mood_id]['name']}")
-    try:
-        await query.edit_message_text(
-            text=_build_mood_message_text(state),
-            parse_mode="Markdown",
-            reply_markup=_build_mood_keyboard(state),
-        )
-    except Exception as e:
-        logger.warning("handle_watch_mood_callback edit fejl: %s", e)
-
-
-async def handle_watch_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    if not await _guard(update):
-        return
-    state = _get_watch_state(context)
-    if not state.get("media_type"):
-        await query.answer("Sessionen er udløbet — start forfra.", show_alert=True)
-        return
-    try:
-        new_page = int(query.data.split(":", 1)[1])
-    except (ValueError, IndexError):
-        return
-    if new_page not in WATCH_PAGES:
-        return
-    state["page"] = new_page
-    try:
-        await query.edit_message_text(
-            text=_build_mood_message_text(state),
-            parse_mode="Markdown",
-            reply_markup=_build_mood_keyboard(state),
-        )
-    except Exception as e:
-        logger.warning("handle_watch_page_callback edit fejl: %s", e)
-
-
-async def handle_watch_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not await _guard(update):
-        await query.answer()
-        return
-    state = _get_watch_state(context)
-    if not state.get("media_type") or not state.get("selected_moods"):
-        await query.answer("Vælg mindst 1 stemning først.", show_alert=True)
-        return
-    await query.answer()
-    prompt = _build_watch_prompt(state, mode="search")
-    await _execute_ai_handoff(update, context, query, prompt)
-
-
-async def handle_watch_surprise_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    if not await _guard(update):
-        return
-    state = _get_watch_state(context)
-    if not state.get("media_type"):
-        prompt = _build_watch_prompt(state, mode="wildcard")
-    else:
-        prompt = _build_watch_prompt(state, mode="surprise")
-    await _execute_ai_handoff(update, context, query, prompt)
-
-
-async def handle_watch_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    _clear_watch_state(context)
-    try:
-        await query.edit_message_text("Aflyst. Tryk på 🍿-knappen igen når du vil have hjælp. 👍")
-    except Exception as e:
-        logger.warning("handle_watch_cancel_callback edit fejl: %s", e)
-
-
-async def handle_watch_noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer("Vælg mindst 1 stemning først 👇", show_alert=False)
-
-
-async def _execute_ai_handoff(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    query,
-    prompt: str,
-) -> None:
-    user        = update.effective_user
-    chat        = query.message.chat
-    state_snapshot = dict(_get_watch_state(context))
-    _clear_watch_state(context)
-    try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    await chat.send_action("typing")
-    loading_msg = await chat.send_message(
-        "🤖 Beregner svar med lynets hast... næsten...",
-    )
-    plex_username = await database.get_plex_username(user.id)
-    persona_id    = await database.get_persona(user.id)
-    await database.log_message(user.id, "incoming", f"[watch_flow] {prompt[:100]}…")
-    reply = await get_ai_response(
-        telegram_id=user.id,
-        user_message=prompt,
-        plex_username=plex_username,
-        persona_id=persona_id,
-        user_first_name=user.first_name,
-    )
-    try:
-        await loading_msg.delete()
-    except Exception:
-        pass
-    await _process_ai_reply(update, context, chat, user, plex_username, reply)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2151,11 +2301,10 @@ async def on_startup(application: Application) -> None:
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — v0.10.8-beta | "
-        "søgeresultater-UX: JA | foto-fix: JA | watch-flow: JA | "
-        "watch-genre-split-fix: JA | genres-cmd: JA | dump-genres-cmd: JA | "
-        "test-metadata-cmd: JA | tmdb-metadata-cache: JA | "
-        "top-keywords-dump: JA | test-v2-cmd: JA"
+        "VERSION CHECK — v0.11.0-beta | "
+        "subgenre-watch-flow: JA | tmdb-metadata-cache: JA | "
+        "find-unwatched-v2: JA | test-v2-cmd: JA | "
+        "top-keywords-dump: JA | gammel-watch-moods: SLETTET"
     )
 
 
@@ -2185,26 +2334,26 @@ def main() -> None:
     app.add_handler(CommandHandler("dump_genres",     cmd_dump_genres))
     app.add_handler(CommandHandler("test_metadata",   cmd_test_metadata))
 
-    # Step 2 admin-kommandoer
+    # TMDB metadata-cache admin-kommandoer
     app.add_handler(CommandHandler("seed_metadata",   cmd_seed_metadata))
     app.add_handler(CommandHandler("fetch_metadata",  cmd_fetch_metadata))
     app.add_handler(CommandHandler("metadata_status", cmd_metadata_status))
     app.add_handler(CommandHandler("top_keywords",    cmd_top_keywords))
 
-    # Etape 2 debug-kommando (NY v0.10.8)
+    # Etape 2 debug-kommando
     app.add_handler(CommandHandler("test_v2",         cmd_test_v2))
 
     # Admin approval
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve_user:\d+$"))
 
-    # 'Hvad skal jeg se?' flow
-    app.add_handler(CallbackQueryHandler(handle_watch_type_callback,     pattern=r"^watch_type:"))
-    app.add_handler(CallbackQueryHandler(handle_watch_mood_callback,     pattern=r"^watch_mood:"))
-    app.add_handler(CallbackQueryHandler(handle_watch_page_callback,     pattern=r"^watch_page:"))
-    app.add_handler(CallbackQueryHandler(handle_watch_search_callback,   pattern=r"^watch_search$"))
-    app.add_handler(CallbackQueryHandler(handle_watch_surprise_callback, pattern=r"^watch_surprise$"))
-    app.add_handler(CallbackQueryHandler(handle_watch_cancel_callback,   pattern=r"^watch_cancel$"))
-    app.add_handler(CallbackQueryHandler(handle_watch_noop_callback,     pattern=r"^watch_noop$"))
+    # ── NYT Watch Flow (Etape 3 — v0.11.0) ──────────────────────────────────
+    app.add_handler(CallbackQueryHandler(handle_subgenre_category_callback, pattern=r"^sg_cat:"))
+    app.add_handler(CallbackQueryHandler(handle_subgenre_pick_callback,     pattern=r"^sg_pick:"))
+    app.add_handler(CallbackQueryHandler(handle_subgenre_random_callback,   pattern=r"^sg_random:"))
+    app.add_handler(CallbackQueryHandler(handle_subgenre_refresh_callback,  pattern=r"^sg_refresh:"))
+    app.add_handler(CallbackQueryHandler(handle_subgenre_next_callback,     pattern=r"^sg_next:"))
+    app.add_handler(CallbackQueryHandler(handle_subgenre_back_callback,     pattern=r"^sg_back:"))
+    app.add_handler(CallbackQueryHandler(handle_subgenre_cancel_callback,   pattern=r"^sg_cancel$"))
 
     # Bestillingsflow
     app.add_handler(CallbackQueryHandler(handle_pick_callback,      pattern=r"^pick:"))
