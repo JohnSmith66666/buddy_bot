@@ -1,18 +1,28 @@
 """
 main.py - Buddy bot entry point.
 
-CHANGES vs previous version (v0.9.8 — Annuller-knap photo-fix):
-  - BUG FIX: handle_cancel_callback brugte query.edit_message_text() som
-    fejler på photo-beskeder (infokort med poster). Resultat: brugeren
-    fik "Hov, jeg fik vist popcorn galt i halsen!" ved tryk på ❌ Annuller.
-    Fixet: Detekterer nu om beskeden er photo, og bruger
-    edit_message_caption() i så fald. Robust fallback hvis edit fejler.
-  - VERSION CHECK opdateret til v0.9.8-beta.
+CHANGES vs previous version (v0.10.0 — 'Hvad skal jeg se?' interaktivt flow):
+  - NY FEATURE: Stemnings-baseret browse-flow med pagination.
+    * Fast ReplyKeyboard-knap '🍿 Hvad skal jeg se?' tilføjet til cmd_start
+      og _handle_plex_input (efter onboarding).
+    * Inline keyboard-flow: vælg type (Film/Serie/Overrask mig) → vælg op til
+      2 stemninger på tværs af 3 sider → 🚀 Søg nu! eller 🎲 Overrask mig.
+    * 17 stemninger mappet til Plex-genrer i WATCH_MOODS-tabellen.
+    * State management via context.user_data["watch_flow"] (in-memory, per user).
+    * 🚀 Søg nu! er disabled (vises som '🔒 Vælg en stemning') indtil mindst
+      1 stemning er valgt.
+    * Valgte stemninger markeres med '✅' præfiks.
+    * Pagination: side 1 = stemninger 1-6, side 2 = 7-12, side 3 = 13-17.
+    * AI handoff: build_watch_prompt() bygger en kontekst-prompt og sender
+      til get_ai_response (samme path som handle_text — bevarer signal-parsing
+      til SHOW_INFO/TRAILER/SEARCH_RESULTS).
+  - VERSION CHECK opdateret til v0.10.0-beta.
+
+UNCHANGED (v0.9.8 — Annuller-knap photo-fix):
+  - handle_cancel_callback bruger edit_message_caption() for photo-beskeder.
 
 UNCHANGED (v0.9.7 — søgeresultater UX-fix):
-  - Tilføjet handle_back_callback: håndterer ⬅️ Tilbage-knappen i søgeresultatlisten.
-    Henter søgeterm og media_type fra pending_request og viser listen igen.
-  - Registreret back:-handler i main() under bestillingsflow.
+  - handle_back_callback: ⬅️ Tilbage-knap i søgeresultatlisten.
 
 Tidligere ændringer (bevares):
   - v0.9.5: user_first_name sendes til get_ai_response.
@@ -29,7 +39,14 @@ import sys
 import traceback
 from aiohttp import web
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -65,6 +82,216 @@ logger = logging.getLogger(__name__)
 _URL_RE = re.compile(r"(https?://[^\s)\]>\"]+)")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 'HVAD SKAL JEG SE?' — Konstanter og helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Tekst på fast ReplyKeyboard-knap. Også brugt som trigger i MessageHandler.
+WATCH_FLOW_TRIGGER = "🍿 Hvad skal jeg se?"
+
+# Max antal stemninger brugeren må vælge på tværs af alle sider
+MAX_MOODS = 2
+
+# Stemnings-katalog. ID 1-17. Hver stemning mapper til 1+ Plex-genrer.
+# Genre-navne skal matche Plex-bibliotekets genre-tags (på dansk).
+WATCH_MOODS: dict[int, dict] = {
+    1:  {"emoji": "🛋️",  "name": "Netflix and Chill",       "genres": ["Komedie", "Romantik"]},
+    2:  {"emoji": "😂",  "name": "Grin til jeg græder",     "genres": ["Komedie"]},
+    3:  {"emoji": "💥",  "name": "Hjernedød Action",        "genres": ["Action", "Action/Eventyr"]},
+    4:  {"emoji": "😱",  "name": "Gem mig bag puden",       "genres": ["Gyser", "Suspense"]},
+    5:  {"emoji": "🤯",  "name": "Mindfuck",                 "genres": ["Mysterium", "Sci-fi", "Thriller"]},
+    6:  {"emoji": "😭",  "name": "Find lommetørklædet",     "genres": ["Drama"]},
+    7:  {"emoji": "🕵️", "name": "Hvem gjorde det?",         "genres": ["Kriminalitet", "Mysterium"]},
+    8:  {"emoji": "❤️",  "name": "Kærlighed & Kliché",      "genres": ["Romantik", "Komedie"]},
+    9:  {"emoji": "🧸",  "name": "Ungerne styrer",           "genres": ["Familie", "Children", "Animation"]},
+    10: {"emoji": "🐉",  "name": "Væk fra virkeligheden",   "genres": ["Fantasy", "Adventure", "Sci-Fi & Fantasy"]},
+    11: {"emoji": "🍷",  "name": "Snobbet Mesterværk",       "genres": ["Drama", "Biography"]},
+    12: {"emoji": "🧠",  "name": "Gør mig klogere",          "genres": ["Documentary", "Historie"]},
+    13: {"emoji": "🎇",  "name": "Visuelt festfyrværkeri",  "genres": ["Action", "Sci-fi", "Fantasy"]},
+    14: {"emoji": "🔪",  "name": "Mørkt og sandt",           "genres": ["Crime", "Documentary"]},
+    15: {"emoji": "🥷",  "name": "Slå på tæven",             "genres": ["Martial Arts", "Action"]},
+    16: {"emoji": "🎸",  "name": "Skru op for anlægget",    "genres": ["Musik", "Musical"]},
+    17: {"emoji": "🔫",  "name": "Tilbage til skyttegraven","genres": ["Krig", "Historie", "War & Politics"]},
+}
+
+# Pagination: hvilken stemning er på hvilken side
+WATCH_PAGES: dict[int, list[int]] = {
+    1: [1, 2, 3, 4, 5, 6],
+    2: [7, 8, 9, 10, 11, 12],
+    3: [13, 14, 15, 16, 17],
+}
+TOTAL_PAGES = 3
+
+
+def _build_main_reply_keyboard() -> ReplyKeyboardMarkup:
+    """
+    Permanent ReplyKeyboard nederst i Telegram-vinduet.
+    Vises efter onboarding er færdig og ved /start.
+    """
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(WATCH_FLOW_TRIGGER)]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def _get_watch_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """
+    Hent (eller initialiser) brugerens 'watch flow' state i context.user_data.
+    State er in-memory og lever pr. user_id mellem callbacks.
+    """
+    if "watch_flow" not in context.user_data:
+        context.user_data["watch_flow"] = {
+            "media_type":     None,    # 'movie' | 'tv' | None
+            "selected_moods": [],      # liste af mood IDs (max 2)
+            "page":           1,       # aktuel side (1-3)
+        }
+    return context.user_data["watch_flow"]
+
+
+def _clear_watch_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ryd watch flow state — kaldes efter handoff til AI eller ved cancel."""
+    context.user_data.pop("watch_flow", None)
+
+
+def _build_type_selection_keyboard() -> InlineKeyboardMarkup:
+    """Trin 2: vis Film / Serie / Overrask mig som 1. valg."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎬 Film",   callback_data="watch_type:movie"),
+            InlineKeyboardButton("📺 Serie",  callback_data="watch_type:tv"),
+        ],
+        [InlineKeyboardButton("🎲 Overrask mig!", callback_data="watch_type:surprise")],
+        [InlineKeyboardButton("❌ Afbryd",        callback_data="watch_cancel")],
+    ])
+
+
+def _build_mood_keyboard(state: dict) -> InlineKeyboardMarkup:
+    """
+    Trin 3: vis stemnings-knapper for aktuel side + navigation + handoff-knapper.
+
+    Layout per side:
+      Stemninger 2 pr. række (op til 3 rækker på side 1-2, 2 rækker + 1 enkelt på side 3)
+      Navigation:    [⬅️] [➡️]   (kun de relevante)
+      Handoff:       [🚀 Søg nu!]  [🎲 Overrask mig!]
+      Footer:        [❌ Afbryd]
+    """
+    page          = state["page"]
+    selected      = set(state["selected_moods"])
+    media_type    = state["media_type"]   # 'movie' eller 'tv' (aldrig 'surprise' her)
+    mood_ids      = WATCH_PAGES[page]
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    # ── Stemnings-knapper, 2 pr. række ────────────────────────────────────────
+    row: list[InlineKeyboardButton] = []
+    for mood_id in mood_ids:
+        mood   = WATCH_MOODS[mood_id]
+        prefix = "✅ " if mood_id in selected else ""
+        label  = f"{prefix}{mood['emoji']} {mood['name']}"
+        row.append(InlineKeyboardButton(label, callback_data=f"watch_mood:{mood_id}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:  # ulige antal — sidste knap alene
+        rows.append(row)
+
+    # ── Navigation: ⬅️ og/eller ➡️ ────────────────────────────────────────────
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton("⬅️ Forrige", callback_data=f"watch_page:{page-1}"))
+    if page < TOTAL_PAGES:
+        nav_row.append(InlineKeyboardButton("Næste ➡️",   callback_data=f"watch_page:{page+1}"))
+    if nav_row:
+        rows.append(nav_row)
+
+    # ── Handoff: 🚀 Søg nu (disabled hvis ingen stemninger) + 🎲 Overrask ─────
+    if selected:
+        search_btn = InlineKeyboardButton("🚀 Søg nu!", callback_data="watch_search")
+    else:
+        # 'Disabled' vises som låst tekst — callback_data="watch_noop"
+        search_btn = InlineKeyboardButton("🔒 Vælg en stemning", callback_data="watch_noop")
+    rows.append([
+        search_btn,
+        InlineKeyboardButton("🎲 Overrask mig!", callback_data="watch_surprise"),
+    ])
+
+    # ── Footer: ❌ Afbryd ─────────────────────────────────────────────────────
+    rows.append([InlineKeyboardButton("❌ Afbryd", callback_data="watch_cancel")])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_mood_message_text(state: dict) -> str:
+    """
+    Bygger besked-teksten over stemnings-tastaturet.
+    Viser type, antal valgte stemninger og side-info.
+    """
+    media_label = "🎬 *Film*" if state["media_type"] == "movie" else "📺 *Serie*"
+    selected    = state["selected_moods"]
+    page        = state["page"]
+
+    if not selected:
+        status = "_Vælg op til 2 stemninger_"
+    else:
+        names = [f"{WATCH_MOODS[m]['emoji']} {WATCH_MOODS[m]['name']}" for m in selected]
+        status = f"_Valgt:_ {', '.join(names)} ({len(selected)}/{MAX_MOODS})"
+
+    return (
+        f"{media_label} — hvilken stemning er du i?\n\n"
+        f"{status}\n\n"
+        f"_Side {page} af {TOTAL_PAGES}_"
+    )
+
+
+def _build_watch_prompt(state: dict, mode: str) -> str:
+    """
+    Bygger den prompt der sendes til get_ai_response.
+
+    mode='search'    → genre-baseret søgning (4-5 forslag)
+    mode='surprise'  → tilfældig perle (4-5 forslag inden for typen)
+    mode='wildcard'  → tilfældig perle uden type-filter (4-5 forslag, fra hovedmenu)
+    """
+    media_type = state.get("media_type")
+    media_word = "film" if media_type == "movie" else ("serier" if media_type == "tv" else "film eller serier")
+
+    if mode == "search":
+        # Saml unikke genrer fra de valgte stemninger
+        all_genres: list[str] = []
+        for mood_id in state["selected_moods"]:
+            for g in WATCH_MOODS[mood_id]["genres"]:
+                if g not in all_genres:
+                    all_genres.append(g)
+        genre_str = ", ".join(all_genres)
+
+        return (
+            f"Find 4-5 gode {media_word} på serveren inden for genrerne: {genre_str}. "
+            f"Brugeren har ikke set dem endnu. Anbefal med kort begrundelse for hver. "
+            f"Svar i din persona — kort, præcis, venlig. Brug ✅-listeformat med "
+            f"klikbare /info_movie_X eller /info_tv_X links."
+        )
+
+    if mode == "surprise":
+        return (
+            f"Find 4-5 tilfældige, fremragende skjulte perler blandt {media_word} på Plex, "
+            f"som brugeren ikke har set endnu. Sælg dem godt med en kort, fængende "
+            f"begrundelse. Brug ✅-listeformat med klikbare /info_movie_X eller "
+            f"/info_tv_X links."
+        )
+
+    # mode == 'wildcard'
+    return (
+        "Find 4-5 tilfældige, fremragende skjulte perler på Plex (både film og serier "
+        "er fint), som brugeren ikke har set endnu. Sælg dem godt med en kort, fængende "
+        "begrundelse. Brug ✅-listeformat med klikbare /info_movie_X eller "
+        "/info_tv_X links."
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Markdown helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
 def escape_markdown(text: str) -> str:
     """
     Escaper underscores inde i URL'er saa Telegrams Markdown-parser ikke
@@ -80,7 +307,9 @@ def escape_markdown(text: str) -> str:
     return _URL_RE.sub(_escape_url, text)
 
 
-# ── Guards ────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Guards
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def _guard(update: Update) -> bool:
     user = update.effective_user
@@ -111,7 +340,9 @@ async def _needs_plex_setup(update: Update) -> bool:
     return True
 
 
-# ── Plex onboarding ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Plex onboarding
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def _handle_plex_input(update: Update, raw_input: str) -> None:
     user = update.effective_user
@@ -129,17 +360,21 @@ async def _handle_plex_input(update: Update, raw_input: str) -> None:
     await update.message.reply_text(
         f"✅ Perfekt! Du er nu koblet til Plex som *{verified}*.\n\nHvad kan jeg hjælpe dig med? 🚀",
         parse_mode="Markdown",
+        reply_markup=_build_main_reply_keyboard(),
     )
     logger.info("Onboarding complete — telegram_id=%s plex='%s'", user.id, verified)
 
 
-# ── Command handlers ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Command handlers
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update):
         return
     user = update.effective_user
     clear_history(user.id)
+    _clear_watch_state(context)
     await database.log_message(user.id, "incoming", "/start")
     if await _needs_plex_setup(update):
         return
@@ -149,9 +384,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• 🎬 Film og serier i dit Plex-bibliotek\n"
         "• ➕ Bestilling af ny film eller serie\n"
         "• 📺 Hvad der er på vej\n\n"
-        "Hvad kan jeg hjælpe dig med?"
+        "Eller tryk på 🍿 *Hvad skal jeg se?* for at finde noget at se nu!"
     )
-    await update.message.reply_text(reply)
+    await update.message.reply_text(
+        reply,
+        parse_mode="Markdown",
+        reply_markup=_build_main_reply_keyboard(),
+    )
     await database.log_message(user.id, "outgoing", reply)
 
 
@@ -167,7 +406,277 @@ async def cmd_skift_plex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
-# ── Inline Keyboard callbacks ─────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 'Hvad skal jeg se?' — Trin 1: trigger fra fast knap
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_watch_flow_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Triggered når brugeren trykker på 🍿 Hvad skal jeg se?-knappen.
+    Initialiser state og vis type-valget.
+    """
+    if not await _guard(update):
+        return
+
+    user = update.effective_user
+    await database.log_message(user.id, "incoming", WATCH_FLOW_TRIGGER)
+
+    if await _needs_plex_setup(update):
+        return
+
+    # Reset enhver tidligere watch flow state
+    _clear_watch_state(context)
+
+    await update.message.reply_text(
+        "🍿 *Hvad skal jeg se?*\n\nVælg hvad du er i humør til:",
+        parse_mode="Markdown",
+        reply_markup=_build_type_selection_keyboard(),
+    )
+    logger.info("Watch flow startet for telegram_id=%s", user.id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 'Hvad skal jeg se?' — Trin 2: type-valg (Film / Serie / Overrask)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_watch_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Bruger valgte type i trin 2.
+    'movie' / 'tv' → vis stemnings-vælgeren (trin 3, side 1).
+    'surprise'     → spring stemninger over, brug 'wildcard' prompt straks.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    if not await _guard(update):
+        return
+
+    media_type = query.data.split(":", 1)[1]   # 'movie', 'tv' eller 'surprise'
+
+    if media_type == "surprise":
+        # Helt vild — ingen type, ingen stemning
+        state = _get_watch_state(context)
+        prompt = _build_watch_prompt(state, mode="wildcard")
+        await _execute_ai_handoff(update, context, query, prompt)
+        return
+
+    # Init state for stemnings-flow
+    state = _get_watch_state(context)
+    state["media_type"]     = media_type
+    state["selected_moods"] = []
+    state["page"]           = 1
+
+    try:
+        await query.edit_message_text(
+            text=_build_mood_message_text(state),
+            parse_mode="Markdown",
+            reply_markup=_build_mood_keyboard(state),
+        )
+    except Exception as e:
+        logger.warning("handle_watch_type_callback edit fejl: %s", e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 'Hvad skal jeg se?' — Trin 3a: toggle stemning
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_watch_mood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Toggle valgt stemning. Max MAX_MOODS valgte ad gangen.
+    Hvis bruger trykker på en allerede valgt → fjern den.
+    Hvis bruger trykker på en ny mens MAX_MOODS er nået → vis info-popup.
+    """
+    query = update.callback_query
+
+    if not await _guard(update):
+        await query.answer()
+        return
+
+    state = _get_watch_state(context)
+    if not state.get("media_type"):
+        await query.answer("Sessionen er udløbet — start forfra med 🍿-knappen.", show_alert=True)
+        return
+
+    try:
+        mood_id = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer()
+        return
+
+    selected: list[int] = state["selected_moods"]
+
+    if mood_id in selected:
+        selected.remove(mood_id)
+        await query.answer(f"Fjernet {WATCH_MOODS[mood_id]['name']}")
+    elif len(selected) >= MAX_MOODS:
+        await query.answer(
+            f"Du kan kun vælge {MAX_MOODS} stemninger. Fravælg en først.",
+            show_alert=True,
+        )
+        return
+    else:
+        selected.append(mood_id)
+        await query.answer(f"Valgt {WATCH_MOODS[mood_id]['name']}")
+
+    try:
+        await query.edit_message_text(
+            text=_build_mood_message_text(state),
+            parse_mode="Markdown",
+            reply_markup=_build_mood_keyboard(state),
+        )
+    except Exception as e:
+        logger.warning("handle_watch_mood_callback edit fejl: %s", e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 'Hvad skal jeg se?' — Trin 3b: skift side
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_watch_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Skift mellem side 1, 2 og 3 i stemnings-vælgeren."""
+    query = update.callback_query
+    await query.answer()
+
+    if not await _guard(update):
+        return
+
+    state = _get_watch_state(context)
+    if not state.get("media_type"):
+        await query.answer("Sessionen er udløbet — start forfra.", show_alert=True)
+        return
+
+    try:
+        new_page = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        return
+
+    if new_page not in WATCH_PAGES:
+        return
+
+    state["page"] = new_page
+
+    try:
+        await query.edit_message_text(
+            text=_build_mood_message_text(state),
+            parse_mode="Markdown",
+            reply_markup=_build_mood_keyboard(state),
+        )
+    except Exception as e:
+        logger.warning("handle_watch_page_callback edit fejl: %s", e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 'Hvad skal jeg se?' — Trin 4: AI handoff
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_watch_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """🚀 Søg nu! — byg prompt fra valgte stemninger og send til AI."""
+    query = update.callback_query
+
+    if not await _guard(update):
+        await query.answer()
+        return
+
+    state = _get_watch_state(context)
+    if not state.get("media_type") or not state.get("selected_moods"):
+        await query.answer("Vælg mindst 1 stemning først.", show_alert=True)
+        return
+
+    await query.answer()
+    prompt = _build_watch_prompt(state, mode="search")
+    await _execute_ai_handoff(update, context, query, prompt)
+
+
+async def handle_watch_surprise_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """🎲 Overrask mig (efter type valgt) — tilfældige forslag inden for type."""
+    query = update.callback_query
+    await query.answer()
+
+    if not await _guard(update):
+        return
+
+    state = _get_watch_state(context)
+    if not state.get("media_type"):
+        # Hvis bruger på en eller anden måde rammer dette uden type → behandle som wildcard
+        prompt = _build_watch_prompt(state, mode="wildcard")
+    else:
+        prompt = _build_watch_prompt(state, mode="surprise")
+
+    await _execute_ai_handoff(update, context, query, prompt)
+
+
+async def handle_watch_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """❌ Afbryd — ryd state og fjern keyboard."""
+    query = update.callback_query
+    await query.answer()
+
+    _clear_watch_state(context)
+
+    try:
+        await query.edit_message_text("Aflyst. Tryk på 🍿-knappen igen når du vil have hjælp. 👍")
+    except Exception as e:
+        logger.warning("handle_watch_cancel_callback edit fejl: %s", e)
+
+
+async def handle_watch_noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """🔒 Vælg en stemning — disabled-knap, vis bare en hint."""
+    query = update.callback_query
+    await query.answer("Vælg mindst 1 stemning først 👇", show_alert=False)
+
+
+async def _execute_ai_handoff(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    query,
+    prompt: str,
+) -> None:
+    """
+    Fælles handoff til AI. Genbruger samme path som handle_text() for at bevare
+    signal-parsing til SHOW_INFO/TRAILER/SEARCH_RESULTS, så AI'ens svar kan
+    udløse infokort, trailer-knapper og søgelister præcis som ved fritekst-input.
+    """
+    user        = update.effective_user
+    chat        = query.message.chat
+    state_snapshot = dict(_get_watch_state(context))   # kopi før clear
+    _clear_watch_state(context)
+
+    # Slet det inline keyboard ved at fjerne reply_markup på den gamle besked
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await chat.send_action("typing")
+
+    loading_msg = await chat.send_message(
+        "🤖 Beregner svar med lynets hast... næsten...",
+    )
+
+    plex_username = await database.get_plex_username(user.id)
+    persona_id    = await database.get_persona(user.id)
+
+    await database.log_message(user.id, "incoming", f"[watch_flow] {prompt[:100]}…")
+
+    reply = await get_ai_response(
+        telegram_id=user.id,
+        user_message=prompt,
+        plex_username=plex_username,
+        persona_id=persona_id,
+        user_first_name=user.first_name,
+    )
+
+    try:
+        await loading_msg.delete()
+    except Exception:
+        pass
+
+    # Kør samme signal-parsing som handle_text — så AI kan returnere SHOW_INFO etc.
+    await _process_ai_reply(update, context, chat, user, plex_username, reply)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Inline Keyboard callbacks (bestillingsflow — uændret fra v0.9.8)
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Bruger valgte et søgeresultat — vis Netflix-look infokort."""
@@ -262,7 +771,9 @@ async def handle_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await show_search_results(query.message, search_query, media_type)
 
 
-# ── /info_movie_<id> og /info_tv_<id> handler ────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# /info_movie_<id> og /info_tv_<id> handler
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -327,7 +838,9 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                             loading_msg=loading_msg)
 
 
-# ── Message handler ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Message handler (fritekst)
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update):
@@ -335,6 +848,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     user = update.effective_user
     text = (update.message.text or "").strip()
+
+    # ── Watch flow trigger ────────────────────────────────────────────────────
+    if text == WATCH_FLOW_TRIGGER:
+        await handle_watch_flow_trigger(update, context)
+        return
+
     await database.log_message(user.id, "incoming", text)
 
     onboarding_state = await database.get_onboarding_state(user.id)
@@ -357,7 +876,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Send loading-besked og slet den når svaret er klar
     loading_msg = await update.message.reply_text(
         "🤖 Beregner svar med lynets hast... næsten...",
-        reply_markup=ReplyKeyboardRemove(),
     )
 
     reply = await get_ai_response(
@@ -374,9 +892,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception:
         pass
 
+    await _process_ai_reply(update, context, update.message.chat, user, plex_username, reply)
+
+
+async def _process_ai_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat,
+    user,
+    plex_username: str | None,
+    reply: str,
+) -> None:
+    """
+    Fælles signal-parsing for AI-svar. Bruges af både handle_text() (fritekst)
+    og _execute_ai_handoff() (watch flow).
+
+    Detekterer SHOW_INFO, SHOW_TRAILER, SEARCH_RESULTS signaler og udløser
+    den korrekte handler (infokort, trailer-knap eller søgeliste).
+    """
     # Rens backticks fra signaler — Buddy pakker dem nogle gange ind i Markdown
-    # Eksempel: `SHOW_INFO:157336:movie` → SHOW_INFO:157336:movie
-    # Det originale reply bruges stadig til normalt svar (bevarer Markdown)
     clean_reply = reply.replace("`", "").strip()
 
     def _find_signal(signal: str) -> str | None:
@@ -398,11 +932,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         parts = signal_line[len(SEARCH_SIGNAL):].split(":", 1)
         query_term = parts[0].strip()
         media_type = parts[1].strip() if len(parts) > 1 else "both"
-        await show_search_results(update.message, query_term, media_type)
+        # show_search_results forventer en 'message' med reply_text/chat_id
+        target_message = update.message if update.message else None
+        if target_message is None:
+            # Watch flow path — chat er sat, men ingen message. Lav en besked at svare på.
+            target_message = await chat.send_message("…")
+        await show_search_results(target_message, query_term, media_type)
         return
 
     # ── Signal: Netflix-look infokort ─────────────────────────────────────────
-    # Format: SHOW_INFO:<tmdb_id>:<media_type>
     signal_line = _find_signal(INFO_SIGNAL)
     if signal_line:
         payload = signal_line[len(INFO_SIGNAL):].strip()
@@ -419,8 +957,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     "title":      "Slår op...",
                     "step":       "picked",
                 })
-                await show_confirmation(update.message, context, token,
-                                        plex_username)
+                # show_confirmation kan kaldes med både Message og CallbackQuery —
+                # vi bruger en sendt besked som trigger.
+                trigger_msg = update.message if update.message else await chat.send_message("…")
+                await show_confirmation(trigger_msg, context, token, plex_username)
                 return
             except Exception as e:
                 logger.error("Fejl ved håndtering af SHOW_INFO: %s", e)
@@ -428,11 +968,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             logger.warning("SHOW_INFO signal kunne ikke parses: %r", reply)
 
     # ── Signal: trailer-knap ──────────────────────────────────────────────────
-    # Format: SHOW_TRAILER:<beskedtekst>|<trailer_url>
     signal_line = _find_signal(TRAILER_SIGNAL)
     if signal_line:
         payload  = signal_line[len(TRAILER_SIGNAL):]
-        # Del ved det SIDSTE pipe-tegn for at beskytte mod pipe i beskeden
         pipe_idx = payload.rfind("|")
         if pipe_idx != -1:
             besked_tekst = payload[:pipe_idx].strip()
@@ -441,7 +979,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("🎬 Se Trailer", url=trailer_url)
             ]])
-            await update.message.reply_text(
+            await chat.send_message(
                 safe_reply,
                 parse_mode="Markdown",
                 reply_markup=keyboard,
@@ -452,14 +990,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # ── Normalt svar — brug det originale reply med Markdown intakt ───────────
     safe_reply = escape_markdown(reply)
-    await update.message.reply_text(safe_reply, parse_mode="Markdown")
+    await chat.send_message(safe_reply, parse_mode="Markdown")
     await database.log_message(user.id, "outgoing", reply)
 
 
-# ── Webhook HTTP server ───────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Webhook HTTP server
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def _webhook_radarr(request: web.Request) -> web.Response:
-    # ── Secret token check ────────────────────────────────────────────────────
     if config.WEBHOOK_SECRET:
         token = request.rel_url.query.get("token", "")
         if token != config.WEBHOOK_SECRET:
@@ -476,7 +1015,6 @@ async def _webhook_radarr(request: web.Request) -> web.Response:
 
 
 async def _webhook_sonarr(request: web.Request) -> web.Response:
-    # ── Secret token check ────────────────────────────────────────────────────
     if config.WEBHOOK_SECRET:
         token = request.rel_url.query.get("token", "")
         if token != config.WEBHOOK_SECRET:
@@ -503,7 +1041,9 @@ async def _start_webhook_server() -> None:
     logger.info("Webhook server started on port 8080")
 
 
-# ── Global error handler ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Global error handler
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -527,7 +1067,9 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
             logger.error("Kunne ikke sende fejlbesked til bruger: %s", e)
 
 
-# ── Lifecycle ─────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Lifecycle
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def on_startup(application: Application) -> None:
     await database.setup_db()
@@ -540,10 +1082,10 @@ async def on_startup(application: Application) -> None:
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — v0.9.8-beta | "
+        "VERSION CHECK — v0.10.0-beta | "
         "søgeresultater-UX: JA | foto-fix: JA | årstal-fallback: JA | "
         "tilbage-knap: JA | already-anmodet-check: JA | user_first_name: JA | "
-        "annuller-photo-fix: JA"
+        "annuller-photo-fix: JA | watch-flow: JA"
     )
 
 
@@ -552,7 +1094,9 @@ async def on_shutdown(application: Application) -> None:
     logger.info("Buddy shut down cleanly.")
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
     app = (
@@ -568,6 +1112,16 @@ def main() -> None:
 
     # Admin approval
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve_user:\d+$"))
+
+    # 'Hvad skal jeg se?' flow — REGISTRERES FØR bestillingsflow så watch_*
+    # callbacks ikke fanges af andre handlers. Hvert handler har sit eget pattern.
+    app.add_handler(CallbackQueryHandler(handle_watch_type_callback,     pattern=r"^watch_type:"))
+    app.add_handler(CallbackQueryHandler(handle_watch_mood_callback,     pattern=r"^watch_mood:"))
+    app.add_handler(CallbackQueryHandler(handle_watch_page_callback,     pattern=r"^watch_page:"))
+    app.add_handler(CallbackQueryHandler(handle_watch_search_callback,   pattern=r"^watch_search$"))
+    app.add_handler(CallbackQueryHandler(handle_watch_surprise_callback, pattern=r"^watch_surprise$"))
+    app.add_handler(CallbackQueryHandler(handle_watch_cancel_callback,   pattern=r"^watch_cancel$"))
+    app.add_handler(CallbackQueryHandler(handle_watch_noop_callback,     pattern=r"^watch_noop$"))
 
     # Bestillingsflow
     app.add_handler(CallbackQueryHandler(handle_pick_callback,      pattern=r"^pick:"))
