@@ -1,15 +1,21 @@
 """
 main.py - Buddy bot entry point.
 
-CHANGES vs previous version (v0.10.6 — Step 2 af subgenre-projekt):
-  - 4 NYE ADMIN-KOMMANDOER til TMDB metadata cache:
-    * /seed_metadata        - Scan Plex og opret pending records i tmdb_metadata
-    * /fetch_metadata       - Hent næste batch på 100 fra TMDB (kan tages i loop)
-    * /fetch_metadata retry - Som ovenfor, men inkluder også 'error' records
-    * /metadata_status      - Vis fremgang: X af Y færdig, fordelt på status
-    * /top_keywords [type] [N] - Empirisk subgenre-discovery: top N keywords
-  - on_startup() opretter nu også tmdb_metadata-tabellen via setup_tmdb_metadata_table().
-  - VERSION CHECK opdateret til v0.10.6-beta.
+CHANGES vs previous version (v0.10.7 — fuld keyword-eksport):
+  - /top_keywords har fået ny "all" mode der dumper ALLE keywords som JSON + CSV
+    Eksempler:
+      /top_keywords movie 50               → top 50 i chat (som før)
+      /top_keywords movie all              → ALLE keywords som JSON + CSV (min 1 film)
+      /top_keywords movie all 5            → ALLE keywords med min 5 film
+      /top_keywords tv all 5               → samme for TV
+      /top_keywords all 5                  → begge (movie + tv)
+  - Filerne sendes som document attachments i Telegram
+    (åbnes i Sheets/Excel via CSV, eller programmeres direkte med JSON)
+  - VERSION CHECK opdateret til v0.10.7-beta.
+
+UNCHANGED (v0.10.6 — Step 2 af subgenre-projekt):
+  - 4 admin-kommandoer: /seed_metadata, /fetch_metadata, /metadata_status, /top_keywords
+  - on_startup() kalder setup_tmdb_metadata_table()
 
 UNCHANGED (v0.10.5 — /test_metadata kommando, Step 1).
 UNCHANGED (v0.10.4 — /test_enrich DRY-RUN kommando).
@@ -21,6 +27,8 @@ UNCHANGED (v0.9.8 — Annuller-knap photo-fix).
 """
 
 import asyncio
+import csv
+import io
 import json
 import logging
 import os
@@ -84,7 +92,7 @@ _URL_RE = re.compile(r"(https?://[^\s)\]>\"]+)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 'HVAD SKAL JEG SE?' — Konstanter og helpers (uændret fra v0.10.5)
+# 'HVAD SKAL JEG SE?' — Konstanter og helpers (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
 
 WATCH_FLOW_TRIGGER = "🍿 Hvad skal jeg se?"
@@ -537,7 +545,7 @@ async def cmd_dump_genres(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# /test_metadata — Engangs admin DRY-RUN (uændret fra v0.10.5)
+# /test_metadata — uændret fra v0.10.5
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _format_metadata_report(meta: dict) -> str:
@@ -716,14 +724,10 @@ async def cmd_test_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Step 2 admin-kommandoer (NYT v0.10.6)
+# Step 2 admin-kommandoer (uændret fra v0.10.6)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _scan_plex_for_seeding_sync() -> list[dict]:
-    """
-    Scan ALLE film + serier i Plex for at samle TMDB IDs til seeding.
-    Returnerer kun items med gyldigt TMDB ID — items uden GUID springes over.
-    """
     from services.plex_service import (
         _connect, _sections, _MOVIE_TYPE, _TV_TYPE,
         _extract_tmdb_id_from_guids,
@@ -773,10 +777,6 @@ def _scan_plex_for_seeding_sync() -> list[dict]:
 
 
 async def cmd_seed_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /seed_metadata — Scan Plex og opret 'pending' records i tmdb_metadata.
-    Idempotent: kan køres flere gange uden at nulstille fetched records.
-    """
     user = update.effective_user
     if user is None or user.id != config.ADMIN_TELEGRAM_ID:
         return
@@ -788,7 +788,6 @@ async def cmd_seed_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         parse_mode="Markdown",
     )
 
-    # ── 1. Scan Plex ──────────────────────────────────────────────────────────
     try:
         items = await asyncio.to_thread(_scan_plex_for_seeding_sync)
     except Exception as e:
@@ -813,7 +812,6 @@ async def cmd_seed_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except Exception:
         pass
 
-    # ── 2. Seed database ──────────────────────────────────────────────────────
     try:
         result = await database.seed_tmdb_metadata(items)
     except Exception as e:
@@ -821,7 +819,6 @@ async def cmd_seed_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await loading.edit_text(f"❌ Database-seed fejlede: {e}")
         return
 
-    # ── 3. Vis status ─────────────────────────────────────────────────────────
     try:
         status = await database.get_metadata_status()
     except Exception as e:
@@ -865,10 +862,6 @@ async def cmd_seed_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def cmd_fetch_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /fetch_metadata          — hent næste batch på 100 pending records
-    /fetch_metadata retry    — som ovenfor, men inkluder også 'error' records
-    """
     user = update.effective_user
     if user is None or user.id != config.ADMIN_TELEGRAM_ID:
         return
@@ -885,7 +878,6 @@ async def cmd_fetch_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode="Markdown",
     )
 
-    # ── 1. Hent pending batch fra DB ──────────────────────────────────────────
     try:
         pending = await database.get_pending_metadata(
             limit=batch_size, include_errors=include_errors,
@@ -907,7 +899,6 @@ async def cmd_fetch_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    # ── 2. Fetch batch fra TMDB ───────────────────────────────────────────────
     try:
         batch_result = await fetch_metadata_batch(pending)
     except Exception as e:
@@ -915,7 +906,6 @@ async def cmd_fetch_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await loading.edit_text(f"❌ TMDB-fejl: {e}")
         return
 
-    # ── 3. Skriv resultater til DB ────────────────────────────────────────────
     write_errors = 0
     for r in batch_result["results"]:
         tmdb_id    = r.get("tmdb_id")
@@ -940,7 +930,7 @@ async def cmd_fetch_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     error_message = r.get("message", "Ikke fundet på TMDB"),
                     is_not_found  = True,
                 )
-            else:  # error
+            else:
                 await database.update_metadata_error(
                     tmdb_id       = tmdb_id,
                     media_type    = media_type,
@@ -952,7 +942,6 @@ async def cmd_fetch_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.warning("update_metadata write-fejl for %s/%s: %s",
                            media_type, tmdb_id, e)
 
-    # ── 4. Vis sammendrag + næste skridt ──────────────────────────────────────
     summary = batch_result["summary"]
     duration = batch_result["duration_seconds"]
 
@@ -998,7 +987,6 @@ async def cmd_fetch_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def cmd_metadata_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/metadata_status — vis fremgang i tmdb_metadata cache."""
     user = update.effective_user
     if user is None or user.id != config.ADMIN_TELEGRAM_ID:
         return
@@ -1054,31 +1042,65 @@ async def cmd_metadata_status(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-async def cmd_top_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /top_keywords                — top 50 keywords (begge media types)
-    /top_keywords movie          — top 50 film-keywords
-    /top_keywords tv             — top 50 TV-keywords
-    /top_keywords movie 100      — top 100 film-keywords
-    /top_keywords tv 30          — top 30 TV-keywords
+# ══════════════════════════════════════════════════════════════════════════════
+# /top_keywords — opgraderet med 'all' mode (NY v0.10.7)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Tre brugsformer:
+#   /top_keywords                    → top 50 (begge media types) i chat
+#   /top_keywords movie              → top 50 film i chat
+#   /top_keywords movie 100          → top 100 film i chat
+#   /top_keywords movie all          → ALLE film-keywords som JSON+CSV (min 1)
+#   /top_keywords movie all 5        → ALLE med min 5 film
+#   /top_keywords tv all 5           → samme for TV
+#   /top_keywords all 5              → begge media types
 
-    Det DETEKTIV-VÆRKTØJ — lader dataen fortælle hvilke subgenrer du faktisk ejer.
-    """
+async def cmd_top_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if user is None or user.id != config.ADMIN_TELEGRAM_ID:
         return
 
     args = context.args
+
+    # Parse args:
+    # - media_type: 'movie', 'tv' eller None
+    # - mode:       'top' (default, returnerer N i chat) eller 'all' (file dump)
+    # - limit:      antal til top-mode (default 50)
+    # - min_count:  min antal film for all-mode (default 1)
     media_type: str | None = None
-    limit = 50
+    mode: str = "top"
+    limit: int = 50
+    min_count: int = 1
 
-    # Parse args fleksibelt: kan være [], ["movie"], ["50"], ["movie", "50"]
+    # Vi parser fleksibelt: enhver rækkefølge af args er OK
     for arg in args:
-        if arg.lower() in ("movie", "tv"):
-            media_type = arg.lower()
+        arg_lower = arg.lower()
+        if arg_lower in ("movie", "tv"):
+            media_type = arg_lower
+        elif arg_lower == "all":
+            mode = "all"
         elif arg.isdigit():
-            limit = max(1, min(int(arg), 200))   # cap mellem 1-200
+            num = int(arg)
+            if mode == "all":
+                min_count = max(1, num)  # i all-mode er tallet min_count
+            else:
+                limit = max(1, min(num, 200))  # i top-mode er det limit (cap 200)
 
+    # ── Mode 1: 'top' — vis i chat (uændret fra v0.10.6) ──────────────────────
+    if mode == "top":
+        await _cmd_top_keywords_chat(update, media_type, limit)
+        return
+
+    # ── Mode 2: 'all' — dump som JSON + CSV ───────────────────────────────────
+    await _cmd_top_keywords_dump(update, context, media_type, min_count)
+
+
+async def _cmd_top_keywords_chat(
+    update: Update,
+    media_type: str | None,
+    limit: int,
+) -> None:
+    """Top N keywords i chat (v0.10.6 logik bevaret)."""
     await update.message.chat.send_action("typing")
     loading = await update.message.reply_text(
         f"🔬 *Top Keywords*\n\n"
@@ -1088,9 +1110,11 @@ async def cmd_top_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
     try:
-        keywords = await database.get_top_keywords(media_type=media_type, limit=limit)
+        keywords = await database.get_top_keywords(
+            media_type=media_type, limit=limit, min_count=1,
+        )
     except Exception as e:
-        logger.error("cmd_top_keywords fejl: %s", e)
+        logger.error("cmd_top_keywords (chat) fejl: %s", e)
         await loading.edit_text(f"❌ DB-fejl: {e}")
         return
 
@@ -1108,7 +1132,6 @@ async def cmd_top_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         else "🌍 ALLE"
     )
 
-    # Vi splitter i flere beskeder hvis listen er lang (Telegram ~4000 tegn limit)
     header = (
         f"🔬 *TOP {limit} KEYWORDS — {type_label}*\n"
         f"═══════════════════════════\n\n"
@@ -1116,10 +1139,9 @@ async def cmd_top_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
     lines = []
-    for i, kw in enumerate(keywords, 1):
+    for kw in keywords:
         lines.append(f"`{kw['count']:>5}` × {kw['keyword']}")
 
-    # Send i chunks af ~50 linjer per besked
     chunk_size = 50
     chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
 
@@ -1144,18 +1166,192 @@ async def cmd_top_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             except Exception:
                 pass
 
-    # Footer med tip
     footer = (
         "─────────────\n"
-        "💡 *Tip:* Kig efter keywords der beskriver *subgenrer* "
-        "(cyberpunk, heist, slasher) vs. *støj* (based on novel, "
-        "duringcreditsstinger).\n\n"
-        "Send mig listen når du er klar — vi designer SUBGENRE_KEYWORDS sammen."
+        "💡 *Tip:* For at få ALLE keywords som JSON+CSV-fil, kør:\n"
+        "`/top_keywords movie all 5` (min 5 film)"
     )
     try:
         await update.message.reply_text(footer, parse_mode="Markdown")
     except Exception:
         pass
+
+
+async def _cmd_top_keywords_dump(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    media_type: str | None,
+    min_count: int,
+) -> None:
+    """Dump ALLE keywords som JSON + CSV filer (NY v0.10.7)."""
+    user = update.effective_user
+
+    await update.message.chat.send_action("typing")
+    type_label = (
+        "🎬 film" if media_type == "movie"
+        else "📺 serier" if media_type == "tv"
+        else "🌍 alle media"
+    )
+    loading = await update.message.reply_text(
+        f"📦 *Keywords-dump*\n\n"
+        f"Henter ALLE keywords for *{type_label}* "
+        f"med minimum *{min_count}* film...\n"
+        f"_Dette kan tage 5-15 sekunder._",
+        parse_mode="Markdown",
+    )
+
+    # ── 1. Hent fra database (limit=None for at få ALT) ───────────────────────
+    try:
+        keywords = await database.get_top_keywords(
+            media_type=media_type, limit=None, min_count=min_count,
+        )
+    except Exception as e:
+        logger.error("cmd_top_keywords (dump) DB-fejl: %s", e)
+        await loading.edit_text(f"❌ DB-fejl: {e}")
+        return
+
+    if not keywords:
+        await loading.edit_text(
+            f"⚠️ *Ingen keywords fundet*\n\n"
+            f"Med min_count={min_count} blev der ikke fundet nogen keywords.\n"
+            f"Prøv et lavere tal eller kør `/fetch_metadata` flere gange.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── 2. Hent total antal film for procent-beregning ────────────────────────
+    try:
+        status = await database.get_metadata_status()
+        if media_type == "movie":
+            total_items = status["by_media_type"]["movie"]["fetched"]
+        elif media_type == "tv":
+            total_items = status["by_media_type"]["tv"]["fetched"]
+        else:
+            total_items = status["fetched"]
+    except Exception:
+        total_items = 0
+
+    # ── 3. Byg filer ──────────────────────────────────────────────────────────
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    type_suffix = media_type if media_type else "all"
+    base_filename = f"keywords_{type_suffix}_min{min_count}_{timestamp}"
+
+    json_path = os.path.join(tempfile.gettempdir(), f"{base_filename}.json")
+    csv_path  = os.path.join(tempfile.gettempdir(), f"{base_filename}.csv")
+
+    # JSON
+    json_data = {
+        "metadata": {
+            "scanned_at":            datetime.utcnow().isoformat() + "Z",
+            "media_type":            media_type or "all",
+            "min_count_filter":      min_count,
+            "total_unique_keywords": len(keywords),
+            "items_in_db":           total_items,
+        },
+        "keywords": [
+            {
+                "rank":       i + 1,
+                "keyword":    kw["keyword"],
+                "film_count": kw["count"],
+                "percentage": round(kw["count"] / total_items * 100, 2) if total_items else 0.0,
+            }
+            for i, kw in enumerate(keywords)
+        ],
+    }
+
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(json_data, f, ensure_ascii=False, indent=2)
+        json_size_kb = os.path.getsize(json_path) / 1024
+    except Exception as e:
+        logger.error("cmd_top_keywords JSON skriv-fejl: %s", e)
+        await loading.edit_text(f"❌ Kunne ikke skrive JSON: {e}")
+        return
+
+    # CSV
+    try:
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["rank", "keyword", "film_count", "percentage"])
+            for i, kw in enumerate(keywords):
+                pct = round(kw["count"] / total_items * 100, 2) if total_items else 0.0
+                writer.writerow([i + 1, kw["keyword"], kw["count"], f"{pct}%"])
+        csv_size_kb = os.path.getsize(csv_path) / 1024
+    except Exception as e:
+        logger.error("cmd_top_keywords CSV skriv-fejl: %s", e)
+        # Cleanup JSON før vi giver op
+        try:
+            os.remove(json_path)
+        except Exception:
+            pass
+        await loading.edit_text(f"❌ Kunne ikke skrive CSV: {e}")
+        return
+
+    logger.info(
+        "top_keywords dump: %d keywords (media=%s, min=%d) — JSON %.1f KB, CSV %.1f KB",
+        len(keywords), media_type or "all", min_count, json_size_kb, csv_size_kb,
+    )
+
+    # ── 4. Send sammendrag + filer ────────────────────────────────────────────
+    try:
+        await loading.delete()
+    except Exception:
+        pass
+
+    summary = (
+        f"📦 *Keywords-dump færdig!*\n\n"
+        f"🎯 *Filter:* {type_label}, min {min_count} film\n"
+        f"📊 *Resultat:*\n"
+        f"  • Unikke keywords: *{len(keywords):,}*\n"
+        f"  • Total items i DB: *{total_items:,}*\n"
+        f"  • Mest brugte: *{keywords[0]['keyword']}* ({keywords[0]['count']} film)\n"
+        f"  • Mindst brugte: *{keywords[-1]['keyword']}* ({keywords[-1]['count']} film)\n\n"
+        f"📁 *Filer:*\n"
+        f"  • JSON: {json_size_kb:.1f} KB\n"
+        f"  • CSV: {csv_size_kb:.1f} KB\n\n"
+        f"_Send filerne til Claude i chatten for analyse._\n"
+        f"_CSV kan åbnes i Google Sheets/Excel._"
+    )
+
+    # Send JSON først (tekst-summary i caption)
+    try:
+        with open(json_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=InputFile(f, filename=os.path.basename(json_path)),
+                caption=summary,
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        logger.error("cmd_top_keywords JSON send-fejl: %s", e)
+        await update.message.reply_text(f"❌ Kunne ikke sende JSON: {e}")
+        try:
+            os.remove(json_path)
+            os.remove(csv_path)
+        except Exception:
+            pass
+        return
+
+    # Send CSV bagefter (uden caption)
+    try:
+        with open(csv_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=InputFile(f, filename=os.path.basename(csv_path)),
+                caption="📊 *CSV — åbn i Google Sheets/Excel*",
+                parse_mode="Markdown",
+            )
+        logger.info("top_keywords dump: filer sendt til admin telegram_id=%s", user.id)
+    except Exception as e:
+        logger.error("cmd_top_keywords CSV send-fejl: %s", e)
+        await update.message.reply_text(f"❌ Kunne ikke sende CSV: {e}")
+    finally:
+        # Cleanup
+        for path in (json_path, csv_path):
+            try:
+                os.remove(path)
+            except Exception as e:
+                logger.warning("top_keywords cleanup-fejl for %s: %s", path, e)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1223,7 +1419,7 @@ async def _handle_plex_input(update: Update, raw_input: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Command handlers
+# Command handlers (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1449,7 +1645,7 @@ async def _execute_ai_handoff(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Bestillingsflow callbacks
+# Bestillingsflow callbacks (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1517,7 +1713,7 @@ async def handle_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# /info_movie_<id> og /info_tv_<id> handler
+# /info_movie_<id> og /info_tv_<id> handler (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1567,7 +1763,7 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Message handler
+# Message handler (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1686,7 +1882,7 @@ async def _process_ai_reply(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Webhook HTTP server
+# Webhook HTTP server (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _webhook_radarr(request: web.Request) -> web.Response:
@@ -1733,7 +1929,7 @@ async def _start_webhook_server() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Global error handler
+# Global error handler (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1760,7 +1956,7 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
 async def on_startup(application: Application) -> None:
     await database.setup_db()
     await database.setup_pending_requests()
-    await database.setup_tmdb_metadata_table()   # NY v0.10.6
+    await database.setup_tmdb_metadata_table()
     await _start_webhook_server()
     if not config.WEBHOOK_SECRET:
         logger.warning(
@@ -1768,10 +1964,11 @@ async def on_startup(application: Application) -> None:
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — v0.10.6-beta | "
+        "VERSION CHECK — v0.10.7-beta | "
         "søgeresultater-UX: JA | foto-fix: JA | watch-flow: JA | "
         "watch-genre-split-fix: JA | genres-cmd: JA | dump-genres-cmd: JA | "
-        "test-metadata-cmd: JA | tmdb-metadata-cache: JA"
+        "test-metadata-cmd: JA | tmdb-metadata-cache: JA | "
+        "top-keywords-dump: JA"
     )
 
 
@@ -1801,7 +1998,7 @@ def main() -> None:
     app.add_handler(CommandHandler("dump_genres",     cmd_dump_genres))
     app.add_handler(CommandHandler("test_metadata",   cmd_test_metadata))
 
-    # Step 2 admin-kommandoer (NY v0.10.6)
+    # Step 2 admin-kommandoer
     app.add_handler(CommandHandler("seed_metadata",   cmd_seed_metadata))
     app.add_handler(CommandHandler("fetch_metadata",  cmd_fetch_metadata))
     app.add_handler(CommandHandler("metadata_status", cmd_metadata_status))

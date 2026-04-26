@@ -1,27 +1,24 @@
 """
 database.py - PostgreSQL connection pool, table management,
 user whitelist, Plex username storage, onboarding state, interaction logging,
-pending requests OG TMDB metadata-cache (NY v0.10.6).
+pending requests OG TMDB metadata-cache.
 
-CHANGES vs previous version (v0.10.6 — TMDB metadata cache):
-  - NY TABEL: tmdb_metadata
-    * Cacher TMDB-genrer + keywords for alle Plex-titler (film + serier)
-    * "Store All, Filter Later" princip — INGEN whitelist på data-laget
-    * GIN-indekser på keywords + tmdb_genres for lyn-hurtige JSONB-queries
-    * Felter til auto-refresh tilføjet (men logikken er IKKE aktiveret endnu)
-  - NYE DB-FUNKTIONER:
-    * setup_tmdb_metadata_table()  - opretter tabel + indexer
-    * seed_tmdb_metadata()         - INSERT pending records (idempotent)
-    * get_metadata_status()        - COUNT per status til /metadata_status
-    * get_pending_metadata()       - SELECT næste batch til /fetch_metadata
-    * update_metadata_success()    - UPDATE efter vellykket TMDB-fetch
-    * update_metadata_error()      - UPDATE efter fejl
-    * get_top_keywords()           - GROUP BY til /top_keywords (data discovery)
+CHANGES vs previous version (v0.10.7 — fuld keyword-export):
+  - get_top_keywords() har fået ny parameter: min_count (default 1)
+    * Bruges af /top_keywords <type> all <min_count> til at filtrere
+      single-occurrence keywords væk
+    * Er også backwards-compatible: top_keywords kalder uden min_count
+      virker som før
+
+UNCHANGED (v0.10.6 — TMDB metadata cache):
+  - Ny tabel tmdb_metadata + GIN-indekser
+  - "Store All, Filter Later" princip
+  - 6 funktioner: setup_tmdb_metadata_table, seed_tmdb_metadata,
+    get_metadata_status, get_pending_metadata, update_metadata_success,
+    update_metadata_error, get_top_keywords
 
 UNCHANGED:
   - Alle eksisterende user-, persona-, onboarding-, log- og pending_requests-funktioner.
-  - persona_id kolonne, get_persona() / set_persona().
-  - Logging arkitektur og connection pool setup.
 """
 
 import json
@@ -80,15 +77,9 @@ CREATE INDEX IF NOT EXISTS idx_log_telegram_id
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Schema — TMDB metadata cache (NY v0.10.6)
+# Schema — TMDB metadata cache
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Designprincip: "Store All, Filter Later"
-# - keywords gemmes RÅ uden filtrering
-# - filtrering sker i Python-laget (find_unwatched_v2 + SUBGENRE_KEYWORDS)
-# - title gemmes for nemmere debugging når vi inspicerer DB
-# - status-felt gør resumable scanning muligt
-# - GIN-indeksser muliggør lyn-hurtige JSONB-queries (millisekund)
 _CREATE_TMDB_METADATA_TABLE = """
 CREATE TABLE IF NOT EXISTS tmdb_metadata (
     tmdb_id        INTEGER     NOT NULL,
@@ -106,13 +97,11 @@ CREATE TABLE IF NOT EXISTS tmdb_metadata (
 );
 """
 
-# Status-index: hurtigt at finde næste batch af pending records
 _CREATE_TMDB_STATUS_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_status
     ON tmdb_metadata (status);
 """
 
-# GIN-indekser: lyn-hurtig JSONB-søgning ('cyberpunk' = ANY(keywords) → ms)
 _CREATE_TMDB_KEYWORDS_GIN = """
 CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_keywords
     ON tmdb_metadata USING GIN (keywords);
@@ -403,15 +392,11 @@ async def delete_pending_requests_for_user(telegram_id: int) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TMDB metadata cache (NY v0.10.6)
+# TMDB metadata cache
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def setup_tmdb_metadata_table() -> None:
-    """
-    Opret tmdb_metadata tabellen + indekser.
-    Idempotent — kan køres ved hver opstart uden problemer.
-    Kaldes fra on_startup() i main.py.
-    """
+    """Opret tmdb_metadata tabellen + indekser. Idempotent."""
     async with _pool_ref().acquire() as conn:
         await conn.execute(_CREATE_TMDB_METADATA_TABLE)
         await conn.execute(_CREATE_TMDB_STATUS_INDEX)
@@ -422,24 +407,12 @@ async def setup_tmdb_metadata_table() -> None:
 
 async def seed_tmdb_metadata(items: list[dict]) -> dict:
     """
-    Seed (eller "støvsug") tmdb_metadata med pending records fra Plex-scanning.
-
-    Args:
-      items: liste af dicts med format:
-        [{"tmdb_id": 27205, "media_type": "movie", "title": "Inception", "year": 2010}, ...]
-
-    Idempotent: ON CONFLICT DO NOTHING betyder at eksisterende records (med ANY status)
-    bliver IKKE rørt — kun nye records oprettes som 'pending'.
-    Det betyder at /seed_metadata kan køres flere gange uden at "nulstille" allerede
-    fetchede records.
-
-    Returns:
-      {"inserted": N, "skipped": M, "total_input": K}
+    Seed tmdb_metadata med pending records fra Plex-scanning.
+    Idempotent: ON CONFLICT DO NOTHING.
     """
     if not items:
         return {"inserted": 0, "skipped": 0, "total_input": 0}
 
-    # Bulk-insert via executemany med ON CONFLICT DO NOTHING for idempotency
     insert_sql = """
         INSERT INTO tmdb_metadata (tmdb_id, media_type, title, year, status)
         VALUES ($1, $2, $3, $4, 'pending')
@@ -460,7 +433,6 @@ async def seed_tmdb_metadata(items: list[dict]) -> dict:
                     item.get("title"),
                     item.get("year"),
                 )
-                # asyncpg returnerer "INSERT 0 1" ved success, "INSERT 0 0" ved skip
                 if result.endswith(" 1"):
                     inserted += 1
 
@@ -470,22 +442,7 @@ async def seed_tmdb_metadata(items: list[dict]) -> dict:
 
 
 async def get_metadata_status() -> dict:
-    """
-    Returnér optælling af records pr. status — bruges af /metadata_status.
-
-    Returns:
-      {
-        "total":     7785,
-        "pending":   0,
-        "fetched":   7642,
-        "error":     53,
-        "not_found": 90,
-        "by_media_type": {
-          "movie": {"total": 6636, "pending": 0, "fetched": 6543, "error": 50, "not_found": 43},
-          "tv":    {"total": 1149, "pending": 0, "fetched": 1099, "error": 3,  "not_found": 47},
-        }
-      }
-    """
+    """Returnér optælling af records pr. status."""
     async with _pool_ref().acquire() as conn:
         rows = await conn.fetch(
             """
@@ -525,16 +482,7 @@ async def get_metadata_status() -> dict:
 
 
 async def get_pending_metadata(limit: int = 100, include_errors: bool = False) -> list[dict]:
-    """
-    Hent næste batch af records der skal fetches fra TMDB.
-
-    Args:
-      limit:          max antal records at hente (default 100)
-      include_errors: hvis True, inkluderes også 'error' records (retry mode)
-
-    Returns:
-      [{"tmdb_id": 27205, "media_type": "movie", "title": "Inception", "year": 2010}, ...]
-    """
+    """Hent næste batch af records der skal fetches fra TMDB."""
     if include_errors:
         status_filter = "status IN ('pending', 'error')"
     else:
@@ -562,12 +510,7 @@ async def update_metadata_success(
     title: str | None = None,
     year: int | None = None,
 ) -> None:
-    """
-    Marker en record som 'fetched' og gem TMDB-data.
-
-    INGEN whitelist-filtrering — keywords gemmes præcist som TMDB returnerede dem.
-    Filtreringen sker senere i Python-laget (find_unwatched_v2 + SUBGENRE_KEYWORDS).
-    """
+    """Marker en record som 'fetched' og gem TMDB-data."""
     async with _pool_ref().acquire() as conn:
         await conn.execute(
             """
@@ -596,10 +539,7 @@ async def update_metadata_error(
     error_message: str,
     is_not_found: bool = False,
 ) -> None:
-    """
-    Marker en record som 'error' eller 'not_found' (separat status så vi
-    kan skelne mellem midlertidige fejl og permanent missing).
-    """
+    """Marker en record som 'error' eller 'not_found'."""
     status = "not_found" if is_not_found else "error"
     async with _pool_ref().acquire() as conn:
         await conn.execute(
@@ -614,44 +554,62 @@ async def update_metadata_error(
         )
 
 
-async def get_top_keywords(media_type: str | None = None, limit: int = 50) -> list[dict]:
+async def get_top_keywords(
+    media_type: str | None = None,
+    limit: int | None = 50,
+    min_count: int = 1,
+) -> list[dict]:
     """
-    Det DETEKTIV-VÆRKTØJ vi diskuterede — find de mest brugte keywords i din samling.
+    Find de mest brugte keywords i din samling.
     Lader DATAEN fortælle hvilke subgenrer du faktisk ejer.
 
     Args:
       media_type: 'movie', 'tv' eller None (begge)
-      limit:      antal top-keywords (default 50)
+      limit:      antal top-keywords (default 50). Hvis None → ingen limit (alle keywords).
+      min_count:  kun keywords der findes på MINDST N film (default 1 = alle)
 
     Returns:
       [
         {"keyword": "based on novel",   "count": 1240},
         {"keyword": "woman director",   "count": 980},
-        {"keyword": "high school",      "count": 450},
-        {"keyword": "cyberpunk",        "count": 87},
         ...
       ]
 
-    Bruger PostgreSQL's jsonb_array_elements_text() til at "splitte" keywords-arrayet
-    så vi kan COUNT(*) GROUP BY pr. enkelt keyword.
+    CHANGES (v0.10.7): Tilføjet min_count + støtte for limit=None
     """
-    where_clause = ""
-    params: list = [limit]
+    where_parts: list[str] = ["status = 'fetched'"]
+    params: list = []
+    param_idx = 1
 
     if media_type in ("movie", "tv"):
-        where_clause = "WHERE media_type = $2 AND status = 'fetched'"
+        where_parts.append(f"media_type = ${param_idx}")
         params.append(media_type)
-    else:
-        where_clause = "WHERE status = 'fetched'"
+        param_idx += 1
+
+    where_clause = " AND ".join(where_parts)
+
+    # min_count filter via HAVING klausul
+    having_clause = ""
+    if min_count > 1:
+        having_clause = f"HAVING COUNT(*) >= ${param_idx}"
+        params.append(min_count)
+        param_idx += 1
+
+    # Limit er valgfri (None = ingen limit = alle keywords)
+    limit_clause = ""
+    if limit is not None:
+        limit_clause = f"LIMIT ${param_idx}"
+        params.append(limit)
 
     sql = f"""
         SELECT keyword, COUNT(*) AS cnt
         FROM tmdb_metadata,
              jsonb_array_elements_text(keywords) AS keyword
-        {where_clause}
+        WHERE {where_clause}
         GROUP BY keyword
+        {having_clause}
         ORDER BY cnt DESC
-        LIMIT $1
+        {limit_clause}
     """
 
     async with _pool_ref().acquire() as conn:
