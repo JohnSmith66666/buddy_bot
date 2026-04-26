@@ -1,22 +1,24 @@
 """
 main.py - Buddy bot entry point.
 
-CHANGES vs previous version (v0.10.7 — fuld keyword-eksport):
-  - /top_keywords har fået ny "all" mode der dumper ALLE keywords som JSON + CSV
-    Eksempler:
-      /top_keywords movie 50               → top 50 i chat (som før)
-      /top_keywords movie all              → ALLE keywords som JSON + CSV (min 1 film)
-      /top_keywords movie all 5            → ALLE keywords med min 5 film
-      /top_keywords tv all 5               → samme for TV
-      /top_keywords all 5                  → begge (movie + tv)
-  - Filerne sendes som document attachments i Telegram
-    (åbnes i Sheets/Excel via CSV, eller programmeres direkte med JSON)
-  - VERSION CHECK opdateret til v0.10.7-beta.
+CHANGES vs previous version (v0.10.8 — /test_v2 admin DEBUG-kommando):
+  - NY ENGANGS-FEATURE: /test_v2 <subgenre_id>
+    * Tester den nye find_unwatched_v2 fra services/v2_service.py
+    * Validerer hele kæden: DB-cache → Plex cross-check → unwatched-filter
+    * Bruges KUN af admin til at debugge før vi bygger UI'en (Etape 3)
+    * Vil blive slettet sammen med /seed_metadata, /fetch_metadata mv. når
+      Etape 4 er færdig og vi rydder op.
+  - Output viser:
+      - Subgenre-label (sjove navne)
+      - Stats: kandidater → i Plex → usete → returneret
+      - Liste af 5 film med titel + år + rating
+      - Hjælper-mode: /test_v2 list viser alle 36 subgenre-IDs
+  - VERSION CHECK opdateret til v0.10.8-beta.
 
+UNCHANGED (v0.10.7 — fuld keyword-eksport):
+  - /top_keywords <type> all <min_count> dumper JSON+CSV
 UNCHANGED (v0.10.6 — Step 2 af subgenre-projekt):
   - 4 admin-kommandoer: /seed_metadata, /fetch_metadata, /metadata_status, /top_keywords
-  - on_startup() kalder setup_tmdb_metadata_table()
-
 UNCHANGED (v0.10.5 — /test_metadata kommando, Step 1).
 UNCHANGED (v0.10.4 — /test_enrich DRY-RUN kommando).
 UNCHANGED (v0.10.3 — /dump_genres admin-kommando).
@@ -79,6 +81,15 @@ from services.tmdb_keywords_service import (
     fetch_tv_metadata,
     search_tmdb_by_title,
 )
+from services.subgenre_service import (
+    SUBGENRE_CATEGORIES,
+    SUBGENRES,
+    get_all_categories,
+    get_subgenre,
+    list_subgenre_ids,
+    validate_subgenre_id,
+)
+from services.v2_service import find_unwatched_v2
 from services.webhook_service import handle_radarr_webhook, handle_sonarr_webhook
 
 logging.basicConfig(
@@ -92,7 +103,7 @@ _URL_RE = re.compile(r"(https?://[^\s)\]>\"]+)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 'HVAD SKAL JEG SE?' — Konstanter og helpers (uændret)
+# 'HVAD SKAL JEG SE?' — Konstanter og helpers (uændret fra v0.10.7)
 # ══════════════════════════════════════════════════════════════════════════════
 
 WATCH_FLOW_TRIGGER = "🍿 Hvad skal jeg se?"
@@ -1043,17 +1054,8 @@ async def cmd_metadata_status(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# /top_keywords — opgraderet med 'all' mode (NY v0.10.7)
+# /top_keywords — uændret fra v0.10.7
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# Tre brugsformer:
-#   /top_keywords                    → top 50 (begge media types) i chat
-#   /top_keywords movie              → top 50 film i chat
-#   /top_keywords movie 100          → top 100 film i chat
-#   /top_keywords movie all          → ALLE film-keywords som JSON+CSV (min 1)
-#   /top_keywords movie all 5        → ALLE med min 5 film
-#   /top_keywords tv all 5           → samme for TV
-#   /top_keywords all 5              → begge media types
 
 async def cmd_top_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -1061,18 +1063,11 @@ async def cmd_top_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     args = context.args
-
-    # Parse args:
-    # - media_type: 'movie', 'tv' eller None
-    # - mode:       'top' (default, returnerer N i chat) eller 'all' (file dump)
-    # - limit:      antal til top-mode (default 50)
-    # - min_count:  min antal film for all-mode (default 1)
     media_type: str | None = None
     mode: str = "top"
     limit: int = 50
     min_count: int = 1
 
-    # Vi parser fleksibelt: enhver rækkefølge af args er OK
     for arg in args:
         arg_lower = arg.lower()
         if arg_lower in ("movie", "tv"):
@@ -1082,16 +1077,14 @@ async def cmd_top_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         elif arg.isdigit():
             num = int(arg)
             if mode == "all":
-                min_count = max(1, num)  # i all-mode er tallet min_count
+                min_count = max(1, num)
             else:
-                limit = max(1, min(num, 200))  # i top-mode er det limit (cap 200)
+                limit = max(1, min(num, 200))
 
-    # ── Mode 1: 'top' — vis i chat (uændret fra v0.10.6) ──────────────────────
     if mode == "top":
         await _cmd_top_keywords_chat(update, media_type, limit)
         return
 
-    # ── Mode 2: 'all' — dump som JSON + CSV ───────────────────────────────────
     await _cmd_top_keywords_dump(update, context, media_type, min_count)
 
 
@@ -1100,7 +1093,6 @@ async def _cmd_top_keywords_chat(
     media_type: str | None,
     limit: int,
 ) -> None:
-    """Top N keywords i chat (v0.10.6 logik bevaret)."""
     await update.message.chat.send_action("typing")
     loading = await update.message.reply_text(
         f"🔬 *Top Keywords*\n\n"
@@ -1183,7 +1175,6 @@ async def _cmd_top_keywords_dump(
     media_type: str | None,
     min_count: int,
 ) -> None:
-    """Dump ALLE keywords som JSON + CSV filer (NY v0.10.7)."""
     user = update.effective_user
 
     await update.message.chat.send_action("typing")
@@ -1200,7 +1191,6 @@ async def _cmd_top_keywords_dump(
         parse_mode="Markdown",
     )
 
-    # ── 1. Hent fra database (limit=None for at få ALT) ───────────────────────
     try:
         keywords = await database.get_top_keywords(
             media_type=media_type, limit=None, min_count=min_count,
@@ -1219,7 +1209,6 @@ async def _cmd_top_keywords_dump(
         )
         return
 
-    # ── 2. Hent total antal film for procent-beregning ────────────────────────
     try:
         status = await database.get_metadata_status()
         if media_type == "movie":
@@ -1231,7 +1220,6 @@ async def _cmd_top_keywords_dump(
     except Exception:
         total_items = 0
 
-    # ── 3. Byg filer ──────────────────────────────────────────────────────────
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     type_suffix = media_type if media_type else "all"
     base_filename = f"keywords_{type_suffix}_min{min_count}_{timestamp}"
@@ -1239,7 +1227,6 @@ async def _cmd_top_keywords_dump(
     json_path = os.path.join(tempfile.gettempdir(), f"{base_filename}.json")
     csv_path  = os.path.join(tempfile.gettempdir(), f"{base_filename}.csv")
 
-    # JSON
     json_data = {
         "metadata": {
             "scanned_at":            datetime.utcnow().isoformat() + "Z",
@@ -1268,7 +1255,6 @@ async def _cmd_top_keywords_dump(
         await loading.edit_text(f"❌ Kunne ikke skrive JSON: {e}")
         return
 
-    # CSV
     try:
         with open(csv_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
@@ -1279,7 +1265,6 @@ async def _cmd_top_keywords_dump(
         csv_size_kb = os.path.getsize(csv_path) / 1024
     except Exception as e:
         logger.error("cmd_top_keywords CSV skriv-fejl: %s", e)
-        # Cleanup JSON før vi giver op
         try:
             os.remove(json_path)
         except Exception:
@@ -1292,7 +1277,6 @@ async def _cmd_top_keywords_dump(
         len(keywords), media_type or "all", min_count, json_size_kb, csv_size_kb,
     )
 
-    # ── 4. Send sammendrag + filer ────────────────────────────────────────────
     try:
         await loading.delete()
     except Exception:
@@ -1313,7 +1297,6 @@ async def _cmd_top_keywords_dump(
         f"_CSV kan åbnes i Google Sheets/Excel._"
     )
 
-    # Send JSON først (tekst-summary i caption)
     try:
         with open(json_path, "rb") as f:
             await context.bot.send_document(
@@ -1332,7 +1315,6 @@ async def _cmd_top_keywords_dump(
             pass
         return
 
-    # Send CSV bagefter (uden caption)
     try:
         with open(csv_path, "rb") as f:
             await context.bot.send_document(
@@ -1346,12 +1328,217 @@ async def _cmd_top_keywords_dump(
         logger.error("cmd_top_keywords CSV send-fejl: %s", e)
         await update.message.reply_text(f"❌ Kunne ikke sende CSV: {e}")
     finally:
-        # Cleanup
         for path in (json_path, csv_path):
             try:
                 os.remove(path)
             except Exception as e:
                 logger.warning("top_keywords cleanup-fejl for %s: %s", path, e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# /test_v2 — Engangs admin DEBUG-kommando (NY v0.10.8)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Tester hele kæden:
+#   1. subgenre_service.SUBGENRES → keywords
+#   2. database.find_films_by_subgenre → DB-kandidater
+#   3. v2_service._build_plex_movie_index → Plex cross-check
+#   4. v2_service._enrich_and_filter_sync → unwatched-filter + sample
+#
+# Brug:
+#   /test_v2 list                     → vis alle 36 subgenre-IDs grupperet pr. kategori
+#   /test_v2 horror_slasher           → test specifik subgenre
+#   /test_v2 special_revenge          → ...
+#
+# Admin-only — slettes når Etape 4 er færdig.
+
+def _format_subgenre_list() -> str:
+    """Bygg pæn oversigt af alle 36 subgenre-IDs grupperet pr. kategori."""
+    lines = [
+        "📋 *Alle subgenre-IDs*",
+        "═══════════════════════",
+        "",
+        "_Brug `/test_v2 <subgenre_id>` for at teste én._",
+        "",
+    ]
+    for cat in get_all_categories():
+        lines.append(f"*{cat['label']}*")
+        for sub in cat["subgenres"]:
+            lines.append(f"  • `{sub['id']}` — {sub['label']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _format_v2_result(result: dict) -> str:
+    """Format find_unwatched_v2 result som pæn Markdown-besked."""
+    status = result.get("status")
+
+    # ── Error cases ───────────────────────────────────────────────────────────
+    if status == "error":
+        return (
+            f"❌ *Fejl*\n\n"
+            f"`{result.get('message', 'Ukendt fejl')}`"
+        )
+
+    # ── Missing case (ingen usete film) ───────────────────────────────────────
+    if status == "missing":
+        label = result.get("subgenre_label", "?")
+        stats = result.get("stats", {})
+        return (
+            f"😔 *{label}*\n"
+            f"_Subgenre: `{result.get('subgenre', '?')}`_\n\n"
+            f"⚠️ *Ingen usete film fundet*\n\n"
+            f"📊 *Stats:*\n"
+            f"  • DB-kandidater: *{stats.get('db_candidates', 0)}*\n"
+            f"  • I Plex: *{stats.get('in_plex', 0)}*\n"
+            f"  • Usete: *{stats.get('unwatched', 0)}*\n"
+            f"  • Returneret: *{stats.get('returned', 0)}*\n\n"
+            f"_Mulige årsager:_\n"
+            f"  • Subgenren har ingen kandidater i din samling\n"
+            f"  • Du har set alle film der matcher\n"
+            f"  • TMDB cachen mangler endnu"
+        )
+
+    # ── Success case (ok med results) ─────────────────────────────────────────
+    label    = result.get("subgenre_label", "?")
+    sub_id   = result.get("subgenre", "?")
+    stats    = result.get("stats", {})
+    results  = result.get("results", [])
+
+    lines = [
+        f"🎯 *{label}*",
+        f"_Subgenre: `{sub_id}`_",
+        "",
+        f"📊 *Stats:*",
+        f"  • DB-kandidater: *{stats.get('db_candidates', 0)}*",
+        f"  • I Plex: *{stats.get('in_plex', 0)}*",
+        f"  • Usete: *{stats.get('unwatched', 0)}*",
+        f"  • Returneret: *{stats.get('returned', 0)}*",
+        "",
+        f"✨ *Forslag ({len(results)}):*",
+    ]
+
+    for film in results:
+        title  = film.get("title", "Ukendt")
+        year   = film.get("year") or "?"
+        rating = film.get("rating")
+        rating_str = f" — {rating:.1f}/10" if rating else ""
+        lines.append(f"  🎬 *{title}* ({year}){rating_str}")
+
+    lines.extend([
+        "",
+        "─────────────",
+        "_Test resultater:_",
+        f"  ✅ Funktionen virker hvis stats viser realistiske tal",
+        f"  ✅ Smart-blanding hvis film er en mix af nye + klassikere",
+        f"  ⚠️ Hvis 'I Plex' er meget lavere end 'DB-kandidater', "
+        f"er TMDB-cachen ude af sync med Plex-biblioteket",
+    ])
+
+    return "\n".join(lines)
+
+
+async def cmd_test_v2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Engangs admin-kommando: /test_v2
+    Tester find_unwatched_v2 fra services/v2_service.py.
+
+    Modi:
+      /test_v2 list                  → vis alle 36 subgenre-IDs
+      /test_v2 <subgenre_id>         → test specifik subgenre
+    """
+    user = update.effective_user
+    if user is None or user.id != config.ADMIN_TELEGRAM_ID:
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "📖 *Brug:*\n"
+            "`/test_v2 list` — vis alle subgenre-IDs\n"
+            "`/test_v2 <subgenre_id>` — test specifik\n\n"
+            "*Eksempler:*\n"
+            "`/test_v2 horror_slasher`\n"
+            "`/test_v2 comedy_romcom`\n"
+            "`/test_v2 special_revenge`",
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── Mode 1: list ──────────────────────────────────────────────────────────
+    if args[0].lower() == "list":
+        report = _format_subgenre_list()
+        # Split i chunks hvis for langt (Telegram har ~4000 tegn limit)
+        if len(report) > 3500:
+            mid = len(report) // 2
+            split_at = report.rfind("\n", 0, mid)
+            await update.message.reply_text(report[:split_at], parse_mode="Markdown")
+            await asyncio.sleep(0.3)
+            await update.message.reply_text(report[split_at:], parse_mode="Markdown")
+        else:
+            await update.message.reply_text(report, parse_mode="Markdown")
+        return
+
+    # ── Mode 2: test specifik subgenre ────────────────────────────────────────
+    subgenre_id = args[0].lower().strip()
+
+    if not validate_subgenre_id(subgenre_id):
+        # Foreslå nærmeste matches
+        all_ids = list_subgenre_ids()
+        suggestions = [sid for sid in all_ids if subgenre_id in sid or sid.startswith(subgenre_id[:4])][:5]
+        suggestion_text = ""
+        if suggestions:
+            suggestion_text = "\n\n*Mente du:*\n" + "\n".join(f"  • `{s}`" for s in suggestions)
+
+        await update.message.reply_text(
+            f"⚠️ *Ukendt subgenre:* `{subgenre_id}`\n"
+            f"{suggestion_text}\n\n"
+            f"Kør `/test_v2 list` for fuld oversigt.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Hent plex_username fra DB
+    plex_username = await database.get_plex_username(user.id)
+
+    await update.message.chat.send_action("typing")
+    loading = await update.message.reply_text(
+        f"🧪 *Tester find_unwatched_v2*\n\n"
+        f"Subgenre: `{subgenre_id}`\n"
+        f"Plex-bruger: `{plex_username or 'admin (fallback)'}`\n\n"
+        f"_Kører DB-query, Plex-scan og filter..._",
+        parse_mode="Markdown",
+    )
+
+    try:
+        result = await find_unwatched_v2(
+            subgenre_id=subgenre_id,
+            plex_username=plex_username,
+            limit=5,
+        )
+    except Exception as e:
+        logger.error("cmd_test_v2 fejl for '%s': %s", subgenre_id, e)
+        await loading.edit_text(f"❌ Uventet fejl: {e}")
+        return
+
+    try:
+        await loading.delete()
+    except Exception:
+        pass
+
+    report = _format_v2_result(result)
+
+    try:
+        await update.message.reply_text(report, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning("cmd_test_v2 Markdown-fejl: %s — sender plain", e)
+        plain = report.replace("*", "").replace("_", "").replace("`", "")
+        await update.message.reply_text(plain)
+
+    logger.info(
+        "test_v2: subgenre='%s' → status='%s' (%d returneret)",
+        subgenre_id, result.get("status"), len(result.get("results", [])),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1964,11 +2151,11 @@ async def on_startup(application: Application) -> None:
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — v0.10.7-beta | "
+        "VERSION CHECK — v0.10.8-beta | "
         "søgeresultater-UX: JA | foto-fix: JA | watch-flow: JA | "
         "watch-genre-split-fix: JA | genres-cmd: JA | dump-genres-cmd: JA | "
         "test-metadata-cmd: JA | tmdb-metadata-cache: JA | "
-        "top-keywords-dump: JA"
+        "top-keywords-dump: JA | test-v2-cmd: JA"
     )
 
 
@@ -1993,7 +2180,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start",           cmd_start))
     app.add_handler(CommandHandler("skift_plex",      cmd_skift_plex))
 
-    # Engangs admin-kommandoer
+    # Engangs admin-kommandoer (slettes når subgenre-projektet er færdigt)
     app.add_handler(CommandHandler("genres",          cmd_genres))
     app.add_handler(CommandHandler("dump_genres",     cmd_dump_genres))
     app.add_handler(CommandHandler("test_metadata",   cmd_test_metadata))
@@ -2003,6 +2190,9 @@ def main() -> None:
     app.add_handler(CommandHandler("fetch_metadata",  cmd_fetch_metadata))
     app.add_handler(CommandHandler("metadata_status", cmd_metadata_status))
     app.add_handler(CommandHandler("top_keywords",    cmd_top_keywords))
+
+    # Etape 2 debug-kommando (NY v0.10.8)
+    app.add_handler(CommandHandler("test_v2",         cmd_test_v2))
 
     # Admin approval
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve_user:\d+$"))
