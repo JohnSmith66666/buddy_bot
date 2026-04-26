@@ -1,35 +1,31 @@
 """
 main.py - Buddy bot entry point.
 
-CHANGES vs previous version (v0.10.3 — /dump_genres admin-kommando):
-  - NY ENGANGS-FEATURE: /dump_genres admin-kommando.
-    * Scanner alle film + serier i Plex og dumper komplet data som JSON.
-    * Sender JSON-filen som Telegram document attachment.
-    * Inkluderer: titel, år, TMDB ID, rating, alle genre-tags per item.
-    * KUN tilgængelig for ADMIN_TELEGRAM_ID.
-    * Tænkt som engangs-værktøj — slettes efter brug.
-  - VERSION CHECK opdateret til v0.10.3-beta.
+CHANGES vs previous version (v0.10.5 — /test_metadata kommando, Step 1 af subgenre-projekt):
+  - NY ENGANGS-FEATURE: /test_metadata <tmdb_id eller titel>
+    Step 1 af subgenre-projektet (jf. plan med PostgreSQL cache + GIN-indekser):
+    * Henter TMDB-genrer + keywords for én film/serie
+    * Formaterer output pænt så vi manuelt kan vurdere mængden af
+      "guld" vs. "støj" i keyword-listen
+    * To input-modes:
+        /test_metadata 27205          → direkte TMDB ID
+        /test_metadata Inception       → titel-søgning, viser top 5 hits
+    * Bruger ny services/tmdb_keywords_service.py
+  - VERSION CHECK opdateret til v0.10.5-beta.
 
-UNCHANGED (v0.10.2 — /genres admin-kommando):
-  - cmd_genres viser genre-counts og top-kombinationer i Telegram.
-
+UNCHANGED (v0.10.4 — /test_enrich DRY-RUN kommando — bevares).
+UNCHANGED (v0.10.3 — /dump_genres admin-kommando).
+UNCHANGED (v0.10.2 — /genres admin-kommando).
 UNCHANGED (v0.10.1 — genre-parameter fix).
 UNCHANGED (v0.10.0 — 'Hvad skal jeg se?' interaktivt flow).
 UNCHANGED (v0.9.8 — Annuller-knap photo-fix).
-UNCHANGED (v0.9.7 — søgeresultater UX-fix).
-
-Tidligere ændringer (bevares):
-  - v0.9.5: user_first_name sendes til get_ai_response.
-  - v0.9.3: persona-rens, SHOW_INFO/TRAILER/SEARCH_RESULTS signal-arkitektur.
-  - handle_watchlist_callback importeret fra confirmation_service.
-  - escape_markdown for URL-underscores.
-  - Webhook server på port 8080 med valgfri token-tjek.
 """
 
 import asyncio
 import json
 import logging
 import os
+import random
 import re
 import sys
 import tempfile
@@ -70,6 +66,11 @@ from services.confirmation_service import (
 )
 from services.plex_service import validate_plex_user
 from services.tmdb_service import get_media_details
+from services.tmdb_keywords_service import (
+    fetch_movie_metadata,
+    fetch_tv_metadata,
+    search_tmdb_by_title,
+)
 from services.webhook_service import handle_radarr_webhook, handle_sonarr_webhook
 
 logging.basicConfig(
@@ -79,22 +80,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Matcher alle http(s)-URL'er — bruges til escape af underscores i tekst-beskeder
 _URL_RE = re.compile(r"(https?://[^\s)\]>\"]+)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 'HVAD SKAL JEG SE?' — Konstanter og helpers
+# 'HVAD SKAL JEG SE?' — Konstanter og helpers (uændret fra v0.10.4)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Tekst på fast ReplyKeyboard-knap. Også brugt som trigger i MessageHandler.
 WATCH_FLOW_TRIGGER = "🍿 Hvad skal jeg se?"
-
-# Max antal stemninger brugeren må vælge på tværs af alle sider
 MAX_MOODS = 2
 
-# Stemnings-katalog. ID 1-17. Hver stemning mapper til 1+ Plex-genrer.
-# Genre-navne skal matche Plex-bibliotekets genre-tags (på dansk).
 WATCH_MOODS: dict[int, dict] = {
     1:  {"emoji": "🛋️",  "name": "Netflix and Chill",       "genres": ["Komedie", "Romantik"]},
     2:  {"emoji": "😂",  "name": "Grin til jeg græder",     "genres": ["Komedie"]},
@@ -115,7 +110,6 @@ WATCH_MOODS: dict[int, dict] = {
     17: {"emoji": "🔫",  "name": "Tilbage til skyttegraven","genres": ["Krig", "Historie", "War & Politics"]},
 }
 
-# Pagination: hvilken stemning er på hvilken side
 WATCH_PAGES: dict[int, list[int]] = {
     1: [1, 2, 3, 4, 5, 6],
     2: [7, 8, 9, 10, 11, 12],
@@ -125,10 +119,6 @@ TOTAL_PAGES = 3
 
 
 def _build_main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """
-    Permanent ReplyKeyboard nederst i Telegram-vinduet.
-    Vises efter onboarding er færdig og ved /start.
-    """
     return ReplyKeyboardMarkup(
         [[KeyboardButton(WATCH_FLOW_TRIGGER)]],
         resize_keyboard=True,
@@ -137,26 +127,20 @@ def _build_main_reply_keyboard() -> ReplyKeyboardMarkup:
 
 
 def _get_watch_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
-    """
-    Hent (eller initialiser) brugerens 'watch flow' state i context.user_data.
-    State er in-memory og lever pr. user_id mellem callbacks.
-    """
     if "watch_flow" not in context.user_data:
         context.user_data["watch_flow"] = {
-            "media_type":     None,    # 'movie' | 'tv' | None
-            "selected_moods": [],      # liste af mood IDs (max 2)
-            "page":           1,       # aktuel side (1-3)
+            "media_type":     None,
+            "selected_moods": [],
+            "page":           1,
         }
     return context.user_data["watch_flow"]
 
 
 def _clear_watch_state(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ryd watch flow state — kaldes efter handoff til AI eller ved cancel."""
     context.user_data.pop("watch_flow", None)
 
 
 def _build_type_selection_keyboard() -> InlineKeyboardMarkup:
-    """Trin 2: vis Film / Serie / Overrask mig som 1. valg."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🎬 Film",   callback_data="watch_type:movie"),
@@ -168,9 +152,6 @@ def _build_type_selection_keyboard() -> InlineKeyboardMarkup:
 
 
 def _build_mood_keyboard(state: dict) -> InlineKeyboardMarkup:
-    """
-    Trin 3: vis stemnings-knapper for aktuel side + navigation + handoff-knapper.
-    """
     page          = state["page"]
     selected      = set(state["selected_moods"])
     media_type    = state["media_type"]
@@ -178,7 +159,6 @@ def _build_mood_keyboard(state: dict) -> InlineKeyboardMarkup:
 
     rows: list[list[InlineKeyboardButton]] = []
 
-    # ── Stemnings-knapper, 2 pr. række ────────────────────────────────────────
     row: list[InlineKeyboardButton] = []
     for mood_id in mood_ids:
         mood   = WATCH_MOODS[mood_id]
@@ -191,7 +171,6 @@ def _build_mood_keyboard(state: dict) -> InlineKeyboardMarkup:
     if row:
         rows.append(row)
 
-    # ── Navigation ────────────────────────────────────────────────────────────
     nav_row: list[InlineKeyboardButton] = []
     if page > 1:
         nav_row.append(InlineKeyboardButton("⬅️ Forrige", callback_data=f"watch_page:{page-1}"))
@@ -200,7 +179,6 @@ def _build_mood_keyboard(state: dict) -> InlineKeyboardMarkup:
     if nav_row:
         rows.append(nav_row)
 
-    # ── Handoff: 🚀 Søg nu / 🎲 Overrask ─────────────────────────────────────
     if selected:
         search_btn = InlineKeyboardButton("🚀 Søg nu!", callback_data="watch_search")
     else:
@@ -210,14 +188,12 @@ def _build_mood_keyboard(state: dict) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🎲 Overrask mig!", callback_data="watch_surprise"),
     ])
 
-    # ── Footer: ❌ Afbryd ─────────────────────────────────────────────────────
     rows.append([InlineKeyboardButton("❌ Afbryd", callback_data="watch_cancel")])
 
     return InlineKeyboardMarkup(rows)
 
 
 def _build_mood_message_text(state: dict) -> str:
-    """Bygger besked-teksten over stemnings-tastaturet."""
     media_label = "🎬 *Film*" if state["media_type"] == "movie" else "📺 *Serie*"
     selected    = state["selected_moods"]
     page        = state["page"]
@@ -236,13 +212,6 @@ def _build_mood_message_text(state: dict) -> str:
 
 
 def _build_watch_prompt(state: dict, mode: str) -> str:
-    """
-    Bygger den prompt der sendes til get_ai_response.
-
-    BUG FIX (v0.10.1): Tidligere blev genrer formateret som comma-separeret
-    streng — Buddy sendte den som ÉN genre-string til find_unwatched.
-    Nu instrueres Buddy eksplicit til SEPARATE parallelle find_unwatched-kald.
-    """
     media_type = state.get("media_type")
     media_word = "film" if media_type == "movie" else ("serier" if media_type == "tv" else "film eller serier")
 
@@ -286,11 +255,10 @@ def _build_watch_prompt(state: dict, mode: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# /genres — Engangs admin-kommando til genre-audit (v0.10.2)
+# /genres + /dump_genres — Engangs admin-kommandoer (uændret fra tidligere)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _scan_plex_genres_sync() -> dict:
-    """Synkron Plex-scanning. Kører i thread pool."""
     from services.plex_service import _connect, _sections, _MOVIE_TYPE, _TV_TYPE
 
     plex = _connect(None)
@@ -343,7 +311,6 @@ def _scan_plex_genres_sync() -> dict:
 
 
 def _format_genres_report(data: dict) -> list[str]:
-    """Formaterer scan-resultatet som flere Telegram-beskeder."""
     if data.get("error"):
         return [f"❌ Fejl ved Plex-scan: {data['error']}"]
 
@@ -381,11 +348,6 @@ def _format_genres_report(data: dict) -> list[str]:
 
 
 async def cmd_genres(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Engangs admin-kommando: /genres
-    Scanner Plex og rapporterer alle unikke genre-tags + top kombinationer.
-    KUN tilgængelig for ADMIN_TELEGRAM_ID.
-    """
     user = update.effective_user
     if user is None or user.id != config.ADMIN_TELEGRAM_ID:
         return
@@ -426,25 +388,7 @@ async def cmd_genres(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     logger.info("Genre-rapport sendt til admin telegram_id=%s", user.id)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# /dump_genres — Engangs admin-kommando til komplet JSON-dump (v0.10.3)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _dump_plex_data_sync() -> dict:
-    """
-    Synkron Plex-dump. Kører i thread pool.
-    Henter ALLE film + serier med komplet metadata til genre-analyse.
-
-    Returnerer struktureret data:
-    {
-      "metadata": {...},   # scan-info
-      "movies":   [...],   # alle film
-      "tv":       [...],   # alle serier
-    }
-
-    Per item:
-      - title, year, tmdb_id, rating, genres (sorted list)
-    """
     from services.plex_service import (
         _connect, _sections, _MOVIE_TYPE, _TV_TYPE,
         _extract_tmdb_id_from_guids,
@@ -457,7 +401,6 @@ def _dump_plex_data_sync() -> dict:
     movies: list[dict] = []
     tv:     list[dict] = []
 
-    # ── Film ──────────────────────────────────────────────────────────────────
     for section in _sections(plex, _MOVIE_TYPE):
         try:
             all_items = section.all()
@@ -478,7 +421,6 @@ def _dump_plex_data_sync() -> dict:
             except Exception as e:
                 logger.warning("dump: item parse-fejl: %s", e)
 
-    # ── Serier ────────────────────────────────────────────────────────────────
     for section in _sections(plex, _TV_TYPE):
         try:
             all_items = section.all()
@@ -505,11 +447,7 @@ def _dump_plex_data_sync() -> dict:
             "movie_count":     len(movies),
             "tv_count":        len(tv),
             "schema_version":  1,
-            "description":     (
-                "Komplet dump af Plex-bibliotek. Hver post indeholder titel, år, "
-                "TMDB ID, rating (0-10) og en sorteret liste af genre-tags som de "
-                "er gemt i Plex. Bruges til offline genre-kombinations-analyse."
-            ),
+            "description":     "Komplet dump af Plex-bibliotek.",
         },
         "movies": movies,
         "tv":     tv,
@@ -517,12 +455,6 @@ def _dump_plex_data_sync() -> dict:
 
 
 async def cmd_dump_genres(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Engangs admin-kommando: /dump_genres
-    Scanner hele Plex og sender komplet JSON-dump som Telegram document.
-    Filen slettes fra disk efter afsendelse.
-    KUN tilgængelig for ADMIN_TELEGRAM_ID.
-    """
     user = update.effective_user
     if user is None or user.id != config.ADMIN_TELEGRAM_ID:
         return
@@ -533,7 +465,6 @@ async def cmd_dump_genres(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "Dette kan tage 30-60 sekunder for store biblioteker."
     )
 
-    # ── 1. Scan Plex ──────────────────────────────────────────────────────────
     try:
         data = await asyncio.to_thread(_dump_plex_data_sync)
     except Exception as e:
@@ -553,7 +484,6 @@ async def cmd_dump_genres(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(f"❌ {data['error']}")
         return
 
-    # ── 2. Skriv JSON til midlertidig fil ─────────────────────────────────────
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     filename  = f"plex_dump_{timestamp}.json"
     filepath  = os.path.join(tempfile.gettempdir(), filename)
@@ -573,13 +503,9 @@ async def cmd_dump_genres(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     logger.info(
         "dump_genres: %d film + %d serier dumpet (%.1f KB) → %s",
-        data["metadata"]["movie_count"],
-        data["metadata"]["tv_count"],
-        size_kb,
-        filename,
+        data["metadata"]["movie_count"], data["metadata"]["tv_count"], size_kb, filename,
     )
 
-    # ── 3. Send fil + opsummering ─────────────────────────────────────────────
     try:
         await loading_msg.delete()
     except Exception:
@@ -606,12 +532,250 @@ async def cmd_dump_genres(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.error("cmd_dump_genres send-fejl: %s", e)
         await update.message.reply_text(f"❌ Kunne ikke sende fil: {e}")
     finally:
-        # ── 4. Ryd op: slet midlertidig fil ───────────────────────────────────
         try:
             os.remove(filepath)
-            logger.info("dump_genres: midlertidig fil slettet: %s", filepath)
         except Exception as e:
             logger.warning("dump_genres: kunne ikke slette %s: %s", filepath, e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# /test_metadata — Engangs admin DRY-RUN af TMDB metadata-fetch (v0.10.5)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# DESIGN:
+#   STEP 1 i subgenre-projektet (jf. plan med PostgreSQL cache + GIN-indekser).
+#   Formål: vurdere kvaliteten af TMDB keywords MANUELT før vi designer
+#   database-schemaet og whitelist-logikken.
+#
+# To input-modes:
+#   /test_metadata 27205         → direkte TMDB ID (movie default)
+#   /test_metadata tv 1396       → TV ID
+#   /test_metadata Inception     → titel-søgning, viser top 5 hits
+#
+# Output viser:
+#   - Titel, år, media_type
+#   - Alle TMDB-genrer (engelsk)
+#   - Alle TMDB-keywords med count
+#   - Vurderings-prompt: "Hvor mange er guld vs. støj?"
+
+def _format_metadata_report(meta: dict) -> str:
+    """Formater metadata-resultat som pæn Markdown-besked til Telegram."""
+    if meta.get("status") == "error":
+        return (
+            f"❌ *TMDB Fejl*\n"
+            f"`{meta.get('error_message', 'Ukendt fejl')}`\n"
+            f"tmdb_id: `{meta.get('tmdb_id')}`"
+        )
+
+    if meta.get("status") == "not_found":
+        return (
+            f"⚠️ *Ikke fundet på TMDB*\n"
+            f"tmdb_id: `{meta.get('tmdb_id')}`"
+        )
+
+    title       = meta["title"]
+    year        = meta.get("year") or "?"
+    media_type  = meta["media_type"]
+    media_emoji = "🎬" if media_type == "movie" else "📺"
+    genres      = meta["genres"]
+    keywords    = meta["keywords"]
+    g_count     = meta["genre_count"]
+    k_count     = meta["keyword_count"]
+
+    lines = [
+        f"{media_emoji} *{title}* ({year})",
+        f"_TMDB ID: `{meta['tmdb_id']}`_",
+        "",
+        f"🎭 *TMDB Genrer* ({g_count})",
+        "─────────────────",
+    ]
+
+    if genres:
+        for g in genres:
+            lines.append(f"  • {g}")
+    else:
+        lines.append("  _(ingen genrer)_")
+
+    lines.extend([
+        "",
+        f"🏷️ *TMDB Keywords* ({k_count})",
+        "─────────────────",
+    ])
+
+    if keywords:
+        # Vis ALLE keywords som bullet-liste — vi vil se den fulde "støj"
+        for kw in keywords:
+            lines.append(f"  • {kw}")
+    else:
+        lines.append("  _(ingen keywords)_")
+
+    if meta.get("keyword_warning"):
+        lines.extend(["", f"⚠️ _{meta['keyword_warning']}_"])
+
+    lines.extend([
+        "",
+        "─────────────────",
+        "🔍 *Vurder selv:*",
+        "  • Hvor mange keywords er *guld* (subgenre-værdige)?",
+        "    F.eks.: cyberpunk, heist, slasher, neo-noir",
+        "  • Hvor mange er *støj* (irrelevant for subgenre)?",
+        "    F.eks.: 'based on novel', 'duringcreditsstinger'",
+        "",
+        "_Når du har kigget på 5-10 forskellige film, kan vi designe whitelisten._",
+    ])
+
+    return "\n".join(lines)
+
+
+def _format_search_results(query: str, results: list[dict]) -> str:
+    """Vis søgeresultater når brugeren skrev en titel."""
+    lines = [
+        f"🔍 *TMDB-søgeresultater for:* `{query}`",
+        "─────────────────",
+        "",
+        "Klik på en linje for at hente fuld metadata:",
+        "",
+    ]
+    for r in results:
+        emoji  = "🎬" if r["media_type"] == "movie" else "📺"
+        year   = r.get("year") or "?"
+        cmd    = f"/test_metadata {r['media_type']} {r['tmdb_id']}"
+        lines.append(f"{emoji} *{r['title']}* ({year})")
+        lines.append(f"   `{cmd}`")
+        lines.append("")
+    return "\n".join(lines)
+
+
+async def cmd_test_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Engangs admin-kommando: /test_metadata <tmdb_id eller titel>
+
+    Eksempler:
+      /test_metadata 27205              → Inception (movie default)
+      /test_metadata movie 27205        → eksplicit movie
+      /test_metadata tv 1396            → Breaking Bad
+      /test_metadata Inception          → titel-søgning
+      /test_metadata Breaking Bad       → titel-søgning
+    """
+    user = update.effective_user
+    if user is None or user.id != config.ADMIN_TELEGRAM_ID:
+        return
+
+    # Parse argumenter
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "📖 *Brug:*\n"
+            "`/test_metadata <tmdb_id>`\n"
+            "`/test_metadata movie <tmdb_id>`\n"
+            "`/test_metadata tv <tmdb_id>`\n"
+            "`/test_metadata <titel>`\n\n"
+            "*Eksempler:*\n"
+            "`/test_metadata 27205`\n"
+            "`/test_metadata tv 1396`\n"
+            "`/test_metadata Inception`",
+            parse_mode="Markdown",
+        )
+        return
+
+    await update.message.chat.send_action("typing")
+
+    # ── Mode 1: 'movie <id>' eller 'tv <id>' ──────────────────────────────────
+    if len(args) == 2 and args[0].lower() in ("movie", "tv") and args[1].isdigit():
+        media_type = args[0].lower()
+        tmdb_id    = int(args[1])
+        loading = await update.message.reply_text(
+            f"🔍 Henter TMDB-metadata for {media_type} ID `{tmdb_id}`...",
+            parse_mode="Markdown",
+        )
+        try:
+            if media_type == "movie":
+                meta = await fetch_movie_metadata(tmdb_id)
+            else:
+                meta = await fetch_tv_metadata(tmdb_id)
+        except Exception as e:
+            logger.error("test_metadata fetch-fejl: %s", e)
+            await loading.edit_text(f"❌ Fejl: {e}")
+            return
+
+        report = _format_metadata_report(meta)
+        try:
+            await loading.delete()
+        except Exception:
+            pass
+        await update.message.reply_text(report, parse_mode="Markdown")
+        return
+
+    # ── Mode 2: kun et tal (default movie) ────────────────────────────────────
+    if len(args) == 1 and args[0].isdigit():
+        tmdb_id = int(args[0])
+        loading = await update.message.reply_text(
+            f"🔍 Henter TMDB-metadata for movie ID `{tmdb_id}` (default)...",
+            parse_mode="Markdown",
+        )
+        try:
+            meta = await fetch_movie_metadata(tmdb_id)
+        except Exception as e:
+            logger.error("test_metadata fetch-fejl: %s", e)
+            await loading.edit_text(f"❌ Fejl: {e}")
+            return
+
+        # Hvis ikke fundet som movie, prøv tv automatisk
+        if meta.get("status") == "not_found":
+            try:
+                meta = await fetch_tv_metadata(tmdb_id)
+                if meta.get("status") == "ok":
+                    logger.info("test_metadata: ID %d fundet som TV efter movie-fejl", tmdb_id)
+            except Exception:
+                pass
+
+        report = _format_metadata_report(meta)
+        try:
+            await loading.delete()
+        except Exception:
+            pass
+        await update.message.reply_text(report, parse_mode="Markdown")
+        return
+
+    # ── Mode 3: titel-søgning ────────────────────────────────────────────────
+    query = " ".join(args)
+    loading = await update.message.reply_text(
+        f"🔍 Søger TMDB efter: `{query}`...",
+        parse_mode="Markdown",
+    )
+    try:
+        results = await search_tmdb_by_title(query, media_type="both")
+    except Exception as e:
+        logger.error("test_metadata search-fejl: %s", e)
+        await loading.edit_text(f"❌ Søgning fejlede: {e}")
+        return
+
+    try:
+        await loading.delete()
+    except Exception:
+        pass
+
+    if not results:
+        await update.message.reply_text(
+            f"⚠️ Ingen TMDB-resultater for `{query}`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Hvis præcis 1 resultat — hent metadata direkte
+    if len(results) == 1:
+        r = results[0]
+        if r["media_type"] == "movie":
+            meta = await fetch_movie_metadata(r["tmdb_id"])
+        else:
+            meta = await fetch_tv_metadata(r["tmdb_id"])
+        report = _format_metadata_report(meta)
+        await update.message.reply_text(report, parse_mode="Markdown")
+        return
+
+    # Flere resultater — vis liste
+    report = _format_search_results(query, results)
+    await update.message.reply_text(report, parse_mode="Markdown")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -619,18 +783,13 @@ async def cmd_dump_genres(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ══════════════════════════════════════════════════════════════════════════════
 
 def escape_markdown(text: str) -> str:
-    """
-    Escaper underscores inde i URL'er saa Telegrams Markdown-parser ikke
-    misfortolker dem som kursiv-markoerer og kraesjer med 'Can't parse entities'.
-    """
     def _escape_url(match: re.Match) -> str:
         return match.group(1).replace("_", r"\_")
-
     return _URL_RE.sub(_escape_url, text)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Guards
+# Guards (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _guard(update: Update) -> bool:
@@ -661,10 +820,6 @@ async def _needs_plex_setup(update: Update) -> bool:
     )
     return True
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Plex onboarding
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def _handle_plex_input(update: Update, raw_input: str) -> None:
     user = update.effective_user
@@ -729,11 +884,10 @@ async def cmd_skift_plex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 'Hvad skal jeg se?' — Trin 1: trigger fra fast knap
+# 'Hvad skal jeg se?' callbacks (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_watch_flow_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Triggered når brugeren trykker på 🍿 Hvad skal jeg se?-knappen."""
     if not await _guard(update):
         return
 
@@ -753,12 +907,7 @@ async def handle_watch_flow_trigger(update: Update, context: ContextTypes.DEFAUL
     logger.info("Watch flow startet for telegram_id=%s", user.id)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 'Hvad skal jeg se?' — Trin 2: type-valg
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def handle_watch_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Bruger valgte type i trin 2."""
     query = update.callback_query
     await query.answer()
 
@@ -788,12 +937,7 @@ async def handle_watch_type_callback(update: Update, context: ContextTypes.DEFAU
         logger.warning("handle_watch_type_callback edit fejl: %s", e)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 'Hvad skal jeg se?' — Trin 3a: toggle stemning
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def handle_watch_mood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Toggle valgt stemning. Max MAX_MOODS valgte ad gangen."""
     query = update.callback_query
 
     if not await _guard(update):
@@ -836,12 +980,7 @@ async def handle_watch_mood_callback(update: Update, context: ContextTypes.DEFAU
         logger.warning("handle_watch_mood_callback edit fejl: %s", e)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 'Hvad skal jeg se?' — Trin 3b: skift side
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def handle_watch_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Skift mellem side 1, 2 og 3 i stemnings-vælgeren."""
     query = update.callback_query
     await query.answer()
 
@@ -873,12 +1012,7 @@ async def handle_watch_page_callback(update: Update, context: ContextTypes.DEFAU
         logger.warning("handle_watch_page_callback edit fejl: %s", e)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 'Hvad skal jeg se?' — Trin 4: AI handoff
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def handle_watch_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """🚀 Søg nu! — byg prompt fra valgte stemninger og send til AI."""
     query = update.callback_query
 
     if not await _guard(update):
@@ -896,7 +1030,6 @@ async def handle_watch_search_callback(update: Update, context: ContextTypes.DEF
 
 
 async def handle_watch_surprise_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """🎲 Overrask mig (efter type valgt) — tilfældige forslag inden for type."""
     query = update.callback_query
     await query.answer()
 
@@ -913,7 +1046,6 @@ async def handle_watch_surprise_callback(update: Update, context: ContextTypes.D
 
 
 async def handle_watch_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """❌ Afbryd — ryd state og fjern keyboard."""
     query = update.callback_query
     await query.answer()
 
@@ -926,7 +1058,6 @@ async def handle_watch_cancel_callback(update: Update, context: ContextTypes.DEF
 
 
 async def handle_watch_noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """🔒 Vælg en stemning — disabled-knap, vis bare en hint."""
     query = update.callback_query
     await query.answer("Vælg mindst 1 stemning først 👇", show_alert=False)
 
@@ -937,7 +1068,6 @@ async def _execute_ai_handoff(
     query,
     prompt: str,
 ) -> None:
-    """Fælles handoff til AI."""
     user        = update.effective_user
     chat        = query.message.chat
     state_snapshot = dict(_get_watch_state(context))
@@ -976,40 +1106,30 @@ async def _execute_ai_handoff(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Inline Keyboard callbacks (bestillingsflow — uændret fra v0.9.8)
+# Bestillingsflow callbacks (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Bruger valgte et søgeresultat — vis Netflix-look infokort."""
     query = update.callback_query
     await query.answer()
-
     if not await _guard(update):
         return
-
     token = query.data.split(":", 1)[1]
     plex_username = await database.get_plex_username(query.from_user.id)
     await show_confirmation(query, context, token, plex_username)
 
 
 async def handle_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Bruger bekræftede bestilling — send til Radarr/Sonarr."""
     query = update.callback_query
     await query.answer()
-
     if not await _guard(update):
         return
-
     token = query.data.split(":", 1)[1]
     plex_username = await database.get_plex_username(query.from_user.id)
     await execute_order(query, token, plex_username)
 
 
 async def handle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Bruger annullerede — ryd op.
-    BUG FIX (v0.9.8): edit_message_text() fejler på photo-beskeder.
-    """
     query = update.callback_query
     await query.answer()
 
@@ -1038,10 +1158,8 @@ async def handle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Bruger trykkede ⬅️ Tilbage i søgeresultatlisten."""
     query = update.callback_query
     await query.answer()
-
     if not await _guard(update):
         return
 
@@ -1067,7 +1185,6 @@ async def handle_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fanger /info_movie_<tmdb_id> og /info_tv_<tmdb_id> kommandoer."""
     if not await _guard(update):
         return
 
@@ -1125,7 +1242,7 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Message handler (fritekst)
+# Message handler
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1135,7 +1252,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user = update.effective_user
     text = (update.message.text or "").strip()
 
-    # ── Watch flow trigger ────────────────────────────────────────────────────
     if text == WATCH_FLOW_TRIGGER:
         await handle_watch_flow_trigger(update, context)
         return
@@ -1186,7 +1302,6 @@ async def _process_ai_reply(
     plex_username: str | None,
     reply: str,
 ) -> None:
-    """Fælles signal-parsing for AI-svar."""
     clean_reply = reply.replace("`", "").strip()
 
     def _find_signal(signal: str) -> str | None:
@@ -1196,7 +1311,6 @@ async def _process_ai_reply(
                 return line
         return None
 
-    # ── Signal: bestillingsflow ───────────────────────────────────────────────
     signal_line = _find_signal(SEARCH_SIGNAL)
     if signal_line:
         parts = signal_line[len(SEARCH_SIGNAL):].split(":", 1)
@@ -1208,7 +1322,6 @@ async def _process_ai_reply(
         await show_search_results(target_message, query_term, media_type)
         return
 
-    # ── Signal: Netflix-look infokort ─────────────────────────────────────────
     signal_line = _find_signal(INFO_SIGNAL)
     if signal_line:
         payload = signal_line[len(INFO_SIGNAL):].strip()
@@ -1233,7 +1346,6 @@ async def _process_ai_reply(
         else:
             logger.warning("SHOW_INFO signal kunne ikke parses: %r", reply)
 
-    # ── Signal: trailer-knap ──────────────────────────────────────────────────
     signal_line = _find_signal(TRAILER_SIGNAL)
     if signal_line:
         payload  = signal_line[len(TRAILER_SIGNAL):]
@@ -1254,7 +1366,6 @@ async def _process_ai_reply(
             await database.log_message(user.id, "outgoing", besked_tekst)
             return
 
-    # ── Normalt svar ──────────────────────────────────────────────────────────
     safe_reply = escape_markdown(reply)
     await chat.send_message(safe_reply, parse_mode="Markdown")
     await database.log_message(user.id, "outgoing", reply)
@@ -1312,7 +1423,6 @@ async def _start_webhook_server() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Catch-all handler for uventede Telegram-fejl."""
     logger.error(
         "Uventet fejl ved håndtering af update:\n%s",
         "".join(traceback.format_exception(
@@ -1340,16 +1450,14 @@ async def on_startup(application: Application) -> None:
     await _start_webhook_server()
     if not config.WEBHOOK_SECRET:
         logger.warning(
-            "WEBHOOK_SECRET er ikke sat — webhooks accepteres uden token-tjek! "
-            "Sæt WEBHOOK_SECRET i Railway for at sikre endpointene."
+            "WEBHOOK_SECRET er ikke sat — webhooks accepteres uden token-tjek!"
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — v0.10.3-beta | "
-        "søgeresultater-UX: JA | foto-fix: JA | årstal-fallback: JA | "
-        "tilbage-knap: JA | already-anmodet-check: JA | user_first_name: JA | "
-        "annuller-photo-fix: JA | watch-flow: JA | watch-genre-split-fix: JA | "
-        "genres-cmd: JA | dump-genres-cmd: JA"
+        "VERSION CHECK — v0.10.5-beta | "
+        "søgeresultater-UX: JA | foto-fix: JA | watch-flow: JA | "
+        "watch-genre-split-fix: JA | genres-cmd: JA | dump-genres-cmd: JA | "
+        "test-metadata-cmd: JA"
     )
 
 
@@ -1371,10 +1479,11 @@ def main() -> None:
         .build()
     )
 
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("skift_plex",  cmd_skift_plex))
-    app.add_handler(CommandHandler("genres",      cmd_genres))       # Engangs admin
-    app.add_handler(CommandHandler("dump_genres", cmd_dump_genres))  # Engangs admin (NYT v0.10.3)
+    app.add_handler(CommandHandler("start",         cmd_start))
+    app.add_handler(CommandHandler("skift_plex",    cmd_skift_plex))
+    app.add_handler(CommandHandler("genres",        cmd_genres))         # Engangs admin
+    app.add_handler(CommandHandler("dump_genres",   cmd_dump_genres))    # Engangs admin
+    app.add_handler(CommandHandler("test_metadata", cmd_test_metadata))  # NY v0.10.5
 
     # Admin approval
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve_user:\d+$"))
@@ -1395,7 +1504,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_watchlist_callback, pattern=r"^watchlist:"))
     app.add_handler(CallbackQueryHandler(handle_back_callback,      pattern=r"^back:"))
 
-    # Info-links fra lister
+    # Info-links
     app.add_handler(MessageHandler(
         (filters.COMMAND | filters.TEXT) & filters.Regex(r"^/info_?(movie|tv)_?(\d+)$"),
         handle_info_link,
