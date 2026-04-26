@@ -1,11 +1,18 @@
 """
 main.py - Buddy bot entry point.
 
-CHANGES vs previous version (v0.9.7 — søgeresultater UX-fix):
+CHANGES vs previous version (v0.9.8 — Annuller-knap photo-fix):
+  - BUG FIX: handle_cancel_callback brugte query.edit_message_text() som
+    fejler på photo-beskeder (infokort med poster). Resultat: brugeren
+    fik "Hov, jeg fik vist popcorn galt i halsen!" ved tryk på ❌ Annuller.
+    Fixet: Detekterer nu om beskeden er photo, og bruger
+    edit_message_caption() i så fald. Robust fallback hvis edit fejler.
+  - VERSION CHECK opdateret til v0.9.8-beta.
+
+UNCHANGED (v0.9.7 — søgeresultater UX-fix):
   - Tilføjet handle_back_callback: håndterer ⬅️ Tilbage-knappen i søgeresultatlisten.
     Henter søgeterm og media_type fra pending_request og viser listen igen.
   - Registreret back:-handler i main() under bestillingsflow.
-  - VERSION CHECK opdateret til v0.9.7-beta.
 
 Tidligere ændringer (bevares):
   - v0.9.5: user_first_name sendes til get_ai_response.
@@ -189,7 +196,15 @@ async def handle_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def handle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Bruger annullerede — ryd op."""
+    """
+    Bruger annullerede — ryd op.
+
+    BUG FIX (v0.9.8): edit_message_text() fejler på photo-beskeder (infokort
+    med poster). Vi detekterer derfor besked-typen først:
+      - Photo (infokort) → edit_message_caption()
+      - Tekst (søgeliste) → edit_message_text()
+    Robust fallback hvis edit fejler: slet original og send ny besked.
+    """
     query = update.callback_query
     await query.answer()
 
@@ -197,7 +212,24 @@ async def handle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
     if token != "none":
         await database.get_pending_request(token)  # sletter fra DB
 
-    await query.edit_message_text("Bestillingen blev annulleret. 👍")
+    cancel_text = "Bestillingen blev annulleret. 👍"
+    is_photo = bool(getattr(query.message, "photo", None))
+
+    try:
+        if is_photo:
+            await query.edit_message_caption(caption=cancel_text)
+        else:
+            await query.edit_message_text(cancel_text)
+    except Exception as e:
+        logger.warning("handle_cancel_callback edit fejl: %s — sender ny besked", e)
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        try:
+            await query.message.chat.send_message(cancel_text)
+        except Exception as e2:
+            logger.error("handle_cancel_callback fallback fejl: %s", e2)
 
 
 async def handle_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -508,9 +540,10 @@ async def on_startup(application: Application) -> None:
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — v0.9.7-beta | "
+        "VERSION CHECK — v0.9.8-beta | "
         "søgeresultater-UX: JA | foto-fix: JA | årstal-fallback: JA | "
-        "tilbage-knap: JA | already-anmodet-check: JA | user_first_name: JA"
+        "tilbage-knap: JA | already-anmodet-check: JA | user_first_name: JA | "
+        "annuller-photo-fix: JA"
     )
 
 
