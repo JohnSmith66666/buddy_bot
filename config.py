@@ -1,17 +1,24 @@
 """
 config.py - Centralized configuration loaded from environment variables.
-The application will raise an error at startup if any required variable is missing.
+
+CHANGES vs previous version:
+  - Tilføjet WEBHOOK_SECRET (valgfri) til sikring af Radarr/Sonarr webhooks.
+    Mangler den, logges en advarsel ved startup og webhooks accepteres uden tjek.
+    Sæt den i Railway og i Radarr/Sonarr's webhook URL: ?token=DIN_KODE
+  - Tavily API key forbliver valgfri som tidligere.
 """
 
+import logging
 import os
+
 from dotenv import load_dotenv
 
-# Load .env file when running locally; Railway injects variables directly.
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 def _require(key: str) -> str:
-    """Fetch a required environment variable or raise a clear error."""
     value = os.getenv(key)
     if not value:
         raise EnvironmentError(
@@ -22,17 +29,51 @@ def _require(key: str) -> str:
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN: str = _require("TELEGRAM_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN: str = _require("TELEGRAM_TOKEN")
+ADMIN_TELEGRAM_ID: int  = int(_require("ADMIN_TELEGRAM_ID"))
 
 # ── Database ──────────────────────────────────────────────────────────────────
 DATABASE_URL: str = _require("DATABASE_URL")
 
 # ── Anthropic ─────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY: str = _require("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL: str   = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+
+# ── TMDB ──────────────────────────────────────────────────────────────────────
+TMDB_API_KEY: str = _require("TMDB_API_KEY")
+
+# ── Plex ──────────────────────────────────────────────────────────────────────
+PLEX_URL: str   = _require("PLEX_URL")
+PLEX_TOKEN: str = _require("PLEX_TOKEN")
+
+# ── Radarr ────────────────────────────────────────────────────────────────────
+RADARR_URL: str               = _require("RADARR_URL")
+RADARR_API_KEY: str           = _require("RADARR_API_KEY")
+RADARR_QUALITY_PROFILE_ID:int = int(os.getenv("RADARR_QUALITY_PROFILE_ID", "1"))
+
+# ── Sonarr ────────────────────────────────────────────────────────────────────
+SONARR_URL: str               = _require("SONARR_URL")
+SONARR_API_KEY: str           = _require("SONARR_API_KEY")
+SONARR_QUALITY_PROFILE_ID:int = int(os.getenv("SONARR_QUALITY_PROFILE_ID", "1"))
+
+# ── Media root folders ────────────────────────────────────────────────────────
+ROOT_MOVIE_ANIMATION: str = "/mnt/unionfs/Media/Movies/Animation"
+ROOT_MOVIE_STANDARD: str  = "/mnt/unionfs/Media/Movies/Film"
+ROOT_TV_DANSK: str        = "/mnt/unionfs/Media/TV/TV"
+ROOT_TV_STANDARD: str     = "/mnt/unionfs/Media/TV/Serier"
+
+# ── Tautulli ──────────────────────────────────────────────────────────────────
+TAUTULLI_URL:     str = _require("TAUTULLI_URL")
+TAUTULLI_API_KEY: str = _require("TAUTULLI_API_KEY")
+
+# ── Tavily (web-søgning) — valgfri ───────────────────────────────────────────
+TAVILY_API_KEY: str | None = os.getenv("TAVILY_API_KEY") or None
+
+# ── Webhook sikkerhed — valgfri ───────────────────────────────────────────────
+# Sæt denne i Railway og tilføj ?token=<værdi> i Radarr/Sonarrs webhook URL.
+# Mangler den, accepteres alle webhooks (advarsel logges ved startup).
+WEBHOOK_SECRET: str | None = os.getenv("WEBHOOK_SECRET") or None
 
 # ── Optional / runtime settings ───────────────────────────────────────────────
-# The environment name ("dev" or "main") — useful for logging.
-ENVIRONMENT: str = os.getenv("ENVIRONMENT", "dev")
-
-# Maximum number of messages stored per user in the interaction log.
+ENVIRONMENT: str       = os.getenv("ENVIRONMENT", "dev")
 LOG_HISTORY_LIMIT: int = int(os.getenv("LOG_HISTORY_LIMIT", "500"))

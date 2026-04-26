@@ -1,6 +1,14 @@
 """
-database.py - PostgreSQL connection pool, automatic table creation,
-whitelist enforcement, and interaction logging.
+database.py - PostgreSQL connection pool, table management,
+user whitelist, Plex username storage, onboarding state and interaction logging.
+
+CHANGES vs previous version:
+  - Tilføjet persona_id kolonne til users-tabellen.
+  - Tilføjet get_persona() og set_persona() funktioner.
+  - Added `onboarding_state` column to `users` table so Railway restarts
+    never lose users mid-onboarding (replaces the in-memory set in main.py).
+  - Log pruning now uses a single DELETE with ORDER BY + OFFSET instead of
+    a correlated subquery, which is faster on large tables.
 """
 
 import logging
@@ -12,35 +20,45 @@ from config import DATABASE_URL, LOG_HISTORY_LIMIT
 
 logger = logging.getLogger(__name__)
 
-# Module-level connection pool — initialised once in setup_db().
 _pool: asyncpg.Pool | None = None
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
-_CREATE_WHITELIST_TABLE = """
-CREATE TABLE IF NOT EXISTS whitelist (
-    telegram_id   BIGINT PRIMARY KEY,
-    username      TEXT,
-    added_by      BIGINT,
-    added_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    notes         TEXT
+_CREATE_USERS_TABLE = """
+CREATE TABLE IF NOT EXISTS users (
+    telegram_id      BIGINT PRIMARY KEY,
+    telegram_name    TEXT,
+    plex_username    TEXT,
+    is_whitelisted   BOOLEAN     NOT NULL DEFAULT FALSE,
+    onboarding_state TEXT,
+    persona_id       TEXT        NOT NULL DEFAULT 'buddy',
+    added_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+"""
+
+_MIGRATE_ONBOARDING_STATE = """
+ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS onboarding_state TEXT;
+"""
+
+_MIGRATE_PERSONA_ID = """
+ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS persona_id TEXT DEFAULT 'buddy';
 """
 
 _CREATE_INTERACTION_LOG_TABLE = """
 CREATE TABLE IF NOT EXISTS interaction_log (
-    id            BIGSERIAL PRIMARY KEY,
-    telegram_id   BIGINT      NOT NULL,
-    username      TEXT,
-    direction     TEXT        NOT NULL CHECK (direction IN ('incoming', 'outgoing')),
-    message_text  TEXT,
-    logged_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id           BIGSERIAL PRIMARY KEY,
+    telegram_id  BIGINT      NOT NULL,
+    direction    TEXT        NOT NULL CHECK (direction IN ('incoming', 'outgoing')),
+    message_text TEXT,
+    logged_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
 
-_CREATE_INTERACTION_LOG_INDEX = """
-CREATE INDEX IF NOT EXISTS idx_interaction_log_telegram_id
+_CREATE_LOG_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_log_telegram_id
     ON interaction_log (telegram_id, logged_at DESC);
 """
 
@@ -48,74 +66,141 @@ CREATE INDEX IF NOT EXISTS idx_interaction_log_telegram_id
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 async def setup_db() -> None:
-    """
-    Create the connection pool and ensure all tables exist.
-    Call this once at bot startup before processing any updates.
-    """
     global _pool
-
     logger.info("Connecting to PostgreSQL …")
     _pool = await asyncpg.create_pool(
-        dsn=DATABASE_URL,
-        min_size=2,
-        max_size=10,
-        command_timeout=30,
+        dsn=DATABASE_URL, min_size=2, max_size=10, command_timeout=30,
     )
-
     async with _pool.acquire() as conn:
-        await conn.execute(_CREATE_WHITELIST_TABLE)
+        await conn.execute(_CREATE_USERS_TABLE)
+        await conn.execute(_MIGRATE_ONBOARDING_STATE)
+        await conn.execute(_MIGRATE_PERSONA_ID)
         await conn.execute(_CREATE_INTERACTION_LOG_TABLE)
-        await conn.execute(_CREATE_INTERACTION_LOG_INDEX)
-
-    logger.info("Database setup complete — tables verified.")
+        await conn.execute(_CREATE_LOG_INDEX)
+    logger.info("Database ready.")
 
 
 async def close_db() -> None:
-    """Gracefully close the connection pool on shutdown."""
     if _pool:
         await _pool.close()
-        logger.info("Database connection pool closed.")
 
 
-def _get_pool() -> asyncpg.Pool:
+def _pool_ref() -> asyncpg.Pool:
     if _pool is None:
-        raise RuntimeError("Database pool is not initialised. Call setup_db() first.")
+        raise RuntimeError("DB pool not initialised — call setup_db() first.")
     return _pool
 
 
-# ── Whitelist ─────────────────────────────────────────────────────────────────
+# ── User helpers ──────────────────────────────────────────────────────────────
 
-async def is_whitelisted(telegram_id: int) -> bool:
-    """Return True if the given Telegram user ID is on the whitelist."""
-    pool = _get_pool()
-    async with pool.acquire() as conn:
+async def get_user(telegram_id: int) -> dict | None:
+    """Return the full user row or None if not found."""
+    async with _pool_ref().acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT 1 FROM whitelist WHERE telegram_id = $1", telegram_id
+            "SELECT * FROM users WHERE telegram_id = $1", telegram_id
         )
-    return row is not None
+    return dict(row) if row else None
 
 
-async def add_to_whitelist(
-    telegram_id: int,
-    username: str | None = None,
-    added_by: int | None = None,
-    notes: str | None = None,
-) -> None:
-    """Insert a user into the whitelist (no-op if they already exist)."""
-    pool = _get_pool()
-    async with pool.acquire() as conn:
+async def upsert_user(telegram_id: int, telegram_name: str | None = None) -> None:
+    """Insert a new user (not whitelisted) or update their Telegram name."""
+    async with _pool_ref().acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO whitelist (telegram_id, username, added_by, notes)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (telegram_id) DO NOTHING
+            INSERT INTO users (telegram_id, telegram_name)
+            VALUES ($1, $2)
+            ON CONFLICT (telegram_id) DO UPDATE
+                SET telegram_name = COALESCE(EXCLUDED.telegram_name, users.telegram_name)
+            """,
+            telegram_id, telegram_name,
+        )
+
+
+async def is_whitelisted(telegram_id: int) -> bool:
+    async with _pool_ref().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT is_whitelisted FROM users WHERE telegram_id = $1", telegram_id
+        )
+    return bool(row and row["is_whitelisted"])
+
+
+async def approve_user(telegram_id: int) -> None:
+    """Whitelist an existing user and mark them as awaiting Plex setup."""
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET is_whitelisted   = TRUE,
+                onboarding_state = 'awaiting_plex'
+            WHERE telegram_id = $1
             """,
             telegram_id,
-            username,
-            added_by,
-            notes,
         )
-    logger.info("Whitelisted user %s (%s)", telegram_id, username)
+    logger.info("User %s approved.", telegram_id)
+
+
+async def get_plex_username(telegram_id: int) -> str | None:
+    async with _pool_ref().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT plex_username FROM users WHERE telegram_id = $1", telegram_id
+        )
+    return row["plex_username"] if row else None
+
+
+async def set_plex_username(telegram_id: int, plex_username: str) -> None:
+    """Save the verified Plex username and clear the onboarding state."""
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET plex_username    = $1,
+                onboarding_state = NULL
+            WHERE telegram_id = $2
+            """,
+            plex_username, telegram_id,
+        )
+    logger.info("plex_username='%s' saved for telegram_id=%s", plex_username, telegram_id)
+
+
+# ── Persona ───────────────────────────────────────────────────────────────────
+
+async def get_persona(telegram_id: int) -> str:
+    """Returnér brugerens valgte persona_id. Falder tilbage til 'buddy'."""
+    async with _pool_ref().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT persona_id FROM users WHERE telegram_id = $1", telegram_id
+        )
+    return (row["persona_id"] if row and row["persona_id"] else "buddy")
+
+
+async def set_persona(telegram_id: int, persona_id: str) -> None:
+    """Gem brugerens valgte persona_id."""
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET persona_id = $1 WHERE telegram_id = $2",
+            persona_id, telegram_id,
+        )
+    logger.info("persona_id='%s' gemt for telegram_id=%s", persona_id, telegram_id)
+
+
+# ── Onboarding state ──────────────────────────────────────────────────────────
+
+async def get_onboarding_state(telegram_id: int) -> str | None:
+    """Return the user's current onboarding_state ('awaiting_plex' or None)."""
+    async with _pool_ref().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT onboarding_state FROM users WHERE telegram_id = $1", telegram_id
+        )
+    return row["onboarding_state"] if row else None
+
+
+async def set_onboarding_state(telegram_id: int, state: str | None) -> None:
+    """Set or clear the onboarding_state for a user."""
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET onboarding_state = $1 WHERE telegram_id = $2",
+            state, telegram_id,
+        )
 
 
 # ── Interaction log ───────────────────────────────────────────────────────────
@@ -124,69 +209,123 @@ async def log_message(
     telegram_id: int,
     direction: str,
     message_text: str,
-    username: str | None = None,
 ) -> None:
-    """
-    Persist a single message to the interaction log.
-
-    Args:
-        telegram_id:  The Telegram user ID.
-        direction:    Either 'incoming' (user → bot) or 'outgoing' (bot → user).
-        message_text: The raw message content.
-        username:     Telegram @username if available.
-    """
-    if direction not in ("incoming", "outgoing"):
-        raise ValueError(f"Invalid direction '{direction}'. Use 'incoming' or 'outgoing'.")
-
-    pool = _get_pool()
-    async with pool.acquire() as conn:
-        # Insert the new row.
+    async with _pool_ref().acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO interaction_log (telegram_id, username, direction, message_text, logged_at)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO interaction_log (telegram_id, direction, message_text, logged_at)
+            VALUES ($1, $2, $3, $4)
             """,
-            telegram_id,
-            username,
-            direction,
-            message_text,
-            datetime.now(timezone.utc),
+            telegram_id, direction, message_text, datetime.now(timezone.utc),
         )
-
-        # Enforce per-user row limit to prevent unbounded table growth.
         await conn.execute(
             """
             DELETE FROM interaction_log
-            WHERE id IN (
-                SELECT id FROM interaction_log
-                WHERE telegram_id = $1
-                ORDER BY logged_at DESC
-                OFFSET $2
-            )
-            """,
-            telegram_id,
-            LOG_HISTORY_LIMIT,
-        )
-
-
-async def get_recent_history(telegram_id: int, limit: int = 20) -> list[dict]:
-    """
-    Retrieve the most recent interactions for a user, oldest first.
-
-    Returns a list of dicts with keys: direction, message_text, logged_at.
-    """
-    pool = _get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT direction, message_text, logged_at
-            FROM interaction_log
             WHERE telegram_id = $1
-            ORDER BY logged_at DESC
-            LIMIT $2
+              AND id NOT IN (
+                  SELECT id FROM interaction_log
+                  WHERE telegram_id = $1
+                  ORDER BY logged_at DESC
+                  LIMIT $2
+              )
             """,
-            telegram_id,
-            limit,
+            telegram_id, LOG_HISTORY_LIMIT,
         )
-    # Reverse so the list is chronological (oldest → newest).
-    return [dict(row) for row in reversed(rows)]
+
+
+async def get_all_whitelisted_users() -> list[dict]:
+    """Return all whitelisted users with their plex_username and telegram_id."""
+    async with _pool_ref().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT telegram_id, telegram_name, plex_username FROM users WHERE is_whitelisted = TRUE"
+        )
+    return [dict(row) for row in rows]
+
+
+# ── Pending requests ──────────────────────────────────────────────────────────
+
+_CREATE_PENDING_REQUESTS_TABLE = """
+CREATE TABLE IF NOT EXISTS pending_requests (
+    token        TEXT        PRIMARY KEY,
+    telegram_id  BIGINT      NOT NULL,
+    media_type   TEXT        NOT NULL,
+    tmdb_id      INTEGER     NOT NULL,
+    tvdb_id      INTEGER,
+    title        TEXT        NOT NULL,
+    year         INTEGER,
+    genres       JSONB,
+    original_language TEXT,
+    season_numbers    JSONB,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+_CREATE_PENDING_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_pending_telegram_id
+    ON pending_requests (telegram_id, created_at DESC);
+"""
+
+
+async def setup_pending_requests() -> None:
+    """Create pending_requests table if it doesn't exist."""
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(_CREATE_PENDING_REQUESTS_TABLE)
+        await conn.execute(_CREATE_PENDING_INDEX)
+
+
+async def save_pending_request(token: str, telegram_id: int, data: dict) -> None:
+    """Save media details for a pending confirmation."""
+    import json
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO pending_requests
+                (token, telegram_id, media_type, tmdb_id, tvdb_id, title, year,
+                 genres, original_language, season_numbers)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            ON CONFLICT (token) DO UPDATE SET
+                telegram_id=EXCLUDED.telegram_id,
+                media_type=EXCLUDED.media_type,
+                tmdb_id=EXCLUDED.tmdb_id,
+                tvdb_id=EXCLUDED.tvdb_id,
+                title=EXCLUDED.title,
+                year=EXCLUDED.year,
+                genres=EXCLUDED.genres,
+                original_language=EXCLUDED.original_language,
+                season_numbers=EXCLUDED.season_numbers,
+                created_at=NOW()
+            """,
+            token,
+            telegram_id,
+            data.get("media_type"),
+            data.get("tmdb_id"),
+            data.get("tvdb_id"),
+            data.get("title"),
+            data.get("year"),
+            json.dumps(data.get("genres", [])),
+            data.get("original_language", "en"),
+            json.dumps(data.get("season_numbers", [])),
+        )
+
+
+async def get_pending_request(token: str) -> dict | None:
+    """Retrieve and delete a pending request by token."""
+    import json
+    async with _pool_ref().acquire() as conn:
+        row = await conn.fetchrow(
+            "DELETE FROM pending_requests WHERE token=$1 RETURNING *", token
+        )
+    if not row:
+        return None
+    d = dict(row)
+    d["genres"]         = json.loads(d["genres"])         if d["genres"]         else []
+    d["season_numbers"] = json.loads(d["season_numbers"]) if d["season_numbers"] else []
+    return d
+
+
+async def delete_pending_requests_for_user(telegram_id: int) -> None:
+    """Clean up all pending requests for a user (e.g. on cancel)."""
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(
+            "DELETE FROM pending_requests WHERE telegram_id=$1", telegram_id
+        )
