@@ -52,7 +52,8 @@ UNCHANGED (v0.9.9 — find_unwatched fix):
   - Tilføjet INFO-log der viser antal usete titler fundet per kald.
 
 UNCHANGED:
-  - Fix A: _build_actor_guid_set() scanner hele biblioteket (Lag 2). Uændret.
+  - Fix: _build_actor_guid_set() Lag 2 (fuld biblioteksscanning) er fjernet —
+    den tilføjede ALLE Plex-film til TMDB-sættet og gav falske positive.
   - _extract_imdb_id_from_guids(), check_actor_on_plex() IMDb GUID-match. Uændret.
   - _franchise_plex_check_sync(). Uændret.
   - add_to_watchlist(), get_plex_watch_url(), validate_plex_user(). Uændret.
@@ -620,12 +621,13 @@ def _build_actor_guid_set(
     plex_username: str | None = None,
 ) -> tuple[set[int], set[str]]:
     """
-    Byg to sæt for alle Plex-film der matcher skuespilleren:
-      - tmdb_ids: set[int]
-      - imdb_ids: set[str]
+    Byg to sæt for alle Plex-film der matcher skuespilleren.
+    Bruger KUN section.search(actor=actor_name).
 
-    Lag 1: section.search(actor=actor_name) — hurtig.
-    Lag 2: scan hele biblioteket — fanger titler gemt under fremmed titel.
+    Lag 2 (fuld biblioteksscanning) er fjernet — den tilføjede ALLE Plex-film
+    til TMDB-sættet og gav falske positive ved TMDB-krydstjek.
+    Tom Hanks fandt 5 film i stedet for 22, fordi cross-check mod TMDB top 20
+    ramte tilfældige film der havde matchende TMDB ID-rækkefølge i biblioteket.
     """
     plex = _connect(plex_username)
     if isinstance(plex, dict):
@@ -648,23 +650,8 @@ def _build_actor_guid_set(
             if iid:
                 imdb_ids.add(iid)
 
-        # Lag 2: scan hele sektionen
-        try:
-            all_items = section.search()
-        except Exception as e:
-            logger.warning("Full section scan fejl i '%s': %s", section.title, e)
-            continue
-
-        for item in all_items:
-            tid = _extract_tmdb_id_from_guids(item)
-            iid = _extract_imdb_id_from_guids(item)
-            if tid:
-                tmdb_ids.add(tid)
-            if iid:
-                imdb_ids.add(iid)
-
-    logger.debug(
-        "_build_actor_guid_set '%s': %d TMDB IDs, %d IMDb IDs",
+    logger.info(
+        "_build_actor_guid_set '%s': %d TMDB IDs, %d IMDb IDs fra section.search(actor=)",
         actor_name, len(tmdb_ids), len(imdb_ids),
     )
     return tmdb_ids, imdb_ids
