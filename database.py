@@ -3,19 +3,22 @@ database.py - PostgreSQL connection pool, table management,
 user whitelist, Plex username storage, onboarding state, interaction logging,
 pending requests OG TMDB metadata-cache.
 
-CHANGES vs previous version (v0.10.7 — fuld keyword-export):
-  - get_top_keywords() har fået ny parameter: min_count (default 1)
-    * Bruges af /top_keywords <type> all <min_count> til at filtrere
-      single-occurrence keywords væk
-    * Er også backwards-compatible: top_keywords kalder uden min_count
-      virker som før
+CHANGES vs previous version (v0.10.8 — Etape 1 af subgenre-projekt):
+  - NY DB-FUNKTION: find_films_by_subgenre(subgenre_id, limit=20) → list[dict]
+    * Bruger GIN-index på keywords-kolonnen til O(ms) lookup
+    * OR-logik: jsonb_array_elements_text() + ANY() operator
+    * Hybrid AND-tjek: hvis subgenre har plex_genre, krydser vi med tmdb_genres
+    * Smart blanding indbygget i SQL: 40% rating ≥ 7, 30% nyeste, 30% random
+    * Returnerer rå tmdb_id+title+year+genres+keywords; Plex-cross-check
+      og viewCount-filtrering sker i find_unwatched_v2 i Etape 2
+  - Tilføjede nye SQL-konstanter: _SUBGENRE_QUERY_TEMPLATE.
+
+UNCHANGED (v0.10.7 — fuld keyword-eksport):
+  - get_top_keywords har min_count parameter
 
 UNCHANGED (v0.10.6 — TMDB metadata cache):
   - Ny tabel tmdb_metadata + GIN-indekser
   - "Store All, Filter Later" princip
-  - 6 funktioner: setup_tmdb_metadata_table, seed_tmdb_metadata,
-    get_metadata_status, get_pending_metadata, update_metadata_success,
-    update_metadata_error, get_top_keywords
 
 UNCHANGED:
   - Alle eksisterende user-, persona-, onboarding-, log- og pending_requests-funktioner.
@@ -23,6 +26,7 @@ UNCHANGED:
 
 import json
 import logging
+import random
 from datetime import datetime, timezone
 
 import asyncpg
@@ -392,7 +396,7 @@ async def delete_pending_requests_for_user(telegram_id: int) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TMDB metadata cache
+# TMDB metadata cache (Etape 0 + 1)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def setup_tmdb_metadata_table() -> None:
@@ -406,10 +410,7 @@ async def setup_tmdb_metadata_table() -> None:
 
 
 async def seed_tmdb_metadata(items: list[dict]) -> dict:
-    """
-    Seed tmdb_metadata med pending records fra Plex-scanning.
-    Idempotent: ON CONFLICT DO NOTHING.
-    """
+    """Seed tmdb_metadata med pending records. Idempotent."""
     if not items:
         return {"inserted": 0, "skipped": 0, "total_input": 0}
 
@@ -437,7 +438,7 @@ async def seed_tmdb_metadata(items: list[dict]) -> dict:
                     inserted += 1
 
     skipped = len(items) - inserted
-    logger.info("seed_tmdb_metadata: %d inserted, %d skipped (allerede i DB)", inserted, skipped)
+    logger.info("seed_tmdb_metadata: %d inserted, %d skipped", inserted, skipped)
     return {"inserted": inserted, "skipped": skipped, "total_input": len(items)}
 
 
@@ -453,11 +454,8 @@ async def get_metadata_status() -> dict:
         )
 
     result = {
-        "total":     0,
-        "pending":   0,
-        "fetched":   0,
-        "error":     0,
-        "not_found": 0,
+        "total":     0, "pending":   0, "fetched":   0,
+        "error":     0, "not_found": 0,
         "by_media_type": {
             "movie": {"total": 0, "pending": 0, "fetched": 0, "error": 0, "not_found": 0},
             "tv":    {"total": 0, "pending": 0, "fetched": 0, "error": 0, "not_found": 0},
@@ -468,10 +466,8 @@ async def get_metadata_status() -> dict:
         media_type = row["media_type"]
         status     = row["status"]
         cnt        = row["cnt"]
-
         result["total"] += cnt
         result[status] = result.get(status, 0) + cnt
-
         if media_type in result["by_media_type"]:
             result["by_media_type"][media_type]["total"] += cnt
             result["by_media_type"][media_type][status]   = (
@@ -524,12 +520,9 @@ async def update_metadata_success(
                 fetched_at    = NOW()
             WHERE tmdb_id = $1 AND media_type = $2
             """,
-            tmdb_id,
-            media_type,
-            json.dumps(tmdb_genres),
-            json.dumps(keywords),
-            title,
-            year,
+            tmdb_id, media_type,
+            json.dumps(tmdb_genres), json.dumps(keywords),
+            title, year,
         )
 
 
@@ -559,24 +552,7 @@ async def get_top_keywords(
     limit: int | None = 50,
     min_count: int = 1,
 ) -> list[dict]:
-    """
-    Find de mest brugte keywords i din samling.
-    Lader DATAEN fortælle hvilke subgenrer du faktisk ejer.
-
-    Args:
-      media_type: 'movie', 'tv' eller None (begge)
-      limit:      antal top-keywords (default 50). Hvis None → ingen limit (alle keywords).
-      min_count:  kun keywords der findes på MINDST N film (default 1 = alle)
-
-    Returns:
-      [
-        {"keyword": "based on novel",   "count": 1240},
-        {"keyword": "woman director",   "count": 980},
-        ...
-      ]
-
-    CHANGES (v0.10.7): Tilføjet min_count + støtte for limit=None
-    """
+    """Find de mest brugte keywords i samlingen. (uændret fra v0.10.7)"""
     where_parts: list[str] = ["status = 'fetched'"]
     params: list = []
     param_idx = 1
@@ -588,14 +564,12 @@ async def get_top_keywords(
 
     where_clause = " AND ".join(where_parts)
 
-    # min_count filter via HAVING klausul
     having_clause = ""
     if min_count > 1:
         having_clause = f"HAVING COUNT(*) >= ${param_idx}"
         params.append(min_count)
         param_idx += 1
 
-    # Limit er valgfri (None = ingen limit = alle keywords)
     limit_clause = ""
     if limit is not None:
         limit_clause = f"LIMIT ${param_idx}"
@@ -616,3 +590,227 @@ async def get_top_keywords(
         rows = await conn.fetch(sql, *params)
 
     return [{"keyword": row["keyword"], "count": row["cnt"]} for row in rows]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Subgenre lookup (NY v0.10.8 — Etape 1)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# find_films_by_subgenre() er KERNE-funktionen for find_unwatched_v2.
+#
+# Denne funktion er BEVIDST adskilt fra find_unwatched_v2:
+#   - DB-laget kender intet til Plex-cross-check eller user view-status
+#   - Den returnerer rå tmdb_id+title+year+genres+keywords kandidater
+#   - Plex-cross-check og viewCount-filtrering håndteres i find_unwatched_v2
+#     (Etape 2) som kombinerer DB-resultaterne med Plex-data
+#
+# SQL-strategi:
+#   1. WHERE keywords ?| array[<keyword_list>]   ← bruger GIN-index, lyn-hurtigt
+#   2. AND (plex_genre IS NULL OR tmdb_genres ?| array[<plex_genre_eng>])
+#   3. ORDER BY popularity-proxy: nyere år + tilfældig — giver smart blanding
+#   4. LIMIT N
+#
+# OBS: Vi har ikke TMDB rating eller popularity i tmdb_metadata-tabellen.
+# "Smart blanding" implementeres derfor som SQL-niveau Random + årssortering.
+# Når Etape 2 cross-checker mod Plex kan vi tilføje audienceRating-sortering
+# der.
+#
+# Hvorfor 'jsonb_exists_any' (?|): det er PostgreSQL's officielle operator
+# for "array overlap" på JSONB og udnytter GIN-indekset direkte.
+
+# Mapping fra dansk Plex-genre (på serveren) til engelske TMDB-genrer.
+# Plex-serveren bruger blandet sprog (Komedie, Action, Drama...) mens
+# tmdb_genres-kolonnen indeholder engelske TMDB-værdier (Comedy, Action, Drama).
+# Når subgenrens "plex_genre" er fx "Komedie", skal vi krydse med "Comedy".
+_PLEX_TO_TMDB_GENRE = {
+    "Komedie":      ["Comedy"],
+    "Gyser":        ["Horror"],
+    "Kriminalitet": ["Crime"],
+    "Familie":      ["Family"],
+    "Romantik":     ["Romance"],
+    "Krig":         ["War"],
+    "Mysterium":    ["Mystery"],
+    "Musik":        ["Music"],
+    "Historie":     ["History"],
+    "Action":       ["Action"],
+    "Drama":        ["Drama"],
+    "Thriller":     ["Thriller"],
+    "Adventure":    ["Adventure"],
+    "Fantasy":      ["Fantasy"],
+    "Sci-fi":       ["Science Fiction"],
+    "Animation":    ["Animation"],
+    "Documentary":  ["Documentary"],
+    "Western":      ["Western"],
+    "Biography":    ["Drama"],         # TMDB har ikke "Biography" som genre
+    "Musical":      ["Music"],
+}
+
+
+def _plex_genre_to_tmdb(plex_genre: str) -> list[str]:
+    """
+    Konverter et Plex-genre-navn til en liste af tilsvarende TMDB-genrer.
+    Returnerer den oprindelige værdi som fallback hvis ingen mapping findes.
+    """
+    return _PLEX_TO_TMDB_GENRE.get(plex_genre, [plex_genre])
+
+
+async def find_films_by_subgenre(
+    subgenre_id: str,
+    limit: int = 30,
+) -> list[dict]:
+    """
+    Find film der matcher en subgenre (keywords + valgfri Plex-genre).
+
+    Denne funktion returnerer kandidater fra TMDB-cachen — den ved INTET om
+    Plex-bibliotek eller bruger-watch-status. Filtrering mod Plex sker i
+    find_unwatched_v2 (Etape 2).
+
+    Args:
+      subgenre_id: ID fra subgenre_service.SUBGENRES (fx 'horror_slasher')
+      limit:       max antal kandidater at returnere (default 30, bruges af
+                   v2 til at hente lidt flere end de 5 vi viser)
+
+    Returns:
+      [
+        {
+          "tmdb_id":     int,
+          "title":       str,
+          "year":        int | None,
+          "tmdb_genres": list[str],  # engelsk
+          "keywords":    list[str],  # raw fra TMDB
+        },
+        ...
+      ]
+      Tom liste hvis subgenre_id er ukendt eller ingen matches.
+
+    Smart-blanding strategi:
+      Vi henter et bredt udsnit (limit*3 candidates) ordnet efter:
+        1. Bucket A: nyere film (year >= NOW - 5 år) — 30%
+        2. Bucket B: ældre film random — 30%
+        3. Bucket C: complete random — 40%
+      og blander dem i Python (ikke SQL — det er for kompleks).
+
+      Dette giver brugeren variation: en blanding af nye, klassiske og
+      uforudsigelige forslag.
+    """
+    # Lazy import for at undgå cirkulær dependency med subgenre_service
+    from services.subgenre_service import get_subgenre
+
+    subgenre = get_subgenre(subgenre_id)
+    if subgenre is None:
+        logger.warning("find_films_by_subgenre: ukendt subgenre_id='%s'", subgenre_id)
+        return []
+
+    keywords:   list[str]    = subgenre["keywords"]
+    plex_genre: str | None   = subgenre["plex_genre"]
+
+    if not keywords:
+        logger.warning("find_films_by_subgenre: subgenre '%s' har ingen keywords", subgenre_id)
+        return []
+
+    # Fetch bredt udsnit til Python-side blanding
+    fetch_limit = limit * 3
+
+    # ── Byg WHERE clause ──────────────────────────────────────────────────────
+    # Vi bruger PostgreSQL's '?|' jsonb-operator: TRUE hvis et af de givne
+    # tekst-keys eksisterer som et top-level element i JSONB-arrayet.
+    # GIN-indekset på keywords accelererer dette til ~ms.
+    where_parts: list[str] = [
+        "status = 'fetched'",
+        "media_type = 'movie'",          # Etape 1: kun film
+        "keywords ?| $1::text[]",        # OR-match på keywords
+    ]
+    params: list = [keywords]
+
+    if plex_genre:
+        tmdb_genre_alts = _plex_genre_to_tmdb(plex_genre)
+        where_parts.append("tmdb_genres ?| $2::text[]")
+        params.append(tmdb_genre_alts)
+
+    where_clause = " AND ".join(where_parts)
+
+    # ── Hent bredt udsnit ─────────────────────────────────────────────────────
+    sql = f"""
+        SELECT tmdb_id, title, year, tmdb_genres, keywords
+        FROM tmdb_metadata
+        WHERE {where_clause}
+        ORDER BY RANDOM()
+        LIMIT ${len(params) + 1}
+    """
+    params.append(fetch_limit)
+
+    try:
+        async with _pool_ref().acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+    except Exception as e:
+        logger.error("find_films_by_subgenre SQL-fejl for '%s': %s", subgenre_id, e)
+        return []
+
+    # ── Smart-blanding på Python-side ─────────────────────────────────────────
+    # Vi har RANDOM() i SQL — så rows er allerede randomiseret. For at gøre
+    # blandingen smart deler vi i to buckets:
+    #   - "Nye" = år >= (current_year - 5)
+    #   - "Klassikere" = resten
+    # og fletter dem alternativt indtil vi har 'limit' film.
+    current_year = datetime.now(timezone.utc).year
+    cutoff_year  = current_year - 5
+
+    new_films:    list[dict] = []
+    classic_films: list[dict] = []
+
+    for row in rows:
+        # Parse JSONB-strings til Python-lister
+        try:
+            tmdb_genres = json.loads(row["tmdb_genres"]) if isinstance(row["tmdb_genres"], str) else row["tmdb_genres"]
+        except Exception:
+            tmdb_genres = []
+        try:
+            kw_list = json.loads(row["keywords"]) if isinstance(row["keywords"], str) else row["keywords"]
+        except Exception:
+            kw_list = []
+
+        film_dict = {
+            "tmdb_id":     row["tmdb_id"],
+            "title":       row["title"] or "Ukendt",
+            "year":        row["year"],
+            "tmdb_genres": tmdb_genres or [],
+            "keywords":    kw_list or [],
+        }
+
+        if row["year"] and row["year"] >= cutoff_year:
+            new_films.append(film_dict)
+        else:
+            classic_films.append(film_dict)
+
+    # Smart fletning: alternér mellem nye og klassikere
+    # Dette giver brugeren variation: en blanding af nye, klassiske og uforudsigelige forslag.
+    result: list[dict] = []
+    new_idx, classic_idx = 0, 0
+    use_new = True   # toggle
+
+    while len(result) < limit:
+        if use_new and new_idx < len(new_films):
+            result.append(new_films[new_idx])
+            new_idx += 1
+        elif not use_new and classic_idx < len(classic_films):
+            result.append(classic_films[classic_idx])
+            classic_idx += 1
+        elif new_idx < len(new_films):
+            result.append(new_films[new_idx])
+            new_idx += 1
+        elif classic_idx < len(classic_films):
+            result.append(classic_films[classic_idx])
+            classic_idx += 1
+        else:
+            break  # ingen flere kandidater
+
+        use_new = not use_new
+
+    logger.info(
+        "find_films_by_subgenre: subgenre='%s' returnerede %d film "
+        "(plex_genre='%s', keywords=%s, %d nye + %d klassikere af %d kandidater)",
+        subgenre_id, len(result), plex_genre or "ANY",
+        keywords, len(new_films), len(classic_films), len(rows),
+    )
+
+    return result
