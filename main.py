@@ -1,34 +1,22 @@
 """
 main.py - Buddy bot entry point.
 
-CHANGES vs previous version (v0.10.1 — genre-parameter fix):
-  - BUG FIX: _build_watch_prompt() instruerede Buddy til at sende flere genrer
-    som comma-separeret string ("Komedie, Romantik"), hvilket fik Plex til at
-    søge efter én bogstavelig genre med komma-tegn i navnet → 0 film fundet.
-    Fix: Promptet instruerer nu eksplicit Buddy til at lave SEPARATE parallelle
-    find_unwatched-kald, ét per genre, og samle resultaterne.
+CHANGES vs previous version (v0.10.2 — /genres admin-kommando):
+  - NY ENGANGS-FEATURE: /genres admin-kommando.
+    * Scanner alle film- og TV-sektioner i Plex.
+    * Tæller alle unikke genre-tags og deres forekomst.
+    * Viser top 20 mest populære kombinationer (genre-par).
+    * KUN tilgængelig for ADMIN_TELEGRAM_ID.
+    * Tænkt som engangs-værktøj — slettes efter brug.
+  - VERSION CHECK opdateret til v0.10.2-beta.
 
-CHANGES vs previous version (v0.10.0 — 'Hvad skal jeg se?' interaktivt flow):
-  - NY FEATURE: Stemnings-baseret browse-flow med pagination.
-    * Fast ReplyKeyboard-knap '🍿 Hvad skal jeg se?' tilføjet til cmd_start
-      og _handle_plex_input (efter onboarding).
-    * Inline keyboard-flow: vælg type (Film/Serie/Overrask mig) → vælg op til
-      2 stemninger på tværs af 3 sider → 🚀 Søg nu! eller 🎲 Overrask mig.
-    * 17 stemninger mappet til Plex-genrer i WATCH_MOODS-tabellen.
-    * State management via context.user_data["watch_flow"] (in-memory, per user).
-    * 🚀 Søg nu! er disabled (vises som '🔒 Vælg en stemning') indtil mindst
-      1 stemning er valgt.
-    * Valgte stemninger markeres med '✅' præfiks.
-    * Pagination: side 1 = stemninger 1-6, side 2 = 7-12, side 3 = 13-17.
-    * AI handoff: build_watch_prompt() bygger en kontekst-prompt og sender
-      til get_ai_response (samme path som handle_text — bevarer signal-parsing
-      til SHOW_INFO/TRAILER/SEARCH_RESULTS).
+UNCHANGED (v0.10.1 — genre-parameter fix):
+  - _build_watch_prompt() instruerer Buddy til separate parallelle
+    find_unwatched-kald, ét per genre.
 
-UNCHANGED (v0.9.8 — Annuller-knap photo-fix):
-  - handle_cancel_callback bruger edit_message_caption() for photo-beskeder.
-
-UNCHANGED (v0.9.7 — søgeresultater UX-fix):
-  - handle_back_callback: ⬅️ Tilbage-knap i søgeresultatlisten.
+UNCHANGED (v0.10.0 — 'Hvad skal jeg se?' interaktivt flow).
+UNCHANGED (v0.9.8 — Annuller-knap photo-fix).
+UNCHANGED (v0.9.7 — søgeresultater UX-fix).
 
 Tidligere ændringer (bevares):
   - v0.9.5: user_first_name sendes til get_ai_response.
@@ -44,6 +32,8 @@ import re
 import sys
 import traceback
 from aiohttp import web
+from collections import Counter
+from itertools import combinations
 
 from telegram import (
     InlineKeyboardButton,
@@ -307,6 +297,174 @@ def _build_watch_prompt(state: dict, mode: str) -> str:
         "begrundelse. Brug ✅-listeformat med klikbare /info_movie_X eller "
         "/info_tv_X links."
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# /genres — Engangs admin-kommando til genre-audit
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _scan_plex_genres_sync() -> dict:
+    """
+    Synkron Plex-scanning. Kører i thread pool.
+    Tæller alle genre-tags og top-kombinationer for film og serier.
+    """
+    from services.plex_service import _connect, _sections, _MOVIE_TYPE, _TV_TYPE
+
+    plex = _connect(None)
+    if isinstance(plex, dict):
+        return {"error": plex.get("message", "Plex-forbindelse fejlede")}
+
+    # Tæller for hver type
+    movie_genres: Counter = Counter()
+    tv_genres:    Counter = Counter()
+    movie_pairs:  Counter = Counter()
+    tv_pairs:     Counter = Counter()
+    movie_total = 0
+    tv_total    = 0
+
+    # ── Film ──────────────────────────────────────────────────────────────────
+    for section in _sections(plex, _MOVIE_TYPE):
+        try:
+            all_items = section.all()
+        except Exception as e:
+            logger.warning("genres scan: section.all() fejl '%s': %s", section.title, e)
+            continue
+
+        for item in all_items:
+            movie_total += 1
+            tags = sorted({g.tag for g in getattr(item, "genres", []) if g.tag})
+            for tag in tags:
+                movie_genres[tag] += 1
+            # Tæl alle 2-genre-kombinationer (sorteret for konsistens)
+            for pair in combinations(tags, 2):
+                movie_pairs[pair] += 1
+
+    # ── Serier ────────────────────────────────────────────────────────────────
+    for section in _sections(plex, _TV_TYPE):
+        try:
+            all_items = section.all()
+        except Exception as e:
+            logger.warning("genres scan: section.all() fejl '%s': %s", section.title, e)
+            continue
+
+        for item in all_items:
+            tv_total += 1
+            tags = sorted({g.tag for g in getattr(item, "genres", []) if g.tag})
+            for tag in tags:
+                tv_genres[tag] += 1
+            for pair in combinations(tags, 2):
+                tv_pairs[pair] += 1
+
+    return {
+        "movie_total":  movie_total,
+        "tv_total":     tv_total,
+        "movie_genres": movie_genres.most_common(),       # alle, sorteret
+        "tv_genres":    tv_genres.most_common(),          # alle, sorteret
+        "movie_pairs":  movie_pairs.most_common(20),      # top 20
+        "tv_pairs":     tv_pairs.most_common(20),         # top 20
+    }
+
+
+def _format_genres_report(data: dict) -> list[str]:
+    """
+    Formaterer scan-resultatet som flere Telegram-beskeder (max 4000 chars hver).
+    Returnerer en liste af besked-strenge.
+    """
+    if data.get("error"):
+        return [f"❌ Fejl ved Plex-scan: {data['error']}"]
+
+    messages: list[str] = []
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    header = (
+        "📊 *PLEX GENRE-RAPPORT*\n"
+        "═══════════════════════\n\n"
+        f"🎬 Film-bibliotek: *{data['movie_total']}* titler\n"
+        f"📺 TV-bibliotek: *{data['tv_total']}* serier\n"
+    )
+
+    # ── Film-genrer ───────────────────────────────────────────────────────────
+    movie_lines = ["🎬 *FILM-GENRER*", "─────────────"]
+    for tag, count in data["movie_genres"]:
+        movie_lines.append(f"`{count:>5}` × {tag}")
+    movie_section = "\n".join(movie_lines)
+
+    # ── TV-genrer ─────────────────────────────────────────────────────────────
+    tv_lines = ["📺 *TV-GENRER*", "─────────────"]
+    for tag, count in data["tv_genres"]:
+        tv_lines.append(f"`{count:>5}` × {tag}")
+    tv_section = "\n".join(tv_lines)
+
+    # ── Top film-kombinationer ────────────────────────────────────────────────
+    movie_pair_lines = ["🔗 *TOP 20 FILM-KOMBINATIONER*", "─────────────────────────"]
+    for (g1, g2), count in data["movie_pairs"]:
+        movie_pair_lines.append(f"`{count:>5}` × {g1} + {g2}")
+    movie_pair_section = "\n".join(movie_pair_lines)
+
+    # ── Top TV-kombinationer ──────────────────────────────────────────────────
+    tv_pair_lines = ["🔗 *TOP 20 TV-KOMBINATIONER*", "──────────────────────────"]
+    for (g1, g2), count in data["tv_pairs"]:
+        tv_pair_lines.append(f"`{count:>5}` × {g1} + {g2}")
+    tv_pair_section = "\n".join(tv_pair_lines)
+
+    # ── Saml besked-grupper (Telegram max ca. 4000 chars per besked) ─────────
+    # Vi sender 5 separate beskeder for læseligheds-skyld
+    messages.append(header)
+    messages.append(movie_section)
+    messages.append(tv_section)
+    messages.append(movie_pair_section)
+    messages.append(tv_pair_section)
+
+    return messages
+
+
+async def cmd_genres(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Engangs admin-kommando: /genres
+    Scanner Plex og rapporterer alle unikke genre-tags + top kombinationer.
+    KUN tilgængelig for ADMIN_TELEGRAM_ID.
+    """
+    user = update.effective_user
+    if user is None or user.id != config.ADMIN_TELEGRAM_ID:
+        # Stille — ingen fejlbesked til uautoriserede
+        return
+
+    await update.message.chat.send_action("typing")
+    loading_msg = await update.message.reply_text(
+        "🔍 Scanner Plex-bibliotek for genre-tags...\nDette kan tage 10-30 sekunder."
+    )
+
+    try:
+        data = await asyncio.to_thread(_scan_plex_genres_sync)
+        messages = _format_genres_report(data)
+    except Exception as e:
+        logger.error("cmd_genres fejl: %s", e)
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
+        await update.message.reply_text(f"❌ Scan fejlede: {e}")
+        return
+
+    try:
+        await loading_msg.delete()
+    except Exception:
+        pass
+
+    for msg_text in messages:
+        try:
+            await update.message.reply_text(msg_text, parse_mode="Markdown")
+            # Lille pause mellem beskeder så Telegram-rate-limit ikke rammer
+            await asyncio.sleep(0.4)
+        except Exception as e:
+            logger.warning("cmd_genres send fejl: %s", e)
+            # Fallback uden Markdown
+            try:
+                await update.message.reply_text(msg_text)
+            except Exception:
+                pass
+
+    logger.info("Genre-rapport sendt til admin telegram_id=%s", user.id)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -953,10 +1111,8 @@ async def _process_ai_reply(
         parts = signal_line[len(SEARCH_SIGNAL):].split(":", 1)
         query_term = parts[0].strip()
         media_type = parts[1].strip() if len(parts) > 1 else "both"
-        # show_search_results forventer en 'message' med reply_text/chat_id
         target_message = update.message if update.message else None
         if target_message is None:
-            # Watch flow path — chat er sat, men ingen message. Lav en besked at svare på.
             target_message = await chat.send_message("…")
         await show_search_results(target_message, query_term, media_type)
         return
@@ -978,8 +1134,6 @@ async def _process_ai_reply(
                     "title":      "Slår op...",
                     "step":       "picked",
                 })
-                # show_confirmation kan kaldes med både Message og CallbackQuery —
-                # vi bruger en sendt besked som trigger.
                 trigger_msg = update.message if update.message else await chat.send_message("…")
                 await show_confirmation(trigger_msg, context, token, plex_username)
                 return
@@ -1103,10 +1257,11 @@ async def on_startup(application: Application) -> None:
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — v0.10.1-beta | "
+        "VERSION CHECK — v0.10.2-beta | "
         "søgeresultater-UX: JA | foto-fix: JA | årstal-fallback: JA | "
         "tilbage-knap: JA | already-anmodet-check: JA | user_first_name: JA | "
-        "annuller-photo-fix: JA | watch-flow: JA | watch-genre-split-fix: JA"
+        "annuller-photo-fix: JA | watch-flow: JA | watch-genre-split-fix: JA | "
+        "genres-cmd: JA"
     )
 
 
@@ -1130,6 +1285,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start",      cmd_start))
     app.add_handler(CommandHandler("skift_plex", cmd_skift_plex))
+    app.add_handler(CommandHandler("genres",     cmd_genres))   # Engangs admin-kommando
 
     # Admin approval
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve_user:\d+$"))
