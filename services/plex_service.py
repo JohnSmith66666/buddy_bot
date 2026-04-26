@@ -1,18 +1,20 @@
 """
 services/plex_service.py - Plex Media Server integration via python-plexapi.
 
-CHANGES vs previous version (v1.2.1 — recommend_from_seed GUID-fix):
-  - KRITISK FIX: _recommend_from_seed_sync byggede på section.search(guid=X)
-    som returnerede 0 hits selv for film der ER på Plex. Resultat:
-    "10 anbefalet → 0 på Plex" på Inception (selvom Memento, The Matrix m.fl.
-    er i biblioteket).
-  - Ny strategi: Saml alle TMDB-IDs fra anbefalinger → scan Plex én gang
-    via section.search() → byg GUID→item index → match anbefalinger mod index.
-    Samme metode som _check_actor_on_plex_sync der virker pålideligt for
-    skuespiller-tjek (34 Mads Mikkelsen-film fundet korrekt).
-  - Tilføjet diagnostisk logging: logger top 3 TMDB-anbefalinger og
-    GUID-index størrelse efter scan.
-  - Early exit: stopper scanningen så snart alle anbefalinger er fundet.
+CHANGES vs previous version (v1.2.2 — hybrid GUID-strategi):
+  - PERFORMANCE FIX: _recommend_from_seed_sync brugte fuld biblioteksscan
+    (~7s) selv når section.search(guid=) ville have virket.
+    Ny hybrid-strategi:
+      Tier 1: Forsøg section.search(guid=tmdb://X) per anbefaling
+              (~0.5-1s for 10 IDs hvis det virker)
+      Tier 2: Hvis Tier 1 finder <30%, fald tilbage til fuld scan
+              (samme metode som actor-check, ~5-7s, pålidelig)
+    Best case: ~4s total flow. Worst case: ~12s (som før).
+  - Detaljeret logging af Tier 1 hit rate og fallback-beslutning.
+
+UNCHANGED (v1.2.1 — recommend_from_seed GUID-fix):
+  - Skiftede fra ren section.search(guid=) til index-baseret matching
+    via fuld biblioteksscan. Pålideligt men langsomt.
 
 UNCHANGED (v1.2.0 — recommend_from_seed combined tool):
   - Tilføjet recommend_from_seed() — combined tool der erstatter sekvensen
@@ -1148,9 +1150,18 @@ def _recommend_from_seed_sync(
     """
     Synkron implementering af recommend_from_seed's Plex-del.
 
-    Bruger en pre-bygget GUID-index (TMDB ID → Plex item) for batch-lookup.
-    Det er mere robust end section.search(guid=...) som kan have problemer
-    med visse Plex-konfigurationer/agents.
+    HYBRID GUID-STRATEGI:
+      Tier 1: section.search(guid=tmdb://X) per anbefaling — O(1) per ID.
+              Forventet hurtig (~0.5-1s for 10 anbefalinger).
+      Tier 2: Hvis Tier 1 finder mindre end 30% af anbefalingerne, fald
+              tilbage til fuld biblioteksscanning (samme metode som
+              _check_actor_on_plex_sync). Tager 5-7s men er pålidelig.
+
+    Begrundelse: section.search(guid=...) er ikke 100% pålidelig på alle
+    Plex-konfigurationer (afhænger af agents og metadata-status). Hvis den
+    returnerer 0 hits for alle, er det sandsynligvis en konfigurationsfejl
+    og vi skal scanne for at få korrekt resultat. Men HVIS den virker, er
+    den 10x hurtigere.
     """
     plex = _connect(plex_username)
     if isinstance(plex, dict):
@@ -1176,11 +1187,11 @@ def _recommend_from_seed_sync(
     )
 
     # Saml de TMDB-IDs vi skal lede efter
-    rec_ids: set[int] = set()
+    rec_ids: list[int] = []
     for rec in recommendations:
         rid = rec.get("id") or rec.get("tmdb_id")
         if rid:
-            rec_ids.add(int(rid))
+            rec_ids.append(int(rid))
 
     if not rec_ids:
         return {
@@ -1189,36 +1200,68 @@ def _recommend_from_seed_sync(
             "filtered": {"on_plex": 0, "unwatched": 0},
         }
 
-    # Byg index: tmdb_id → (plex_item, watched bool)
-    # Vi scanner hele biblioteket én gang og matcher på .guids — det er hurtigere
-    # end at lave 10-20 separate section.search(guid=...) kald.
+    # ── TIER 1: Hurtig server-side GUID-lookup ────────────────────────────────
+    # Forventet ~0.5-1s for 10 IDs hvis det virker korrekt.
     plex_index: dict[int, dict] = {}
-    for section in sections:
-        try:
-            for item in section.search():
-                tid = _extract_tmdb_id_from_guids(item)
-                if tid and tid in rec_ids and tid not in plex_index:
-                    plex_index[tid] = {
-                        "item": item,
-                        "view_count": getattr(item, "viewCount", 0) or 0,
+    tier1_errors = 0
+
+    for rec_id in rec_ids:
+        for section in sections:
+            try:
+                hits = section.search(guid=f"tmdb://{rec_id}")
+                if hits:
+                    plex_index[rec_id] = {
+                        "item": hits[0],
+                        "view_count": getattr(hits[0], "viewCount", 0) or 0,
                     }
-                    if len(plex_index) == len(rec_ids):
-                        break  # Alle fundet, stop scanningen
-            if len(plex_index) == len(rec_ids):
-                break
-        except Exception as e:
-            logger.warning(
-                "recommend_from_seed: scan fejl i sektion '%s': %s",
-                section.title, e,
-            )
-            continue
+                    break  # Fundet i denne sektion, gå til næste rec_id
+            except Exception:
+                tier1_errors += 1
+                continue
+
+    tier1_hit_rate = len(plex_index) / len(rec_ids) if rec_ids else 0
 
     logger.info(
-        "recommend_from_seed: GUID-index byggget — %d/%d anbefalinger fundet på Plex",
-        len(plex_index), len(rec_ids),
+        "recommend_from_seed Tier 1 (GUID-search): %d/%d fundet (%.0f%%), %d fejl",
+        len(plex_index), len(rec_ids), tier1_hit_rate * 100, tier1_errors,
     )
 
-    # Match anbefalinger mod Plex-index
+    # ── TIER 2: Fald tilbage til fuld scan hvis Tier 1 var dårlig ─────────────
+    # Tærskel: hvis vi fandt mindre end 30% af anbefalingerne, er Tier 1
+    # sandsynligvis upålidelig på denne Plex-server, og vi skal scanne.
+    # 30% er valgt fordi mange anbefalinger naturligt IKKE er på Plex —
+    # men hvis Tier 1 finder 0%, er det helt sikkert en konfigurationsfejl.
+    if tier1_hit_rate < 0.30:
+        logger.info(
+            "recommend_from_seed: Tier 1 hit rate lav (%.0f%%) — falder tilbage til Tier 2 (fuld scan)",
+            tier1_hit_rate * 100,
+        )
+        rec_id_set = set(rec_ids)
+        for section in sections:
+            try:
+                for item in section.search():
+                    tid = _extract_tmdb_id_from_guids(item)
+                    if tid and tid in rec_id_set and tid not in plex_index:
+                        plex_index[tid] = {
+                            "item": item,
+                            "view_count": getattr(item, "viewCount", 0) or 0,
+                        }
+                        if len(plex_index) == len(rec_id_set):
+                            break  # Alle fundet, stop scanningen
+                if len(plex_index) == len(rec_id_set):
+                    break
+            except Exception as e:
+                logger.warning(
+                    "recommend_from_seed Tier 2 scan fejl i sektion '%s': %s",
+                    section.title, e,
+                )
+                continue
+        logger.info(
+            "recommend_from_seed Tier 2 done: %d/%d total fundet",
+            len(plex_index), len(rec_ids),
+        )
+
+    # ── Match anbefalinger mod Plex-index ─────────────────────────────────────
     found_on_plex: list[dict] = []
     unwatched_only: list[dict] = []
 
