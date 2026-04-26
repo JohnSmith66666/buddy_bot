@@ -1,16 +1,17 @@
 """
 ai_handler.py - Agentic loop for Buddy.
 
-CHANGES vs previous version (v1.0.5 — filmografi token-fix):
-  - _MAX_TOOL_RESULT_CHARS: 6.000 → 12.000.
-    Årsag: get_person_filmography for Tarantino (91 film × ~98 chars) = ~9.600 chars
-    + person-overhead = ~10.000 chars total. Med 6.000-grænsen blev filmografien
-    klippet til ~61 film — Inglourious Basterds, Jackie Brown, Kill Bill etc.
-    nåede aldrig frem til Buddy, som derefter gættede forkerte ID'er.
-    12.000 giver god margen selv til store filmografier (200+ film).
-  - _slim_data max_list_items: 10 → 40 for første pas.
-    Tidligere klippede _slim_data til 10 items som fallback — det er for aggressivt
-    for filmografi-lister. 40 items er et bedre kompromis.
+CHANGES vs previous version (v1.0.6 — P0 patch: changelog-kode mismatch fix):
+  - KRITISK FIX: _MAX_TOOL_RESULT_CHARS = 12000 (var 6000 trods v1.0.5 changelog
+    sagde det var ændret). Filmografier på 75-100 film blev stadig klippet
+    til ~37 entries → Buddy gættede forkerte TMDB-IDs fra træningsdata.
+  - KRITISK FIX: _slim_data() default max_list_items=40 (var 10). Konsistens
+    med _trim_tool_result fallback-pas på 5 (det er nu en faktisk reduktion
+    i stedet for en udvidelse).
+
+UNCHANGED (v1.0.5 — filmografi token-fix dokumenteret men ikke deployet):
+  - _MAX_TOOL_RESULT_CHARS: dokumenteret som 6000 → 12000 (nu rettet i kode).
+  - _slim_data max_list_items: dokumenteret som 10 → 40 (nu rettet i kode).
 
 UNCHANGED (v0.9.9 — get_recently_added fix):
   - get_recently_added() kaldes uden plex_username argument.
@@ -82,9 +83,11 @@ _last_activity: dict[int, float] = {}
 _SESSION_TIMEOUT = 10 * 60
 _MAX_HISTORY = 6
 
-# Tarantinos instruktørfilm: ~10 film × 98 chars = ~1.000 chars — passer fint i 6.000.
-# get_person_filmography returnerer nu kun crew/Director-film, ikke alle 91 cast-film.
-_MAX_TOOL_RESULT_CHARS = 6000
+# Tarantinos instruktørfilm: ~10 film × 98 chars = ~1.000 chars — passer fint i 12.000.
+# Større filmografier (Tom Hanks, Tom Cruise, 75+ film) fylder op til 10.000 chars.
+# 12.000 giver god margen selv til 200+ film og forhindrer trunkering der har
+# tidligere fået Buddy til at gætte forkerte TMDB-IDs fra træningsdata.
+_MAX_TOOL_RESULT_CHARS = 12000
 
 SEARCH_SIGNAL  = "SHOW_SEARCH_RESULTS:"
 TRAILER_SIGNAL = "SHOW_TRAILER:"
@@ -103,10 +106,12 @@ def _trim(telegram_id: int) -> None:
         _histories[telegram_id] = hist[-_MAX_HISTORY:]
 
 
-def _slim_data(data, max_list_items: int = 10):
+def _slim_data(data, max_list_items: int = 40):
     """
     Rekursivt trim store lister og fjern None-værdier for at spare tokens.
-    To pas: max 10 items, derefter max 5 hvis stadig for lang.
+    To pas: max 40 items i første pas, derefter max 5 hvis stadig for lang.
+    40 er valgt fordi filmografier kan have 50-100 entries — at klippe til 10
+    ville fjerne størstedelen af f.eks. Spielbergs eller Tarantinos værker.
     """
     if isinstance(data, dict):
         return {k: _slim_data(v, max_list_items) for k, v in data.items() if v is not None}
@@ -118,7 +123,7 @@ def _slim_data(data, max_list_items: int = 10):
 def _trim_tool_result(result: str) -> str:
     """
     Trim et tool-resultat til max _MAX_TOOL_RESULT_CHARS tegn.
-    To pas: max 10 items, derefter max 5 hvis stadig for lang.
+    To pas: max 40 items i første pas, derefter max 5 hvis stadig for lang.
     """
     if len(result) <= _MAX_TOOL_RESULT_CHARS:
         return result

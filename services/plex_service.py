@@ -1,7 +1,14 @@
 """
 services/plex_service.py - Plex Media Server integration via python-plexapi.
 
-CHANGES vs previous version (v1.1.0 — switchHomeUser failure cache):
+CHANGES vs previous version (v1.1.1 — P0 cleanup):
+  - _build_actor_guid_set(): Lag 2 (fuld biblioteksscanning) er fjernet —
+    den tilføjede ALLE Plex-film til TMDB-sættet og gav falske positive
+    ved TMDB-krydstjek. Tom Hanks fandt 5 film i stedet for 22.
+  - _check_actor_on_plex_sync(): dead code 'capped_missing' fjernet
+    (variablen blev beregnet men aldrig brugt — ren cleanup).
+
+UNCHANGED (v1.1.0 — switchHomeUser failure cache):
   - Performance fix: _connect() cacher nu Plex Home User auth-fejl per username.
     Når switchHomeUser() fejler med 401 unauthorized, caches usernavnet i 1 time
     så efterfølgende kald straks falder tilbage til admin-konto i stedet for
@@ -857,17 +864,22 @@ def _check_actor_on_plex_sync(
     top_movies: list[dict],
     plex_username: str | None = None,
 ) -> dict:
-    """Krydstjek skuespillers top-film mod Plex via GUID + fuzzy titel."""
+    """
+    Krydstjek skuespillers top-film mod Plex via GUID + fuzzy titel.
+
+    NB: Returnerer kun 'found'-listen — missing er bevidst udeladt
+    (var tidligere upålidelig og blev kilde til ID-hallucination).
+    Buddy nævner kun film vi faktisk har på serveren.
+    """
     tmdb_ids, imdb_ids = _build_actor_guid_set(actor_name, plex_username)
 
-    found    = []
-    missing  = []
+    found = []
 
     for movie in top_movies:
-        tmdb_id  = movie.get("tmdb_id")
-        imdb_id  = movie.get("imdb_id")
-        title    = movie.get("title", "")
-        year     = movie.get("year")
+        tmdb_id = movie.get("tmdb_id")
+        imdb_id = movie.get("imdb_id")
+        title   = movie.get("title", "")
+        year    = movie.get("year")
 
         in_plex = False
         if tmdb_id and tmdb_id in tmdb_ids:
@@ -875,16 +887,14 @@ def _check_actor_on_plex_sync(
         elif imdb_id and imdb_id in imdb_ids:
             in_plex = True
 
-        entry = {"title": title, "year": year, "tmdb_id": tmdb_id}
-        (found if in_plex else missing).append(entry)
-
-    capped_missing = missing[:_ACTOR_MAX_MISSING]
+        if in_plex:
+            found.append({"title": title, "year": year, "tmdb_id": tmdb_id})
 
     if not found:
         return {
-            "status":  STATUS_MISSING,
-            "actor":   actor_name,
-            "found":   [],
+            "status": STATUS_MISSING,
+            "actor":  actor_name,
+            "found":  [],
         }
     return {"status": "ok", "actor": actor_name, "found": found, "count": len(found)}
 
