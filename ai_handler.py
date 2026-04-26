@@ -1,17 +1,22 @@
 """
 ai_handler.py - Agentic loop for Buddy.
 
-CHANGES vs previous version (v1.0.6 — P0 patch: changelog-kode mismatch fix):
-  - KRITISK FIX: _MAX_TOOL_RESULT_CHARS = 12000 (var 6000 trods v1.0.5 changelog
-    sagde det var ændret). Filmografier på 75-100 film blev stadig klippet
-    til ~37 entries → Buddy gættede forkerte TMDB-IDs fra træningsdata.
-  - KRITISK FIX: _slim_data() default max_list_items=40 (var 10). Konsistens
-    med _trim_tool_result fallback-pas på 5 (det er nu en faktisk reduktion
-    i stedet for en udvidelse).
+CHANGES vs previous version (v1.0.7 — max_tokens fix for store filmografier):
+  - max_tokens: 1500 → 4000.
+    Årsag: Mads Mikkelsens 68 cast-credits genererede svar på 1500+ output
+    tokens (68 linjer med titler, ID'er og status-emojis). Buddy ramte
+    max_tokens-grænsen og afsluttede med "(Svaret blev afbrudt for at spare
+    plads — spørg endelig hvis du vil have resten med!)".
+    4000 giver god margen selv til 100+ film uden væsentlig omkostningsstigning,
+    da grænsen kun rammes ved meget lange svar.
+
+UNCHANGED (v1.0.6 — P0 patch: changelog-kode mismatch fix):
+  - _MAX_TOOL_RESULT_CHARS = 12000 (var 6000 trods v1.0.5 changelog).
+  - _slim_data() default max_list_items=40 (var 10).
 
 UNCHANGED (v1.0.5 — filmografi token-fix dokumenteret men ikke deployet):
-  - _MAX_TOOL_RESULT_CHARS: dokumenteret som 6000 → 12000 (nu rettet i kode).
-  - _slim_data max_list_items: dokumenteret som 10 → 40 (nu rettet i kode).
+  - _MAX_TOOL_RESULT_CHARS: dokumenteret som 6000 → 12000 (rettet i v1.0.6).
+  - _slim_data max_list_items: dokumenteret som 10 → 40 (rettet i v1.0.6).
 
 UNCHANGED (v0.9.9 — get_recently_added fix):
   - get_recently_added() kaldes uden plex_username argument.
@@ -389,7 +394,7 @@ async def get_ai_response(
         while True:
             response = await _client.messages.create(
                 model=ANTHROPIC_MODEL,
-                max_tokens=1500,
+                max_tokens=4000,
                 system=system_blocks,
                 tools=tools_with_cache,
                 messages=_histories[telegram_id],
