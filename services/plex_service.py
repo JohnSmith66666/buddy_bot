@@ -1,7 +1,20 @@
 """
 services/plex_service.py - Plex Media Server integration via python-plexapi.
 
-CHANGES vs previous version (v1.2.0 — recommend_from_seed combined tool):
+CHANGES vs previous version (v1.2.1 — recommend_from_seed GUID-fix):
+  - KRITISK FIX: _recommend_from_seed_sync byggede på section.search(guid=X)
+    som returnerede 0 hits selv for film der ER på Plex. Resultat:
+    "10 anbefalet → 0 på Plex" på Inception (selvom Memento, The Matrix m.fl.
+    er i biblioteket).
+  - Ny strategi: Saml alle TMDB-IDs fra anbefalinger → scan Plex én gang
+    via section.search() → byg GUID→item index → match anbefalinger mod index.
+    Samme metode som _check_actor_on_plex_sync der virker pålideligt for
+    skuespiller-tjek (34 Mads Mikkelsen-film fundet korrekt).
+  - Tilføjet diagnostisk logging: logger top 3 TMDB-anbefalinger og
+    GUID-index størrelse efter scan.
+  - Early exit: stopper scanningen så snart alle anbefalinger er fundet.
+
+UNCHANGED (v1.2.0 — recommend_from_seed combined tool):
   - Tilføjet recommend_from_seed() — combined tool der erstatter sekvensen
     get_recommendations + N×check_plex_library + viewCount-filtrering med
     ét enkelt kald. Sparer 4-7 sekunder på anbefalingsflow ved at fjerne
@@ -9,8 +22,6 @@ CHANGES vs previous version (v1.2.0 — recommend_from_seed combined tool):
   - Resultatet inkluderer kun titler der er på Plex (og usete hvis
     only_unwatched=True). Ingen ➕-titler — vi anbefaler kun ting brugeren
     faktisk kan se nu.
-  - Bruger section.search(guid=tmdb://X) til server-side GUID-lookup,
-    samme metode som _check_sync's Lag 0. Hurtigt og præcist.
 
 UNCHANGED (v1.1.1 — P0 cleanup):
   - _build_actor_guid_set(): Lag 2 (fuld biblioteksscanning) er fjernet —
@@ -1136,7 +1147,10 @@ def _recommend_from_seed_sync(
 ) -> dict:
     """
     Synkron implementering af recommend_from_seed's Plex-del.
-    Bruger section.search(guid=tmdb://X) til hurtig batch-lookup.
+
+    Bruger en pre-bygget GUID-index (TMDB ID → Plex item) for batch-lookup.
+    Det er mere robust end section.search(guid=...) som kan have problemer
+    med visse Plex-konfigurationer/agents.
     """
     plex = _connect(plex_username)
     if isinstance(plex, dict):
@@ -1151,6 +1165,60 @@ def _recommend_from_seed_sync(
             "filtered": {"on_plex": 0, "unwatched": 0},
         }
 
+    # Diagnostisk: log første 3 anbefalinger
+    rec_summary = ", ".join(
+        f"{r.get('title', r.get('name', '?'))} (id={r.get('id')})"
+        for r in recommendations[:3]
+    )
+    logger.info(
+        "recommend_from_seed_sync: %d sections, %d recs. Top 3: %s",
+        len(sections), len(recommendations), rec_summary,
+    )
+
+    # Saml de TMDB-IDs vi skal lede efter
+    rec_ids: set[int] = set()
+    for rec in recommendations:
+        rid = rec.get("id") or rec.get("tmdb_id")
+        if rid:
+            rec_ids.add(int(rid))
+
+    if not rec_ids:
+        return {
+            "status": STATUS_MISSING,
+            "results": [],
+            "filtered": {"on_plex": 0, "unwatched": 0},
+        }
+
+    # Byg index: tmdb_id → (plex_item, watched bool)
+    # Vi scanner hele biblioteket én gang og matcher på .guids — det er hurtigere
+    # end at lave 10-20 separate section.search(guid=...) kald.
+    plex_index: dict[int, dict] = {}
+    for section in sections:
+        try:
+            for item in section.search():
+                tid = _extract_tmdb_id_from_guids(item)
+                if tid and tid in rec_ids and tid not in plex_index:
+                    plex_index[tid] = {
+                        "item": item,
+                        "view_count": getattr(item, "viewCount", 0) or 0,
+                    }
+                    if len(plex_index) == len(rec_ids):
+                        break  # Alle fundet, stop scanningen
+            if len(plex_index) == len(rec_ids):
+                break
+        except Exception as e:
+            logger.warning(
+                "recommend_from_seed: scan fejl i sektion '%s': %s",
+                section.title, e,
+            )
+            continue
+
+    logger.info(
+        "recommend_from_seed: GUID-index byggget — %d/%d anbefalinger fundet på Plex",
+        len(plex_index), len(rec_ids),
+    )
+
+    # Match anbefalinger mod Plex-index
     found_on_plex: list[dict] = []
     unwatched_only: list[dict] = []
 
@@ -1158,6 +1226,11 @@ def _recommend_from_seed_sync(
         rec_tmdb_id = rec.get("id") or rec.get("tmdb_id")
         if not rec_tmdb_id:
             continue
+
+        plex_data = plex_index.get(int(rec_tmdb_id))
+        if plex_data is None:
+            continue  # Ikke på Plex → drop
+
         rec_title = rec.get("title") or rec.get("name") or "Ukendt"
         rec_year = None
         date_str = rec.get("release_date") or rec.get("first_air_date") or ""
@@ -1168,20 +1241,6 @@ def _recommend_from_seed_sync(
                 pass
         rec_rating = rec.get("vote_average") or rec.get("rating")
 
-        # Server-side GUID-lookup på tværs af alle sektioner af typen
-        plex_item = None
-        for section in sections:
-            try:
-                hits = section.search(guid=f"tmdb://{rec_tmdb_id}")
-                if hits:
-                    plex_item = hits[0]
-                    break
-            except Exception:
-                continue
-
-        if plex_item is None:
-            continue  # Ikke på Plex → drop
-
         entry = {
             "title": rec_title,
             "year": rec_year,
@@ -1190,9 +1249,7 @@ def _recommend_from_seed_sync(
         }
         found_on_plex.append(entry)
 
-        # Filtrér på uset hvis ønsket
-        view_count = getattr(plex_item, "viewCount", 0) or 0
-        if view_count == 0:
+        if plex_data["view_count"] == 0:
             unwatched_only.append(entry)
 
     # Vælg final liste
