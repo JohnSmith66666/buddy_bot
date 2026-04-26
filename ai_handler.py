@@ -1,7 +1,12 @@
 """
 ai_handler.py - Agentic loop for Buddy.
 
-CHANGES vs previous version (v1.0.7 — max_tokens fix for store filmografier):
+CHANGES vs previous version (v1.0.8 — recommend_from_seed dispatch):
+  - Tilføjet dispatch case for recommend_from_seed (P1 combined tool).
+    Sparer 5-7s på anbefalingsflow ved at samle 7+ tool-calls til 1.
+  - Importeret recommend_from_seed fra services.plex_service.
+
+UNCHANGED (v1.0.7 — max_tokens fix for store filmografier):
   - max_tokens: 1500 → 4000.
     Årsag: Mads Mikkelsens 68 cast-credits genererede svar på 1500+ output
     tokens (68 linjer med titler, ID'er og status-emojis). Buddy ramte
@@ -57,6 +62,7 @@ from services.plex_service import (
     get_on_deck,
     get_plex_metadata,
     get_similar_in_library,
+    recommend_from_seed,
     search_by_actor,
 )
 from services.tmdb_service import (
@@ -221,6 +227,14 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
         ))
     if tool_name == "get_similar_in_library":
         return j(await get_similar_in_library(tool_input["title"], plex_username))
+    if tool_name == "recommend_from_seed":
+        return j(await recommend_from_seed(
+            tmdb_id=tool_input["tmdb_id"],
+            media_type=tool_input["media_type"],
+            plex_username=plex_username,
+            max_results=tool_input.get("max_results", 8),
+            only_unwatched=tool_input.get("only_unwatched", True),
+        ))
     if tool_name == "get_missing_from_collection":
         return j(await get_missing_from_collection(
             tool_input["collection_name"], plex_username

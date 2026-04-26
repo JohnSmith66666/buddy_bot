@@ -1,13 +1,15 @@
 """
 tools.py - Claude Tool Use definitions for Buddy.
 
-CHANGES vs previous version (v1.0.4 — search_plex_by_actor instruktør-fix):
+CHANGES vs previous version (v1.1.0 — recommend_from_seed combined tool):
+  - Tilføjet recommend_from_seed: Combined tool der erstatter sekvensen
+    get_recommendations + N×check_plex_library + viewCount-filtrering med
+    ét kald. Sparer 5-7 sekunder på anbefalingsflow.
+    Returnerer KUN titler på Plex (og usete hvis only_unwatched=true).
+
+UNCHANGED (v1.0.4 — search_plex_by_actor instruktør-fix):
   - search_plex_by_actor: Tilføjet eksplicit advarsel om atværktøjet KUN
     finder skuespillerroller i Plex — ikke instruktørfilm.
-    For instruktørspørgsmål ('hvilke Tarantino-film har vi?') skal Buddy
-    bruge get_person_filmography + check_plex_library i stedet.
-    Årsag: Tarantino instruerede 12 film men spiller kun i 7 — search_plex_by_actor
-    returnerede kun 7 og ignorerede resten.
 
 UNCHANGED (v0.9.4 — search_media year-filter):
   - search_media: valgfri `year` parameter, årstal sendes separat.
@@ -312,6 +314,48 @@ TOOLS = [
             "type": "object",
             "properties": {"title": {"type": "string"}},
             "required": ["title"],
+        },
+    },
+    {
+        "name": "recommend_from_seed",
+        "description": (
+            "PRIMÆRT VÆRKTØJ til anbefalinger baseret på en seed-titel. "
+            "Henter TMDB-anbefalinger OG krydstjekker mod Plex OG filtrerer usete "
+            "i ét kald. Returnerer KUN titler der er paa Plex og som brugeren ikke "
+            "har set endnu. Sparer 5-7 sekunder vs. den gamle sekvens "
+            "(get_recommendations + flere check_plex_library kald). "
+            "Brug dette naar brugeren beder om noget at se der ligner X — f.eks. "
+            "'noget der ligner Inception', 'anbefal noget i samme stil som "
+            "Breaking Bad'. "
+            "Workflow: 1) Find seed-titlens TMDB ID via search_media. 2) Kald "
+            "recommend_from_seed med tmdb_id og media_type. 3) Vis resultaterne "
+            "direkte — ingen ekstra check_plex_library kald nødvendige."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tmdb_id": {
+                    "type": "integer",
+                    "description": "TMDB ID for seed-titlen (filmen/serien som anbefalingerne skal baseres på).",
+                },
+                "media_type": {
+                    "type": "string",
+                    "enum": ["movie", "tv"],
+                    "description": "Type for seed-titlen.",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maks antal resultater der returneres. Standard 8.",
+                },
+                "only_unwatched": {
+                    "type": "boolean",
+                    "description": (
+                        "Hvis true (standard), returneres kun titler brugeren ikke har set. "
+                        "Sæt til false hvis brugeren ønsker alle anbefalinger paa Plex (sete + usete)."
+                    ),
+                },
+            },
+            "required": ["tmdb_id", "media_type"],
         },
     },
     {
