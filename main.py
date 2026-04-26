@@ -1,19 +1,18 @@
 """
 main.py - Buddy bot entry point.
 
-CHANGES vs previous version (v0.10.5 — /test_metadata kommando, Step 1 af subgenre-projekt):
-  - NY ENGANGS-FEATURE: /test_metadata <tmdb_id eller titel>
-    Step 1 af subgenre-projektet (jf. plan med PostgreSQL cache + GIN-indekser):
-    * Henter TMDB-genrer + keywords for én film/serie
-    * Formaterer output pænt så vi manuelt kan vurdere mængden af
-      "guld" vs. "støj" i keyword-listen
-    * To input-modes:
-        /test_metadata 27205          → direkte TMDB ID
-        /test_metadata Inception       → titel-søgning, viser top 5 hits
-    * Bruger ny services/tmdb_keywords_service.py
-  - VERSION CHECK opdateret til v0.10.5-beta.
+CHANGES vs previous version (v0.10.6 — Step 2 af subgenre-projekt):
+  - 4 NYE ADMIN-KOMMANDOER til TMDB metadata cache:
+    * /seed_metadata        - Scan Plex og opret pending records i tmdb_metadata
+    * /fetch_metadata       - Hent næste batch på 100 fra TMDB (kan tages i loop)
+    * /fetch_metadata retry - Som ovenfor, men inkluder også 'error' records
+    * /metadata_status      - Vis fremgang: X af Y færdig, fordelt på status
+    * /top_keywords [type] [N] - Empirisk subgenre-discovery: top N keywords
+  - on_startup() opretter nu også tmdb_metadata-tabellen via setup_tmdb_metadata_table().
+  - VERSION CHECK opdateret til v0.10.6-beta.
 
-UNCHANGED (v0.10.4 — /test_enrich DRY-RUN kommando — bevares).
+UNCHANGED (v0.10.5 — /test_metadata kommando, Step 1).
+UNCHANGED (v0.10.4 — /test_enrich DRY-RUN kommando).
 UNCHANGED (v0.10.3 — /dump_genres admin-kommando).
 UNCHANGED (v0.10.2 — /genres admin-kommando).
 UNCHANGED (v0.10.1 — genre-parameter fix).
@@ -67,6 +66,7 @@ from services.confirmation_service import (
 from services.plex_service import validate_plex_user
 from services.tmdb_service import get_media_details
 from services.tmdb_keywords_service import (
+    fetch_metadata_batch,
     fetch_movie_metadata,
     fetch_tv_metadata,
     search_tmdb_by_title,
@@ -84,7 +84,7 @@ _URL_RE = re.compile(r"(https?://[^\s)\]>\"]+)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 'HVAD SKAL JEG SE?' — Konstanter og helpers (uændret fra v0.10.4)
+# 'HVAD SKAL JEG SE?' — Konstanter og helpers (uændret fra v0.10.5)
 # ══════════════════════════════════════════════════════════════════════════════
 
 WATCH_FLOW_TRIGGER = "🍿 Hvad skal jeg se?"
@@ -255,7 +255,7 @@ def _build_watch_prompt(state: dict, mode: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# /genres + /dump_genres — Engangs admin-kommandoer (uændret fra tidligere)
+# /genres + /dump_genres — Engangs admin-kommandoer (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _scan_plex_genres_sync() -> dict:
@@ -501,10 +501,8 @@ async def cmd_dump_genres(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(f"❌ Kunne ikke skrive fil: {e}")
         return
 
-    logger.info(
-        "dump_genres: %d film + %d serier dumpet (%.1f KB) → %s",
-        data["metadata"]["movie_count"], data["metadata"]["tv_count"], size_kb, filename,
-    )
+    logger.info("dump_genres: %d film + %d serier dumpet (%.1f KB) → %s",
+                data["metadata"]["movie_count"], data["metadata"]["tv_count"], size_kb, filename)
 
     try:
         await loading_msg.delete()
@@ -539,27 +537,10 @@ async def cmd_dump_genres(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# /test_metadata — Engangs admin DRY-RUN af TMDB metadata-fetch (v0.10.5)
+# /test_metadata — Engangs admin DRY-RUN (uændret fra v0.10.5)
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# DESIGN:
-#   STEP 1 i subgenre-projektet (jf. plan med PostgreSQL cache + GIN-indekser).
-#   Formål: vurdere kvaliteten af TMDB keywords MANUELT før vi designer
-#   database-schemaet og whitelist-logikken.
-#
-# To input-modes:
-#   /test_metadata 27205         → direkte TMDB ID (movie default)
-#   /test_metadata tv 1396       → TV ID
-#   /test_metadata Inception     → titel-søgning, viser top 5 hits
-#
-# Output viser:
-#   - Titel, år, media_type
-#   - Alle TMDB-genrer (engelsk)
-#   - Alle TMDB-keywords med count
-#   - Vurderings-prompt: "Hvor mange er guld vs. støj?"
 
 def _format_metadata_report(meta: dict) -> str:
-    """Formater metadata-resultat som pæn Markdown-besked til Telegram."""
     if meta.get("status") == "error":
         return (
             f"❌ *TMDB Fejl*\n"
@@ -589,21 +570,14 @@ def _format_metadata_report(meta: dict) -> str:
         f"🎭 *TMDB Genrer* ({g_count})",
         "─────────────────",
     ]
-
     if genres:
         for g in genres:
             lines.append(f"  • {g}")
     else:
         lines.append("  _(ingen genrer)_")
 
-    lines.extend([
-        "",
-        f"🏷️ *TMDB Keywords* ({k_count})",
-        "─────────────────",
-    ])
-
+    lines.extend(["", f"🏷️ *TMDB Keywords* ({k_count})", "─────────────────"])
     if keywords:
-        # Vis ALLE keywords som bullet-liste — vi vil se den fulde "støj"
         for kw in keywords:
             lines.append(f"  • {kw}")
     else:
@@ -612,23 +586,10 @@ def _format_metadata_report(meta: dict) -> str:
     if meta.get("keyword_warning"):
         lines.extend(["", f"⚠️ _{meta['keyword_warning']}_"])
 
-    lines.extend([
-        "",
-        "─────────────────",
-        "🔍 *Vurder selv:*",
-        "  • Hvor mange keywords er *guld* (subgenre-værdige)?",
-        "    F.eks.: cyberpunk, heist, slasher, neo-noir",
-        "  • Hvor mange er *støj* (irrelevant for subgenre)?",
-        "    F.eks.: 'based on novel', 'duringcreditsstinger'",
-        "",
-        "_Når du har kigget på 5-10 forskellige film, kan vi designe whitelisten._",
-    ])
-
     return "\n".join(lines)
 
 
 def _format_search_results(query: str, results: list[dict]) -> str:
-    """Vis søgeresultater når brugeren skrev en titel."""
     lines = [
         f"🔍 *TMDB-søgeresultater for:* `{query}`",
         "─────────────────",
@@ -647,21 +608,10 @@ def _format_search_results(query: str, results: list[dict]) -> str:
 
 
 async def cmd_test_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Engangs admin-kommando: /test_metadata <tmdb_id eller titel>
-
-    Eksempler:
-      /test_metadata 27205              → Inception (movie default)
-      /test_metadata movie 27205        → eksplicit movie
-      /test_metadata tv 1396            → Breaking Bad
-      /test_metadata Inception          → titel-søgning
-      /test_metadata Breaking Bad       → titel-søgning
-    """
     user = update.effective_user
     if user is None or user.id != config.ADMIN_TELEGRAM_ID:
         return
 
-    # Parse argumenter
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -669,18 +619,13 @@ async def cmd_test_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "`/test_metadata <tmdb_id>`\n"
             "`/test_metadata movie <tmdb_id>`\n"
             "`/test_metadata tv <tmdb_id>`\n"
-            "`/test_metadata <titel>`\n\n"
-            "*Eksempler:*\n"
-            "`/test_metadata 27205`\n"
-            "`/test_metadata tv 1396`\n"
-            "`/test_metadata Inception`",
+            "`/test_metadata <titel>`",
             parse_mode="Markdown",
         )
         return
 
     await update.message.chat.send_action("typing")
 
-    # ── Mode 1: 'movie <id>' eller 'tv <id>' ──────────────────────────────────
     if len(args) == 2 and args[0].lower() in ("movie", "tv") and args[1].isdigit():
         media_type = args[0].lower()
         tmdb_id    = int(args[1])
@@ -697,7 +642,6 @@ async def cmd_test_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             logger.error("test_metadata fetch-fejl: %s", e)
             await loading.edit_text(f"❌ Fejl: {e}")
             return
-
         report = _format_metadata_report(meta)
         try:
             await loading.delete()
@@ -706,7 +650,6 @@ async def cmd_test_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(report, parse_mode="Markdown")
         return
 
-    # ── Mode 2: kun et tal (default movie) ────────────────────────────────────
     if len(args) == 1 and args[0].isdigit():
         tmdb_id = int(args[0])
         loading = await update.message.reply_text(
@@ -720,12 +663,9 @@ async def cmd_test_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await loading.edit_text(f"❌ Fejl: {e}")
             return
 
-        # Hvis ikke fundet som movie, prøv tv automatisk
         if meta.get("status") == "not_found":
             try:
                 meta = await fetch_tv_metadata(tmdb_id)
-                if meta.get("status") == "ok":
-                    logger.info("test_metadata: ID %d fundet som TV efter movie-fejl", tmdb_id)
             except Exception:
                 pass
 
@@ -737,7 +677,6 @@ async def cmd_test_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(report, parse_mode="Markdown")
         return
 
-    # ── Mode 3: titel-søgning ────────────────────────────────────────────────
     query = " ".join(args)
     loading = await update.message.reply_text(
         f"🔍 Søger TMDB efter: `{query}`...",
@@ -762,7 +701,6 @@ async def cmd_test_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    # Hvis præcis 1 resultat — hent metadata direkte
     if len(results) == 1:
         r = results[0]
         if r["media_type"] == "movie":
@@ -773,9 +711,451 @@ async def cmd_test_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(report, parse_mode="Markdown")
         return
 
-    # Flere resultater — vis liste
     report = _format_search_results(query, results)
     await update.message.reply_text(report, parse_mode="Markdown")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Step 2 admin-kommandoer (NYT v0.10.6)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _scan_plex_for_seeding_sync() -> list[dict]:
+    """
+    Scan ALLE film + serier i Plex for at samle TMDB IDs til seeding.
+    Returnerer kun items med gyldigt TMDB ID — items uden GUID springes over.
+    """
+    from services.plex_service import (
+        _connect, _sections, _MOVIE_TYPE, _TV_TYPE,
+        _extract_tmdb_id_from_guids,
+    )
+
+    plex = _connect(None)
+    if isinstance(plex, dict):
+        return []
+
+    items: list[dict] = []
+
+    for section in _sections(plex, _MOVIE_TYPE):
+        try:
+            all_items = section.all()
+        except Exception as e:
+            logger.warning("seed scan (movie): section.all() fejl '%s': %s", section.title, e)
+            continue
+        for item in all_items:
+            tmdb_id = _extract_tmdb_id_from_guids(item)
+            if not tmdb_id:
+                continue
+            items.append({
+                "tmdb_id":    tmdb_id,
+                "media_type": "movie",
+                "title":      getattr(item, "title", None),
+                "year":       getattr(item, "year", None),
+            })
+
+    for section in _sections(plex, _TV_TYPE):
+        try:
+            all_items = section.all()
+        except Exception as e:
+            logger.warning("seed scan (tv): section.all() fejl '%s': %s", section.title, e)
+            continue
+        for item in all_items:
+            tmdb_id = _extract_tmdb_id_from_guids(item)
+            if not tmdb_id:
+                continue
+            items.append({
+                "tmdb_id":    tmdb_id,
+                "media_type": "tv",
+                "title":      getattr(item, "title", None),
+                "year":       getattr(item, "year", None),
+            })
+
+    return items
+
+
+async def cmd_seed_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /seed_metadata — Scan Plex og opret 'pending' records i tmdb_metadata.
+    Idempotent: kan køres flere gange uden at nulstille fetched records.
+    """
+    user = update.effective_user
+    if user is None or user.id != config.ADMIN_TELEGRAM_ID:
+        return
+
+    await update.message.chat.send_action("typing")
+    loading = await update.message.reply_text(
+        "🌱 *Seed Metadata*\n\n"
+        "1. Scanner Plex for alle film + serier med TMDB ID...",
+        parse_mode="Markdown",
+    )
+
+    # ── 1. Scan Plex ──────────────────────────────────────────────────────────
+    try:
+        items = await asyncio.to_thread(_scan_plex_for_seeding_sync)
+    except Exception as e:
+        logger.error("cmd_seed_metadata Plex-fejl: %s", e)
+        await loading.edit_text(f"❌ Plex-scan fejlede: {e}")
+        return
+
+    if not items:
+        await loading.edit_text("⚠️ Ingen Plex-items med TMDB ID fundet.")
+        return
+
+    movie_count = sum(1 for i in items if i["media_type"] == "movie")
+    tv_count    = sum(1 for i in items if i["media_type"] == "tv")
+
+    try:
+        await loading.edit_text(
+            f"🌱 *Seed Metadata*\n\n"
+            f"✅ Scannet Plex: *{movie_count}* film + *{tv_count}* serier\n"
+            f"📥 Indsætter pending records i database...",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+    # ── 2. Seed database ──────────────────────────────────────────────────────
+    try:
+        result = await database.seed_tmdb_metadata(items)
+    except Exception as e:
+        logger.error("cmd_seed_metadata DB-fejl: %s", e)
+        await loading.edit_text(f"❌ Database-seed fejlede: {e}")
+        return
+
+    # ── 3. Vis status ─────────────────────────────────────────────────────────
+    try:
+        status = await database.get_metadata_status()
+    except Exception as e:
+        logger.warning("cmd_seed_metadata status-fejl: %s", e)
+        status = None
+
+    summary = (
+        f"🌱 *Seed Metadata — Færdig!*\n\n"
+        f"📥 *Plex-scan:*\n"
+        f"  • Film: *{movie_count}*\n"
+        f"  • Serier: *{tv_count}*\n"
+        f"  • Total: *{len(items)}*\n\n"
+        f"💾 *Database-seed:*\n"
+        f"  • Nye records oprettet: *{result['inserted']}*\n"
+        f"  • Allerede i DB (skipped): *{result['skipped']}*\n"
+    )
+
+    if status:
+        summary += (
+            f"\n📊 *Aktuel status:*\n"
+            f"  • Pending: *{status['pending']}*\n"
+            f"  • Fetched: *{status['fetched']}*\n"
+            f"  • Error: *{status['error']}*\n"
+            f"  • Not found: *{status['not_found']}*\n"
+            f"  • Total: *{status['total']}*\n"
+        )
+
+    summary += (
+        f"\n🚀 *Næste skridt:*\n"
+        f"Kør `/fetch_metadata` flere gange (100 per batch) "
+        f"indtil pending = 0."
+    )
+
+    try:
+        await loading.delete()
+    except Exception:
+        pass
+    await update.message.reply_text(summary, parse_mode="Markdown")
+    logger.info("seed_metadata: %d items scanned, %d inserted, %d skipped",
+                len(items), result["inserted"], result["skipped"])
+
+
+async def cmd_fetch_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /fetch_metadata          — hent næste batch på 100 pending records
+    /fetch_metadata retry    — som ovenfor, men inkluder også 'error' records
+    """
+    user = update.effective_user
+    if user is None or user.id != config.ADMIN_TELEGRAM_ID:
+        return
+
+    args = context.args
+    include_errors = bool(args and args[0].lower() == "retry")
+    batch_size     = 100
+
+    await update.message.chat.send_action("typing")
+    mode_label = "med retry af errors" if include_errors else "kun pending"
+    loading = await update.message.reply_text(
+        f"📡 *Fetch Metadata* ({mode_label})\n\n"
+        f"Henter næste batch på *{batch_size}* records fra TMDB...",
+        parse_mode="Markdown",
+    )
+
+    # ── 1. Hent pending batch fra DB ──────────────────────────────────────────
+    try:
+        pending = await database.get_pending_metadata(
+            limit=batch_size, include_errors=include_errors,
+        )
+    except Exception as e:
+        logger.error("cmd_fetch_metadata DB-fejl: %s", e)
+        await loading.edit_text(f"❌ DB-fejl: {e}")
+        return
+
+    if not pending:
+        try:
+            await loading.delete()
+        except Exception:
+            pass
+        await update.message.reply_text(
+            "🎉 *Ingen pending records!*\n\n"
+            "Hele cachen er færdigfetched. Kør `/metadata_status` for fuld oversigt.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── 2. Fetch batch fra TMDB ───────────────────────────────────────────────
+    try:
+        batch_result = await fetch_metadata_batch(pending)
+    except Exception as e:
+        logger.error("cmd_fetch_metadata TMDB-fejl: %s", e)
+        await loading.edit_text(f"❌ TMDB-fejl: {e}")
+        return
+
+    # ── 3. Skriv resultater til DB ────────────────────────────────────────────
+    write_errors = 0
+    for r in batch_result["results"]:
+        tmdb_id    = r.get("tmdb_id")
+        media_type = r.get("media_type")
+        if not tmdb_id or not media_type:
+            continue
+
+        try:
+            if r["status"] == "ok":
+                await database.update_metadata_success(
+                    tmdb_id     = tmdb_id,
+                    media_type  = media_type,
+                    tmdb_genres = r.get("genres", []),
+                    keywords    = r.get("keywords", []),
+                    title       = r.get("title"),
+                    year        = r.get("year"),
+                )
+            elif r["status"] == "not_found":
+                await database.update_metadata_error(
+                    tmdb_id       = tmdb_id,
+                    media_type    = media_type,
+                    error_message = r.get("message", "Ikke fundet på TMDB"),
+                    is_not_found  = True,
+                )
+            else:  # error
+                await database.update_metadata_error(
+                    tmdb_id       = tmdb_id,
+                    media_type    = media_type,
+                    error_message = r.get("error_message", "Ukendt fejl"),
+                    is_not_found  = False,
+                )
+        except Exception as e:
+            write_errors += 1
+            logger.warning("update_metadata write-fejl for %s/%s: %s",
+                           media_type, tmdb_id, e)
+
+    # ── 4. Vis sammendrag + næste skridt ──────────────────────────────────────
+    summary = batch_result["summary"]
+    duration = batch_result["duration_seconds"]
+
+    try:
+        status = await database.get_metadata_status()
+    except Exception:
+        status = None
+
+    msg = (
+        f"📡 *Fetch Metadata — Batch færdig*\n"
+        f"_({mode_label})_\n\n"
+        f"⏱️ *Varighed:* {duration:.1f} sek\n\n"
+        f"📦 *Denne batch ({summary['total']} items):*\n"
+        f"  ✅ OK: *{summary['ok']}*\n"
+        f"  ⚠️ Not found: *{summary['not_found']}*\n"
+        f"  ❌ Error: *{summary['error']}*\n"
+    )
+    if write_errors:
+        msg += f"  💾 DB-write errors: *{write_errors}*\n"
+
+    if status:
+        pct = (status["fetched"] / status["total"] * 100) if status["total"] else 0
+        msg += (
+            f"\n📊 *Total status:*\n"
+            f"  • Fetched: *{status['fetched']}* / *{status['total']}* ({pct:.1f}%)\n"
+            f"  • Pending: *{status['pending']}*\n"
+            f"  • Error:   *{status['error']}*\n"
+            f"  • Not found: *{status['not_found']}*\n"
+        )
+        if status["pending"] > 0:
+            batches_left = (status["pending"] + batch_size - 1) // batch_size
+            msg += f"\n🚀 *Næste skridt:* `/fetch_metadata` ({batches_left} batches tilbage)"
+        elif status["error"] > 0 and not include_errors:
+            msg += f"\n🔁 *Retry errors:* `/fetch_metadata retry`"
+        else:
+            msg += "\n🎉 *Alle records er færdigbehandlet!*"
+
+    try:
+        await loading.delete()
+    except Exception:
+        pass
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_metadata_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/metadata_status — vis fremgang i tmdb_metadata cache."""
+    user = update.effective_user
+    if user is None or user.id != config.ADMIN_TELEGRAM_ID:
+        return
+
+    try:
+        status = await database.get_metadata_status()
+    except Exception as e:
+        logger.error("cmd_metadata_status fejl: %s", e)
+        await update.message.reply_text(f"❌ DB-fejl: {e}")
+        return
+
+    if status["total"] == 0:
+        await update.message.reply_text(
+            "📊 *Metadata Status*\n\n"
+            "Ingen records i tmdb_metadata endnu.\n"
+            "Kør `/seed_metadata` for at starte.",
+            parse_mode="Markdown",
+        )
+        return
+
+    pct_total = (status["fetched"] / status["total"] * 100) if status["total"] else 0
+    movie     = status["by_media_type"]["movie"]
+    tv        = status["by_media_type"]["tv"]
+
+    movie_pct = (movie["fetched"] / movie["total"] * 100) if movie["total"] else 0
+    tv_pct    = (tv["fetched"]    / tv["total"]    * 100) if tv["total"]    else 0
+
+    msg = (
+        f"📊 *Metadata Status*\n"
+        f"═══════════════════════\n\n"
+        f"🌍 *Total:* {status['fetched']:,} / {status['total']:,} ({pct_total:.1f}%)\n"
+        f"  • Pending: *{status['pending']:,}*\n"
+        f"  • Fetched: *{status['fetched']:,}*\n"
+        f"  • Error: *{status['error']:,}*\n"
+        f"  • Not found: *{status['not_found']:,}*\n\n"
+        f"🎬 *Film:* {movie['fetched']:,} / {movie['total']:,} ({movie_pct:.1f}%)\n"
+        f"  • Pending: {movie['pending']:,}\n"
+        f"  • Error: {movie['error']:,}\n"
+        f"  • Not found: {movie['not_found']:,}\n\n"
+        f"📺 *Serier:* {tv['fetched']:,} / {tv['total']:,} ({tv_pct:.1f}%)\n"
+        f"  • Pending: {tv['pending']:,}\n"
+        f"  • Error: {tv['error']:,}\n"
+        f"  • Not found: {tv['not_found']:,}\n"
+    )
+
+    if status["pending"] > 0:
+        msg += f"\n🚀 *Næste:* `/fetch_metadata`"
+    elif status["error"] > 0:
+        msg += f"\n🔁 *Retry errors:* `/fetch_metadata retry`"
+    else:
+        msg += f"\n🎉 *Alle records er færdige!* Prøv `/top_keywords movie 50`"
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_top_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /top_keywords                — top 50 keywords (begge media types)
+    /top_keywords movie          — top 50 film-keywords
+    /top_keywords tv             — top 50 TV-keywords
+    /top_keywords movie 100      — top 100 film-keywords
+    /top_keywords tv 30          — top 30 TV-keywords
+
+    Det DETEKTIV-VÆRKTØJ — lader dataen fortælle hvilke subgenrer du faktisk ejer.
+    """
+    user = update.effective_user
+    if user is None or user.id != config.ADMIN_TELEGRAM_ID:
+        return
+
+    args = context.args
+    media_type: str | None = None
+    limit = 50
+
+    # Parse args fleksibelt: kan være [], ["movie"], ["50"], ["movie", "50"]
+    for arg in args:
+        if arg.lower() in ("movie", "tv"):
+            media_type = arg.lower()
+        elif arg.isdigit():
+            limit = max(1, min(int(arg), 200))   # cap mellem 1-200
+
+    await update.message.chat.send_action("typing")
+    loading = await update.message.reply_text(
+        f"🔬 *Top Keywords*\n\n"
+        f"Analyserer database...\n"
+        f"_(media_type: {media_type or 'alle'}, limit: {limit})_",
+        parse_mode="Markdown",
+    )
+
+    try:
+        keywords = await database.get_top_keywords(media_type=media_type, limit=limit)
+    except Exception as e:
+        logger.error("cmd_top_keywords fejl: %s", e)
+        await loading.edit_text(f"❌ DB-fejl: {e}")
+        return
+
+    if not keywords:
+        await loading.edit_text(
+            "⚠️ *Ingen keywords i databasen endnu.*\n\n"
+            "Kør først `/seed_metadata` og derefter `/fetch_metadata`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    type_label = (
+        "🎬 FILM" if media_type == "movie"
+        else "📺 SERIER" if media_type == "tv"
+        else "🌍 ALLE"
+    )
+
+    # Vi splitter i flere beskeder hvis listen er lang (Telegram ~4000 tegn limit)
+    header = (
+        f"🔬 *TOP {limit} KEYWORDS — {type_label}*\n"
+        f"═══════════════════════════\n\n"
+        f"_Lad dataen fortælle hvilke subgenrer du faktisk ejer:_\n"
+    )
+
+    lines = []
+    for i, kw in enumerate(keywords, 1):
+        lines.append(f"`{kw['count']:>5}` × {kw['keyword']}")
+
+    # Send i chunks af ~50 linjer per besked
+    chunk_size = 50
+    chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
+
+    try:
+        await loading.delete()
+    except Exception:
+        pass
+
+    for idx, chunk in enumerate(chunks):
+        if idx == 0:
+            text = header + "\n".join(chunk)
+        else:
+            text = f"_(fortsat — del {idx + 1}/{len(chunks)})_\n\n" + "\n".join(chunk)
+
+        try:
+            await update.message.reply_text(text, parse_mode="Markdown")
+            await asyncio.sleep(0.4)
+        except Exception as e:
+            logger.warning("top_keywords send-fejl: %s — sender uden Markdown", e)
+            try:
+                await update.message.reply_text(text)
+            except Exception:
+                pass
+
+    # Footer med tip
+    footer = (
+        "─────────────\n"
+        "💡 *Tip:* Kig efter keywords der beskriver *subgenrer* "
+        "(cyberpunk, heist, slasher) vs. *støj* (based on novel, "
+        "duringcreditsstinger).\n\n"
+        "Send mig listen når du er klar — vi designer SUBGENRE_KEYWORDS sammen."
+    )
+    try:
+        await update.message.reply_text(footer, parse_mode="Markdown")
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -890,15 +1270,11 @@ async def cmd_skift_plex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def handle_watch_flow_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update):
         return
-
     user = update.effective_user
     await database.log_message(user.id, "incoming", WATCH_FLOW_TRIGGER)
-
     if await _needs_plex_setup(update):
         return
-
     _clear_watch_state(context)
-
     await update.message.reply_text(
         "🍿 *Hvad skal jeg se?*\n\nVælg hvad du er i humør til:",
         parse_mode="Markdown",
@@ -910,23 +1286,18 @@ async def handle_watch_flow_trigger(update: Update, context: ContextTypes.DEFAUL
 async def handle_watch_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-
     if not await _guard(update):
         return
-
     media_type = query.data.split(":", 1)[1]
-
     if media_type == "surprise":
         state = _get_watch_state(context)
         prompt = _build_watch_prompt(state, mode="wildcard")
         await _execute_ai_handoff(update, context, query, prompt)
         return
-
     state = _get_watch_state(context)
     state["media_type"]     = media_type
     state["selected_moods"] = []
     state["page"]           = 1
-
     try:
         await query.edit_message_text(
             text=_build_mood_message_text(state),
@@ -939,24 +1310,19 @@ async def handle_watch_type_callback(update: Update, context: ContextTypes.DEFAU
 
 async def handle_watch_mood_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-
     if not await _guard(update):
         await query.answer()
         return
-
     state = _get_watch_state(context)
     if not state.get("media_type"):
         await query.answer("Sessionen er udløbet — start forfra med 🍿-knappen.", show_alert=True)
         return
-
     try:
         mood_id = int(query.data.split(":", 1)[1])
     except (ValueError, IndexError):
         await query.answer()
         return
-
     selected: list[int] = state["selected_moods"]
-
     if mood_id in selected:
         selected.remove(mood_id)
         await query.answer(f"Fjernet {WATCH_MOODS[mood_id]['name']}")
@@ -969,7 +1335,6 @@ async def handle_watch_mood_callback(update: Update, context: ContextTypes.DEFAU
     else:
         selected.append(mood_id)
         await query.answer(f"Valgt {WATCH_MOODS[mood_id]['name']}")
-
     try:
         await query.edit_message_text(
             text=_build_mood_message_text(state),
@@ -983,25 +1348,19 @@ async def handle_watch_mood_callback(update: Update, context: ContextTypes.DEFAU
 async def handle_watch_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-
     if not await _guard(update):
         return
-
     state = _get_watch_state(context)
     if not state.get("media_type"):
         await query.answer("Sessionen er udløbet — start forfra.", show_alert=True)
         return
-
     try:
         new_page = int(query.data.split(":", 1)[1])
     except (ValueError, IndexError):
         return
-
     if new_page not in WATCH_PAGES:
         return
-
     state["page"] = new_page
-
     try:
         await query.edit_message_text(
             text=_build_mood_message_text(state),
@@ -1014,16 +1373,13 @@ async def handle_watch_page_callback(update: Update, context: ContextTypes.DEFAU
 
 async def handle_watch_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-
     if not await _guard(update):
         await query.answer()
         return
-
     state = _get_watch_state(context)
     if not state.get("media_type") or not state.get("selected_moods"):
         await query.answer("Vælg mindst 1 stemning først.", show_alert=True)
         return
-
     await query.answer()
     prompt = _build_watch_prompt(state, mode="search")
     await _execute_ai_handoff(update, context, query, prompt)
@@ -1032,25 +1388,20 @@ async def handle_watch_search_callback(update: Update, context: ContextTypes.DEF
 async def handle_watch_surprise_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-
     if not await _guard(update):
         return
-
     state = _get_watch_state(context)
     if not state.get("media_type"):
         prompt = _build_watch_prompt(state, mode="wildcard")
     else:
         prompt = _build_watch_prompt(state, mode="surprise")
-
     await _execute_ai_handoff(update, context, query, prompt)
 
 
 async def handle_watch_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-
     _clear_watch_state(context)
-
     try:
         await query.edit_message_text("Aflyst. Tryk på 🍿-knappen igen når du vil have hjælp. 👍")
     except Exception as e:
@@ -1072,23 +1423,17 @@ async def _execute_ai_handoff(
     chat        = query.message.chat
     state_snapshot = dict(_get_watch_state(context))
     _clear_watch_state(context)
-
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
-
     await chat.send_action("typing")
-
     loading_msg = await chat.send_message(
         "🤖 Beregner svar med lynets hast... næsten...",
     )
-
     plex_username = await database.get_plex_username(user.id)
     persona_id    = await database.get_persona(user.id)
-
     await database.log_message(user.id, "incoming", f"[watch_flow] {prompt[:100]}…")
-
     reply = await get_ai_response(
         telegram_id=user.id,
         user_message=prompt,
@@ -1096,17 +1441,15 @@ async def _execute_ai_handoff(
         persona_id=persona_id,
         user_first_name=user.first_name,
     )
-
     try:
         await loading_msg.delete()
     except Exception:
         pass
-
     await _process_ai_reply(update, context, chat, user, plex_username, reply)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Bestillingsflow callbacks (uændret)
+# Bestillingsflow callbacks
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1132,14 +1475,11 @@ async def handle_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
 async def handle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-
     token = query.data.split(":", 1)[1]
     if token != "none":
         await database.get_pending_request(token)
-
     cancel_text = "Bestillingen blev annulleret. 👍"
     is_photo = bool(getattr(query.message, "photo", None))
-
     try:
         if is_photo:
             await query.edit_message_caption(caption=cancel_text)
@@ -1162,21 +1502,17 @@ async def handle_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     if not await _guard(update):
         return
-
     token = query.data.split(":", 1)[1]
     pending = await database.get_pending_request(token)
     if not pending:
         await query.edit_message_text("Sessionen er udløbet — start forfra.")
         return
-
     search_query = pending["title"]
     media_type   = pending["media_type"]
-
     try:
         await query.message.delete()
     except Exception:
         pass
-
     await show_search_results(query.message, search_query, media_type)
 
 
@@ -1187,9 +1523,7 @@ async def handle_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update):
         return
-
     logger.info("HANDLER MODTOG: %s", update.message.text)
-
     if context.matches:
         match = context.matches[0]
     else:
@@ -1198,30 +1532,23 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not match:
             logger.warning("HANDLER: ingen match på '%s' — ignorerer", update.message.text)
             return
-
     media_type    = match.group(1)
     tmdb_id       = int(match.group(2))
     logger.info("Bruger trykkede på info-link: type=%s, id=%s", media_type, tmdb_id)
-
     user_id       = update.effective_user.id
     plex_username = await database.get_plex_username(user_id)
-
     await update.message.chat.send_action("typing")
-
     loading_msg = await update.message.reply_text(
         "🤖 Beregner svar med lynets hast... næsten...",
         reply_markup=ReplyKeyboardRemove(),
     )
-
     details = await get_media_details(tmdb_id, media_type)
     if not details:
         await loading_msg.delete()
         await update.message.reply_text("Kunne ikke hente info — prøv igen.")
         return
-
     title = details.get("title") or "Ukendt"
     year  = details.get("release_date", details.get("first_air_date", ""))[:4]
-
     import secrets as _sec
     token = _sec.token_hex(8)
     await database.save_pending_request(token, user_id, {
@@ -1231,12 +1558,10 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "year":       int(year) if year else None,
         "step":       "picked",
     })
-
     try:
         await update.message.delete()
     except Exception:
         pass
-
     await show_confirmation(update.message, context, token, plex_username,
                             loading_msg=loading_msg)
 
@@ -1248,36 +1573,27 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update):
         return
-
     user = update.effective_user
     text = (update.message.text or "").strip()
-
     if text == WATCH_FLOW_TRIGGER:
         await handle_watch_flow_trigger(update, context)
         return
-
     await database.log_message(user.id, "incoming", text)
-
     onboarding_state = await database.get_onboarding_state(user.id)
     if onboarding_state == "awaiting_plex":
         await _handle_plex_input(update, text)
         return
-
     if await _needs_plex_setup(update):
         return
-
     if check_session_timeout(user.id):
         await cmd_start(update, context)
         return
-
     await update.message.chat.send_action("typing")
     plex_username = await database.get_plex_username(user.id)
     persona_id    = await database.get_persona(user.id)
-
     loading_msg = await update.message.reply_text(
         "🤖 Beregner svar med lynets hast... næsten...",
     )
-
     reply = await get_ai_response(
         telegram_id=user.id,
         user_message=text,
@@ -1285,12 +1601,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         persona_id=persona_id,
         user_first_name=user.first_name,
     )
-
     try:
         await loading_msg.delete()
     except Exception:
         pass
-
     await _process_ai_reply(update, context, update.message.chat, user, plex_username, reply)
 
 
@@ -1429,7 +1743,6 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
             type(context.error), context.error, context.error.__traceback__
         )),
     )
-
     if isinstance(update, Update) and update.effective_message:
         try:
             await update.effective_message.reply_text(
@@ -1447,6 +1760,7 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
 async def on_startup(application: Application) -> None:
     await database.setup_db()
     await database.setup_pending_requests()
+    await database.setup_tmdb_metadata_table()   # NY v0.10.6
     await _start_webhook_server()
     if not config.WEBHOOK_SECRET:
         logger.warning(
@@ -1454,10 +1768,10 @@ async def on_startup(application: Application) -> None:
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — v0.10.5-beta | "
+        "VERSION CHECK — v0.10.6-beta | "
         "søgeresultater-UX: JA | foto-fix: JA | watch-flow: JA | "
         "watch-genre-split-fix: JA | genres-cmd: JA | dump-genres-cmd: JA | "
-        "test-metadata-cmd: JA"
+        "test-metadata-cmd: JA | tmdb-metadata-cache: JA"
     )
 
 
@@ -1479,11 +1793,19 @@ def main() -> None:
         .build()
     )
 
-    app.add_handler(CommandHandler("start",         cmd_start))
-    app.add_handler(CommandHandler("skift_plex",    cmd_skift_plex))
-    app.add_handler(CommandHandler("genres",        cmd_genres))         # Engangs admin
-    app.add_handler(CommandHandler("dump_genres",   cmd_dump_genres))    # Engangs admin
-    app.add_handler(CommandHandler("test_metadata", cmd_test_metadata))  # NY v0.10.5
+    app.add_handler(CommandHandler("start",           cmd_start))
+    app.add_handler(CommandHandler("skift_plex",      cmd_skift_plex))
+
+    # Engangs admin-kommandoer
+    app.add_handler(CommandHandler("genres",          cmd_genres))
+    app.add_handler(CommandHandler("dump_genres",     cmd_dump_genres))
+    app.add_handler(CommandHandler("test_metadata",   cmd_test_metadata))
+
+    # Step 2 admin-kommandoer (NY v0.10.6)
+    app.add_handler(CommandHandler("seed_metadata",   cmd_seed_metadata))
+    app.add_handler(CommandHandler("fetch_metadata",  cmd_fetch_metadata))
+    app.add_handler(CommandHandler("metadata_status", cmd_metadata_status))
+    app.add_handler(CommandHandler("top_keywords",    cmd_top_keywords))
 
     # Admin approval
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve_user:\d+$"))
