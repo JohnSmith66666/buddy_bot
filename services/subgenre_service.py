@@ -1,16 +1,47 @@
 """
 services/subgenre_service.py - Subgenre catalog and lookup helpers.
 
-CHANGES (v0.3.0 — TV-subgenrer tilføjet, media-aware arkitektur):
-  - NY: SUBGENRES_TV med 27 datadrevne TV-subgenrer baseret på analyse af
-    1.110 fetched serier i tmdb_metadata. Alle 27 har data (ingen tomme).
-  - NY: SUBGENRE_CATEGORIES_TV med 9 hovedkategorier til TV-flow.
-  - NY: Alle helper-funktioner (get_subgenre, get_category, etc.) tager nu
+CHANGES (v0.3.2 — Master fix for 8 højrisiko TV-subgenrer):
+  - DATADRIVET FIX: 8 subgenrer havde adjektiv-keywords ('hilarious', 'witty',
+    'dramatic') eller decade-keywords ('1980s', 'nostalgic') der gav misfit-
+    matches. Brugeren havde fx The Mentalist (Crime+Drama) i tv_sitcom og
+    Cobra Kai i tv_period_drama.
+
+  - LØSNING — Hybrid pakke:
+    * tv_period_drama: Fjern decade-keywords (1980s/1990s/etc + nostalgic),
+      tilføj plex_genre='Drama' som dørmand
+    * tv_sitcom: Fjern adjektiv-keywords (hilarious/amused/witty),
+      tilføj plex_genre='Komedie'
+    * tv_dark_comedy: Tilføj plex_genre='Komedie' (absurd+satire trigger ikke
+      længere udenfor komedie-genren)
+    * tv_emotional_drama: Tilføj plex_genre='Drama' (alle keywords er adjektiver,
+      så plex_genre er kritisk dørmand)
+    * tv_psychological_thriller: Tilføj plex_genre='Thriller' (intense/tense
+      er adjektiver der lukker uden Plex-genre filter)
+    * tv_animation: Tilføj plex_genre='Animation' (cartoon-keyword fanger ellers
+      børnefilm)
+    * tv_romcom: Tilføj plex_genre='Romantik' (love/romance er for brede)
+    * tv_family_drama: Tilføj plex_genre='Drama' ('family' er meget bredt)
+
+  - BEVAREDE BESLUTNINGER (de 19 andre subgenrer er UÆNDREDE):
+    * tv_book_adaptation/tv_comic_adaptation/tv_miniseries/tv_lgbt:
+      INGEN plex_genre passer (cross-genre) — keywords er specifikke nok
+    * tv_murder_mystery/tv_horror_creature/tv_war/tv_medical/tv_legal/etc:
+      Keywords er entitet-specifikke (zombie, lawyer, world war ii)
+
+  - FORVENTET EFFEKT: ~20-30% færre hits per fixed subgenre, men ~95% match-
+    præcision. Walking Dead bevares i tv_horror_creature, Sherlock i
+    tv_book_adaptation, etc. — fordi vi IKKE rør deres subgenrer.
+
+UNCHANGED (v0.3.0 — TV-subgenrer tilføjet, media-aware arkitektur):
+  - SUBGENRES_TV med 27 datadrevne TV-subgenrer baseret på analyse af
+    1.110 fetched serier i tmdb_metadata. Alle 27 har data.
+  - SUBGENRE_CATEGORIES_TV med 9 hovedkategorier til TV-flow.
+  - Alle helper-funktioner (get_subgenre, get_category, etc.) tager nu
     en valgfri media_type parameter ('movie' eller 'tv'). Default: 'movie'
     for at sikre bagudkompatibilitet med eksisterende kode.
   - BAGUDKOMPATIBILITET: SUBGENRES og SUBGENRE_CATEGORIES (uden _MOVIE suffix)
-    bevares som aliases der peger på film-katalogerne. Ingen eksisterende
-    import-statements brækker.
+    bevares som aliases der peger på film-katalogerne.
   - SELF-CHECK: Validerer både film- og TV-katalogerne ved import.
 
 UNCHANGED (v0.2.0 — sjove danske labels for film):
@@ -24,6 +55,9 @@ DESIGN-PRINCIPPER:
   - Hver subgenre har minimum ~10-15 matches i biblioteket (datavalideret).
   - TV-subgenrer er ALDRIG identiske med film-subgenrer (forskellige keywords
     fordi serier bruger andre TMDB-tags end film).
+  - PLEX_GENRE DØRMAND: Tilføjes KUN når keywords indeholder adjektiver
+    eller meget brede termer der ellers giver false positives. Cross-genre
+    subgenrer (book_adaptation, miniseries, lgbt) får ALDRIG plex_genre.
 """
 
 from __future__ import annotations
@@ -290,25 +324,24 @@ SUBGENRE_CATEGORIES_MOVIE: dict[str, dict] = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SUBGENRE-KATALOG — TV (NY i v0.3.0)
+# SUBGENRE-KATALOG — TV (NY i v0.3.0, justeret i v0.3.2 — Master Fix)
 # ══════════════════════════════════════════════════════════════════════════════
 #
 # 27 datadrevne TV-subgenrer baseret på analyse af 1.110 fetched serier
 # i tmdb_metadata. Alle har minimum 10+ hits, ingen tomme.
 #
-# Bemærk: TV-subgenrer bruger DELVIST samme keywords som film, men typisk
-# andre kombinationer fordi serier har andre TMDB-tags end film:
-#   - Film bruger "neo-noir" som genre-keyword
-#   - TV bruger "miniseries", "anthology", "sitcom" som format-keywords
-#   - TV har stærke keywords som "based on novel or book" (146 hits) der
-#     ikke giver mening som filmstemning
+# v0.3.2 ændringer markeret med "FIX (v0.3.2)" kommentarer.
+#
+# DESIGN-NOTE: plex_genre er KUN tilføjet hvor keywords er adjektiver eller
+# meget brede termer. Cross-genre subgenrer (book_adaptation, miniseries,
+# lgbt) har ALDRIG plex_genre fordi de findes i alle Plex-genrer.
 
 SUBGENRES_TV: dict[str, dict] = {
 
     # ──── 1. KRIMINALITET & MYSTIK (4 subgenrer) ──────────────────────────────
     "tv_murder_mystery": {
         "label":      "🔪 Hvem Gjorde Det?",
-        "plex_genre": None,
+        "plex_genre": None,  # Keywords er specifikke nok (serial killer, homicide)
         "keywords":   [
             "murder", "murder investigation", "murder mystery",
             "serial killer", "investigation", "mysterious",
@@ -316,12 +349,12 @@ SUBGENRES_TV: dict[str, dict] = {
     },
     "tv_true_crime": {
         "label":      "🎙️ True Crime — Reality check",
-        "plex_genre": None,
+        "plex_genre": None,  # 'true crime' er meget specifik
         "keywords":   ["true crime", "based on true story"],
     },
     "tv_police_procedural": {
         "label":      "👮 Afspærringstape & Sirener",
-        "plex_genre": None,
+        "plex_genre": None,  # 'police', 'fbi' er specifikke entiteter
         "keywords":   [
             "police", "police detective", "police procedural",
             "police officer", "fbi", "fbi agent", "criminal",
@@ -329,34 +362,42 @@ SUBGENRES_TV: dict[str, dict] = {
     },
     "tv_neo_noir": {
         "label":      "🕶️ Neo-noir & Detektiv",
-        "plex_genre": None,
+        "plex_genre": None,  # 'neo-noir', 'homicide detective' er specifikke
         "keywords":   ["detective", "neo-noir", "homicide detective"],
     },
 
     # ──── 2. KOMEDIE (3 subgenrer) ────────────────────────────────────────────
     "tv_sitcom": {
         "label":      "🛋️ Sofa-Komedier",
-        "plex_genre": None,
+        # FIX (v0.3.2): Tilføjet plex_genre='Komedie' + fjernet adjektiv-
+        # keywords (hilarious, amused, witty). Bekræftet problem: The Mentalist
+        # blev fanget via 'witty' selvom det er Crime+Drama, ikke Komedie.
+        "plex_genre": "Komedie",
         "keywords":   [
-            "sitcom", "workplace comedy", "dramedy",
-            "hilarious", "amused", "witty", "mockumentary",
+            "sitcom", "workplace comedy", "dramedy", "mockumentary",
         ],
     },
     "tv_dark_comedy": {
         "label":      "🖤 Mørk Komedie",
-        "plex_genre": None,
+        # FIX (v0.3.2): Tilføjet plex_genre='Komedie'. 'absurd' og 'satire'
+        # er adjektiver der ellers fanger dokumentarer og dramaer.
+        "plex_genre": "Komedie",
         "keywords":   ["dark comedy", "absurd", "satire"],
     },
     "tv_romcom": {
         "label":      "💕 Romantik & Romcom",
-        "plex_genre": None,
+        # FIX (v0.3.2): Tilføjet plex_genre='Romantik'. 'love' og 'romance'
+        # er for brede til at stå alene.
+        "plex_genre": "Romantik",
         "keywords":   ["romance", "romcom", "love", "marriage", "teenage romance"],
     },
 
     # ──── 3. DRAMA (3 subgenrer) ──────────────────────────────────────────────
     "tv_family_drama": {
         "label":      "👨‍👩‍👧 Familie-drama",
-        "plex_genre": None,
+        # FIX (v0.3.2): Tilføjet plex_genre='Drama'. 'family' alene fanger
+        # børneserier og familieshows blandet.
+        "plex_genre": "Drama",
         "keywords":   [
             "family", "family relationships", "family drama",
             "dysfunctional family",
@@ -364,7 +405,7 @@ SUBGENRES_TV: dict[str, dict] = {
     },
     "tv_teen_drama": {
         "label":      "🎓 Teen Drama & Coming of Age",
-        "plex_genre": None,
+        "plex_genre": None,  # 'teen drama', 'high school' er specifikke nok
         "keywords":   [
             "teen drama", "high school", "coming of age",
             "teenager", "based on young adult novel",
@@ -372,7 +413,10 @@ SUBGENRES_TV: dict[str, dict] = {
     },
     "tv_emotional_drama": {
         "label":      "💔 Tunge Følelser",
-        "plex_genre": None,
+        # FIX (v0.3.2): Tilføjet plex_genre='Drama'. ALLE keywords er
+        # adjektiver (dramatic, intimate, complex, etc) — 100% risky-score.
+        # Plex-genre er kritisk dørmand for at forhindre over-matching.
+        "plex_genre": "Drama",
         "keywords":   [
             "dramatic", "intimate", "complex",
             "thoughtful", "introspective", "tragic",
@@ -382,6 +426,8 @@ SUBGENRES_TV: dict[str, dict] = {
     # ──── 4. GYS & THRILLER (3 subgenrer) ─────────────────────────────────────
     "tv_horror_supernatural": {
         "label":      "👻 Spøgelser & Overnaturlig",
+        # Keywords er specifikke (ghost, demon, witch) — bevarer breddi
+        # for shows som Buffy/Charmed der er Drama+Fantasy
         "plex_genre": None,
         "keywords":   [
             "supernatural", "supernatural horror", "ghost",
@@ -391,6 +437,8 @@ SUBGENRES_TV: dict[str, dict] = {
     },
     "tv_horror_creature": {
         "label":      "🧟 Monstre, Blod & Gys",
+        # Keywords er specifikke entiteter (zombie, vampire, monster)
+        # Bevarer Walking Dead (Drama+Sci-Fi), True Blood (Drama+Fantasy)
         "plex_genre": None,
         "keywords":   [
             "zombie", "zombie apocalypse", "monster", "creature",
@@ -399,7 +447,9 @@ SUBGENRES_TV: dict[str, dict] = {
     },
     "tv_psychological_thriller": {
         "label":      "🧠 Psykologisk Thriller",
-        "plex_genre": None,
+        # FIX (v0.3.2): Tilføjet plex_genre='Thriller'. 'thriller', 'tense',
+        # 'intense', 'suspenseful' er adjektiver der ellers giver false positives.
+        "plex_genre": "Thriller",
         "keywords":   [
             "psychological thriller", "psychological horror", "psychopath",
             "thriller", "suspenseful", "tense", "intense",
@@ -409,12 +459,12 @@ SUBGENRES_TV: dict[str, dict] = {
     # ──── 5. SCI-FI & FANTASY (3 subgenrer) ───────────────────────────────────
     "tv_scifi_dystopia": {
         "label":      "🏚️ Dystopi & Apokalypse",
-        "plex_genre": None,
+        "plex_genre": None,  # 'dystopia', 'apocalypse' er specifikke
         "keywords":   ["dystopia", "post-apocalyptic future", "apocalypse", "survival"],
     },
     "tv_scifi_space": {
         "label":      "🛸 Sci-fi & Rumrejser",
-        "plex_genre": None,
+        "plex_genre": None,  # 'space opera', 'space travel' er specifikke
         "keywords":   [
             "science fiction", "space", "space travel",
             "space opera", "alien", "time travel",
@@ -422,18 +472,21 @@ SUBGENRES_TV: dict[str, dict] = {
     },
     "tv_fantasy": {
         "label":      "🧙 Fantasy & Magi",
-        "plex_genre": None,
+        "plex_genre": None,  # 'fantasy world', 'magic' er specifikke
         "keywords":   ["fantasy world", "dark fantasy", "magic"],
     },
 
     # ──── 6. ADAPTATIONER (2 subgenrer) ───────────────────────────────────────
     "tv_book_adaptation": {
         "label":      "📖 Bogadaptationer",
+        # INGEN plex_genre — bog-adaptationer findes i ALLE genrer:
+        # GoT (Fantasy), Sherlock (Mystery), Bridgerton (Romance), Dexter (Crime)
         "plex_genre": None,
         "keywords":   ["based on novel or book", "based on young adult novel"],
     },
     "tv_comic_adaptation": {
         "label":      "🦸 Spandex & Superkræfter",
+        # INGEN plex_genre — comic-adaptationer er Action+Sci-Fi+Drama blandet
         "plex_genre": None,
         "keywords":   [
             "superhero", "based on comic", "based on graphic novel",
@@ -444,17 +497,22 @@ SUBGENRES_TV: dict[str, dict] = {
     # ──── 7. TV-FORMATER (3 subgenrer) ────────────────────────────────────────
     "tv_miniseries": {
         "label":      "🎬 Hurtigt Overstået (Miniserier)",
+        # INGEN plex_genre — miniseries er FORMAT, ikke genre
+        # Chernobyl (Drama), Mare of Easttown (Crime), Queen's Gambit (Drama)
         "plex_genre": None,
         "keywords":   ["miniseries"],
     },
     "tv_animation": {
         "label":      "🎨 Tegnet for voksne",
-        "plex_genre": None,
+        # FIX (v0.3.2): Tilføjet plex_genre='Animation'. 'cartoon' alene
+        # fanger ellers børneserier — Animation-genre + 'adult animation'
+        # keyword sikrer voksen-content.
+        "plex_genre": "Animation",
         "keywords":   ["adult animation", "cartoon"],
     },
     "tv_reality": {
         "label":      "🏆 Reality TV",
-        "plex_genre": None,
+        "plex_genre": None,  # Plex har sjældent 'Reality' som genre, keywords er specifikke
         "keywords":   [
             "reality competition", "reality tv", "alternative reality",
             "music documentary", "sports documentary", "biographical documentary",
@@ -464,30 +522,33 @@ SUBGENRES_TV: dict[str, dict] = {
     # ──── 8. HISTORISK (2 subgenrer) ──────────────────────────────────────────
     "tv_period_drama": {
         "label":      "🏛️ Korsetter & Gamle Dage",
-        "plex_genre": None,
+        # FIX (v0.3.2): Decade-keywords FJERNET (1980s, 1990s, 1970s, 1960s,
+        # 1950s, nostalgic) - de gav mismatches med moderne serier sat i
+        # fortiden (Cobra Kai, Stranger Things, GLOW). Tilføjet plex_genre=
+        # 'Drama' som ekstra dørmand for at sikre det er ægte period drama.
+        "plex_genre": "Drama",
         "keywords":   [
             "period drama", "period piece", "historical drama",
             "historical", "historical fiction", "19th century",
-            "1980s", "1990s", "1970s", "1960s", "1950s", "nostalgic",
         ],
     },
     "tv_war": {
         "label":      "🪖 Til Fronten!",
-        "plex_genre": None,
+        "plex_genre": None,  # 'world war ii' er meget specifik
         "keywords":   ["world war ii", "war", "military"],
     },
 
     # ──── 9. PÅ ARBEJDE (3 subgenrer) ─────────────────────────────────────────
     "tv_medical": {
         "label":      "🏥 Medicinsk Drama",
-        "plex_genre": None,
+        "plex_genre": None,  # 'medical drama', 'hospital', 'doctor' er specifikke
         "keywords":   [
             "medical drama", "hospital", "doctor", "medical", "medical student",
         ],
     },
     "tv_legal": {
         "label":      "⚖️ I Rettens Navn",
-        "plex_genre": None,
+        "plex_genre": None,  # 'lawyer', 'courtroom' er specifikke
         "keywords":   [
             "lawyer", "criminal lawyer", "courtroom drama",
             "court case", "courtroom",
@@ -495,7 +556,7 @@ SUBGENRES_TV: dict[str, dict] = {
     },
     "tv_spy": {
         "label":      "🕴️ Spioner & Konspiration",
-        "plex_genre": None,
+        "plex_genre": None,  # 'cia', 'espionage' er specifikke
         "keywords":   [
             "central intelligence agency (cia)", "conspiracy", "espionage",
         ],
@@ -504,6 +565,8 @@ SUBGENRES_TV: dict[str, dict] = {
     # ──── 10. SPECIELT (1 subgenre — kun LGBT) ───────────────────────────────
     "tv_lgbt": {
         "label":      "🌈 Pride & Regnbuer",
+        # INGEN plex_genre — LGBT er TEMA, ikke genre
+        # Pose (Drama), Heartstopper (Romance), Pose (Drama+Music)
         "plex_genre": None,
         "keywords":   ["lgbt", "gay theme"],
     },
