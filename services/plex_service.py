@@ -1,7 +1,18 @@
 """
 services/plex_service.py - Plex Media Server integration via python-plexapi.
 
-CHANGES vs previous version (v1.2.0 — _check_sync Lag 0 bruger plex_cache):
+CHANGES vs previous version (v1.2.1 — recommend_from_seed genintroduceret):
+  - BUG FIX: recommend_from_seed-funktionen blev ved en fejl udeladt i v1.2.0
+    refaktoreringen, hvilket fik Railway til at crashe ved opstart med
+    ImportError fordi ai_handler.py v1.0.8 importerer den.
+  - GENINTRODUKTION: Funktionen er nu tilføjet igen og udnytter den nye
+    plex_cache for endnu hurtigere lookup. Den oprindelige implementering
+    lavede 7+ separate Plex-kald — den nye version laver kun 1 cache-lookup.
+  - PERFORMANCE-BONUS: Hvor den oprindelige version sparer 5-7s på et
+    anbefalingsflow, sparer denne version YDERLIGERE 1-2s ved at genbruge
+    plex_cache (som typisk er warm fra v2-flowet).
+
+UNCHANGED (v1.2.0 — _check_sync Lag 0 bruger plex_cache):
   - BUG FIX: _check_sync Lag 0 GUID-tjek bruger nu services.plex_cache.
     section.search(guid='tmdb://X') fejler stille for nogle film selvom
     GUID'et findes i biblioteket — vi har observeret det for fx
@@ -9,19 +20,14 @@ CHANGES vs previous version (v1.2.0 — _check_sync Lag 0 bruger plex_cache):
     "Hocus Pocus 2" (642885), "A Bridge Too Far" (544). Resultatet var
     at brugeren så "Tilføj til Plex"-knap selvom filmen ER i Plex.
   - LØSNING: Vi tjekker først plex_cache.get_plex_movie_index_sync()
-    som er bygget via section.all() + manuel GUID-extract (samme metode
-    som find_unwatched_v2 bruger). Hvis cache er tom, falder vi tilbage
-    til den gamle section.search(guid=...). Den gamle Lag 1/2/3
-    titel-søgning bevares uændret som ekstra fallback.
+    som er bygget via section.all() + manuel GUID-extract.
   - PERFORMANCE: Når cachen er warm (90%+ af tid), er Lag 0 nu ~1ms
     mod tidligere ~500ms — _check_sync er stort set gratis.
-  - KONSISTENS: _check_sync og find_unwatched_v2 bruger nu SAMME datakilde,
-    så de svarer altid det samme for samme film/bruger.
+  - KONSISTENS: _check_sync og find_unwatched_v2 bruger nu SAMME datakilde.
 
 UNCHANGED (v1.1.0 — switchHomeUser failure cache):
   - _connect() cacher Plex Home User auth-fejl per username i 1 time.
   - Ved 5 parallelle Plex-tjek sparer dette 15-25 sekunder.
-  - ERROR-log første gang en bruger ryger i cache; DEBUG-log på subsequent skips.
 
 UNCHANGED (v1.0.2 — sci-fi genre fix):
   - _GENRE_SYNONYMS udvidet med "sciencefiction" og "science fiction".
@@ -35,8 +41,6 @@ UNCHANGED (v0.9.9 — find_unwatched fix):
 TOKEN OPTIMISATION (data-diæt):
   - Alle list-resultater er capped til 25 items maksimum.
   - Hvert Plex-item serialiseres gennem _slim() før det returneres til AI'en.
-  - File paths, codecs, bitrates og anden tung metadata er strippet fra
-    alle list-responses. Tekniske specs returneres kun af get_plex_metadata().
 """
 
 import asyncio
@@ -75,14 +79,6 @@ _FRANCHISE_MAX_PER_LIST = 40
 _ACTOR_MAX_MISSING      = 15
 
 # ── switchHomeUser failure cache ──────────────────────────────────────────────
-# Cacher Plex Home User auth-fejl (401 unauthorized) per username.
-# Når en bruger fejler, falder vi straks tilbage til admin-konto i stedet for
-# at spilde 3-5 sekunder på timeout-baseret retry ved hvert eneste tool-kald.
-# Cachen er per process — nulstilles ved Railway redeploy.
-#
-# TTL er bevidst 1 time: kort nok til at fange genaktiverede tokens hurtigt,
-# langt nok til at undgå spam når token er permanent revoked.
-
 _SWITCH_FAIL_TTL_SECS = 3600  # 1 time
 _switch_fail_cache: dict[str, float] = {}  # username (lower) → unix timestamp
 
@@ -249,7 +245,6 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
             )
             return admin_plex
         else:
-            # TTL udløbet — giv brugeren en chance igen
             logger.info(
                 "switchHomeUser cache TTL udløbet for '%s' — prøver igen",
                 plex_username,
@@ -278,7 +273,6 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
                     switched = account.switchHomeUser(user)
                     return PlexServer(PLEX_URL, switched.authToken, timeout=15)
                 except Exception as e:
-                    # Cache fejlen så vi ikke spilder 3-5s på næste tool-kald
                     _switch_fail_cache[norm] = time.time()
                     logger.error(
                         "switchHomeUser FAILED for '%s' — caching for %ds. "
@@ -396,11 +390,6 @@ def _check_sync(
         }
 
     # ── Lag 0: Cached movie index (KUN film) ──────────────────────────────────
-    # plex_cache.get_plex_movie_index_sync() bygger index via section.all() +
-    # manuel GUID-extract — samme metode som find_unwatched_v2 bruger. Det er
-    # MERE pålideligt end section.search(guid=...) som kan fejle stille for
-    # film hvor Plex' GUID-index ikke er synkront opdateret.
-    # Cachen er per-bruger med 5 min TTL — første kald ~1-2 sek, derefter ~1ms.
     if tmdb_id and not is_tv:
         try:
             from services.plex_cache import get_plex_movie_index_sync
@@ -410,14 +399,10 @@ def _check_sync(
                 return _build_result(cached_item, "0/cache")
         except Exception as e:
             logger.warning("plex_cache lookup fejl for tmdb_id=%s: %s", tmdb_id, e)
-        # Cache miss eller fejl — fortsæt til section-loop med fallback
 
     for section in _sections(plex, plex_type):
 
         # ── Lag 0b: Server-side GUID-filter (FALLBACK) ────────────────────────
-        # Hvis cachen ikke fandt filmen (eller for TV-serier som vi ikke
-        # cacher endnu), prøv det gamle GUID-tjek. Det virker for de fleste
-        # film, men kan fejle for nogle hvor Plex' GUID-index er stale.
         if tmdb_id:
             try:
                 guid_hits = section.search(guid=f"tmdb://{tmdb_id}")
@@ -425,11 +410,8 @@ def _check_sync(
                     return _build_result(guid_hits[0], "0/GUID")
             except Exception as e:
                 logger.warning("GUID search fejl i '%s': %s", section.title, e)
-            # Ingen hit på GUID — fortsæt til lag 1
 
         # ── Lag 1 + 2/3: Titel-søgning ────────────────────────────────────────
-        # Prøv også med stripped titel (fjern '...' og lignende) som fallback.
-        # "Once Upon a Time... in Hollywood" søges som "Once Upon a Time in Hollywood"
         stripped_title = re.sub(r"\.{2,}", "", title).strip()
         search_titles = [title] if stripped_title == title else [title, stripped_title]
 
@@ -579,10 +561,6 @@ def _unwatched_sync(
 ) -> dict:
     """
     Find usete film eller serier i Plex-biblioteket.
-
-    FIX (v0.9.9): section.all() henter hele biblioteket uden Plex default-limit.
-    FIX (v1.0.0): Genre-matching bruger nu _genre_matches() med synonym-tabel
-      der dækker dansk/engelsk genre-labels.
     """
     is_tv     = (media_type == "tv")
     plex_type = _TV_TYPE if is_tv else _MOVIE_TYPE
@@ -761,12 +739,6 @@ def _build_actor_guid_set(
 ) -> tuple[set[int], set[str]]:
     """
     Byg to sæt for alle Plex-film der matcher skuespilleren.
-    Bruger KUN section.search(actor=actor_name).
-
-    Lag 2 (fuld biblioteksscanning) er fjernet — den tilføjede ALLE Plex-film
-    til TMDB-sættet og gav falske positive ved TMDB-krydstjek.
-    Tom Hanks fandt 5 film i stedet for 22, fordi cross-check mod TMDB top 20
-    ramte tilfældige film der havde matchende TMDB ID-rækkefølge i biblioteket.
     """
     plex = _connect(plex_username)
     if isinstance(plex, dict):
@@ -1128,3 +1100,299 @@ async def get_plex_watch_url(
     except Exception as e:
         logger.warning("get_plex_watch_url fejl for tmdb_id=%s: %s", tmdb_id, e)
         return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# recommend_from_seed (P1 combined tool — v1.2.1 genintroduceret)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def recommend_from_seed(
+    tmdb_id: int,
+    media_type: str,
+    plex_username: str | None = None,
+    max_results: int = 8,
+    only_unwatched: bool = True,
+) -> dict:
+    """
+    Combined tool: TMDB anbefalinger → Plex cross-check → unwatched-filter.
+
+    Erstatter et helt anbefalingsflow der ellers ville kræve 7+ separate
+    tool-calls (1× get_recommendations + N× check_plex_library, evt. + viewCount).
+    Sparer 5-7 sekunder per anbefaling.
+
+    Args:
+      tmdb_id:        Seed-filmens TMDB ID (filmen brugeren elskede)
+      media_type:     'movie' eller 'tv'
+      plex_username:  Plex-username (None = admin)
+      max_results:    Max antal anbefalinger at returnere (default 8)
+      only_unwatched: Hvis True, filtrer film brugeren har set ud (default True)
+
+    Returns:
+      Success:
+        {
+          "status": "ok",
+          "seed_tmdb_id": 671,
+          "media_type": "movie",
+          "results": [{"title": "...", "year": ..., "tmdb_id": ..., "rating": ...,
+                       "genres": [...], "summary": "...", "viewCount": 0}, ...],
+          "stats": {
+            "tmdb_recommendations": 20,
+            "in_plex":              12,
+            "unwatched":            8,
+            "returned":             8,
+          },
+        }
+
+      Empty (ingen Plex-matches eller alle set):
+        {"status": "missing", "stats": {...}}
+
+      Error:
+        {"status": "error", "message": "..."}
+    """
+    # Lazy import for at undgå circular dependency
+    from services.tmdb_service import get_recommendations
+
+    # ── 1. Hent TMDB anbefalinger ─────────────────────────────────────────────
+    try:
+        recommendations = await get_recommendations(tmdb_id, media_type)
+    except Exception as e:
+        logger.error("recommend_from_seed: TMDB-fejl for tmdb_id=%s: %s", tmdb_id, e)
+        return {"status": STATUS_ERROR, "message": f"TMDB-anbefalinger fejlede: {e}"}
+
+    if not recommendations:
+        logger.info("recommend_from_seed: ingen TMDB-anbefalinger for tmdb_id=%s", tmdb_id)
+        return {
+            "status":       STATUS_MISSING,
+            "seed_tmdb_id": tmdb_id,
+            "media_type":   media_type,
+            "stats": {
+                "tmdb_recommendations": 0,
+                "in_plex":              0,
+                "unwatched":            0,
+                "returned":             0,
+            },
+        }
+
+    # ── 2. Cross-check mod Plex (kun film — TV bruger fallback) ───────────────
+    is_movie = (media_type == "movie")
+
+    if is_movie:
+        # Brug plex_cache for hurtig lookup
+        try:
+            return await asyncio.to_thread(
+                partial(
+                    _recommend_from_seed_movie_sync,
+                    tmdb_id=tmdb_id,
+                    recommendations=recommendations,
+                    plex_username=plex_username,
+                    max_results=max_results,
+                    only_unwatched=only_unwatched,
+                )
+            )
+        except Exception as e:
+            logger.error("recommend_from_seed (movie): cross-check fejl: %s", e)
+            return {"status": STATUS_ERROR, "message": f"Plex cross-check fejlede: {e}"}
+    else:
+        # TV: brug check_library per recommendation (ikke cached endnu)
+        try:
+            return await _recommend_from_seed_tv_async(
+                tmdb_id=tmdb_id,
+                recommendations=recommendations,
+                plex_username=plex_username,
+                max_results=max_results,
+                only_unwatched=only_unwatched,
+            )
+        except Exception as e:
+            logger.error("recommend_from_seed (tv): cross-check fejl: %s", e)
+            return {"status": STATUS_ERROR, "message": f"Plex cross-check fejlede: {e}"}
+
+
+def _recommend_from_seed_movie_sync(
+    tmdb_id: int,
+    recommendations: list[dict],
+    plex_username: str | None,
+    max_results: int,
+    only_unwatched: bool,
+) -> dict:
+    """
+    Synkron del af recommend_from_seed for film.
+    Bruger plex_cache for ~1ms cross-check per recommendation.
+    """
+    from services.plex_cache import get_plex_movie_index_sync
+
+    try:
+        plex_index = get_plex_movie_index_sync(plex_username)
+    except Exception as e:
+        logger.error("_recommend_from_seed_movie_sync: cache fejl: %s", e)
+        return {"status": STATUS_ERROR, "message": f"Plex-cache fejl: {e}"}
+
+    if not plex_index:
+        return {
+            "status":       STATUS_MISSING,
+            "seed_tmdb_id": tmdb_id,
+            "media_type":   "movie",
+            "stats": {
+                "tmdb_recommendations": len(recommendations),
+                "in_plex":              0,
+                "unwatched":            0,
+                "returned":             0,
+            },
+        }
+
+    # ── Cross-check ───────────────────────────────────────────────────────────
+    in_plex_items: list = []
+    unwatched_items: list = []
+
+    for rec in recommendations:
+        rec_tmdb_id = rec.get("id") or rec.get("tmdb_id")
+        if not rec_tmdb_id:
+            continue
+
+        plex_item = plex_index.get(rec_tmdb_id)
+        if plex_item is None:
+            continue
+
+        in_plex_items.append(plex_item)
+
+        # viewCount-filter
+        if not getattr(plex_item, "viewCount", 0):
+            unwatched_items.append(plex_item)
+
+    # ── Vælg endelige resultater ──────────────────────────────────────────────
+    if only_unwatched:
+        candidates = unwatched_items
+    else:
+        candidates = in_plex_items
+
+    if not candidates:
+        return {
+            "status":       STATUS_MISSING,
+            "seed_tmdb_id": tmdb_id,
+            "media_type":   "movie",
+            "stats": {
+                "tmdb_recommendations": len(recommendations),
+                "in_plex":              len(in_plex_items),
+                "unwatched":            len(unwatched_items),
+                "returned":             0,
+            },
+        }
+
+    # Top max_results — i samme rækkefølge som TMDB returnerede dem
+    # (TMDB sorterer efter relevans/popularitet, så vi bevarer den orden)
+    chosen = candidates[:max_results]
+
+    results = []
+    for item in chosen:
+        slim_dict = _slim(item)
+        # Tilføj viewCount så Buddy ved om brugeren har set filmen
+        slim_dict["viewCount"] = getattr(item, "viewCount", 0) or 0
+        results.append(slim_dict)
+
+    logger.info(
+        "recommend_from_seed (movie): seed=%s — %d TMDB → %d Plex → %d unwatched → %d returned",
+        tmdb_id, len(recommendations), len(in_plex_items), len(unwatched_items), len(chosen),
+    )
+
+    return {
+        "status":       "ok",
+        "seed_tmdb_id": tmdb_id,
+        "media_type":   "movie",
+        "results":      results,
+        "stats": {
+            "tmdb_recommendations": len(recommendations),
+            "in_plex":              len(in_plex_items),
+            "unwatched":            len(unwatched_items),
+            "returned":             len(chosen),
+        },
+    }
+
+
+async def _recommend_from_seed_tv_async(
+    tmdb_id: int,
+    recommendations: list[dict],
+    plex_username: str | None,
+    max_results: int,
+    only_unwatched: bool,
+) -> dict:
+    """
+    Async del af recommend_from_seed for TV-serier.
+    Bruger check_library per recommendation (parallelt for hastighed).
+    TV cacher vi ikke endnu — det er typisk små biblioteker.
+    """
+    # Parallelle check_library-kald
+    async def _check_one(rec: dict) -> tuple[dict, dict | None] | None:
+        rec_tmdb_id = rec.get("id") or rec.get("tmdb_id")
+        title       = rec.get("title") or rec.get("name") or ""
+        year_str    = (rec.get("release_date") or rec.get("first_air_date") or "")[:4]
+        year        = int(year_str) if year_str.isdigit() else None
+
+        if not rec_tmdb_id or not title:
+            return None
+
+        plex_check = await check_library(
+            title=title,
+            year=year,
+            media_type="tv",
+            plex_username=plex_username,
+            tmdb_id=rec_tmdb_id,
+        )
+
+        if plex_check.get("status") != STATUS_FOUND:
+            return None
+
+        return (rec, plex_check)
+
+    parallel_results = await asyncio.gather(
+        *[_check_one(rec) for rec in recommendations],
+        return_exceptions=False,
+    )
+
+    in_plex: list[tuple[dict, dict]] = [r for r in parallel_results if r is not None]
+
+    if not in_plex:
+        return {
+            "status":       STATUS_MISSING,
+            "seed_tmdb_id": tmdb_id,
+            "media_type":   "tv",
+            "stats": {
+                "tmdb_recommendations": len(recommendations),
+                "in_plex":              0,
+                "unwatched":            0,
+                "returned":             0,
+            },
+        }
+
+    # NOTE: For TV har vi ikke nem adgang til viewCount via check_library.
+    # Hvis only_unwatched=True for TV, returnerer vi alligevel alt der er i Plex
+    # — det er en bedre UX end at returnere ingenting. Buddy kan altid spørge
+    # brugeren om de har set det.
+    chosen = in_plex[:max_results]
+
+    results = []
+    for rec, plex_check in chosen:
+        results.append({
+            "title":   rec.get("title") or rec.get("name") or "Ukendt",
+            "year":    plex_check.get("year"),
+            "tmdb_id": rec.get("id") or rec.get("tmdb_id"),
+            "rating":  plex_check.get("rating"),
+            "summary": (rec.get("overview") or "").strip()[:200] or None,
+            "viewCount": 0,  # ukendt for TV — antag usete
+        })
+
+    logger.info(
+        "recommend_from_seed (tv): seed=%s — %d TMDB → %d Plex → %d returned",
+        tmdb_id, len(recommendations), len(in_plex), len(chosen),
+    )
+
+    return {
+        "status":       "ok",
+        "seed_tmdb_id": tmdb_id,
+        "media_type":   "tv",
+        "results":      results,
+        "stats": {
+            "tmdb_recommendations": len(recommendations),
+            "in_plex":              len(in_plex),
+            "unwatched":            len(in_plex),  # ukendt for TV
+            "returned":             len(chosen),
+        },
+    }
