@@ -1,42 +1,35 @@
 """
 services/plex_service.py - Plex Media Server integration via python-plexapi.
 
-CHANGES vs previous version (v1.4.0 — P0/P1 performance pakke):
-  - P0-1: PlexServer-instans cache i _connect()
-    Tidligere oprettede vi en NY PlexServer-instans ved hvert eneste tool-kald.
-    Det er en HTTP-handshake + auth roundtrip = 50-100ms per kald. Med 5+ tool
-    calls per bruger-tur betød det 250-500ms spildt. Nu caches PlexServer-
-    instansen per bruger i 10 min.
-    Estimeret besparelse: 200-500ms per multi-tool flow.
+CHANGES vs previous version (v1.4.1 — fix #3: Shrek 5 false positive):
+  - BUG FIX i _franchise_plex_check_sync: Strikt år-match kræves nu for
+    fuzzy-titel fallback. Tidligere kunne en hindi-film "अक्यूज़्ड" matche
+    "Shrek 5" fordi:
+    1. Shrek 5 (tmdb_id=421892, year=2027) er ikke i Plex endnu
+    2. Fuzzy fallback brugte _titles_match_fuzzy som er substring-baseret
+    3. Når Plex-filmens år manglede ELLER var inden for 1 år (samme tilfælde
+       i original kode), blev det godkendt som match
+    
+    Ny logik:
+    - Eksakt titel-match: tillad år ±1 ELLER manglende år (uændret)
+    - Fuzzy titel-match: kræv BÅDE Plex-år og TMDB-år, og indenfor 1 år
+    
+    Forhindrer cross-genre false positives. Bedre data-integritet —
+    Buddy lyver ikke længere om hvilke film du har.
 
+UNCHANGED (v1.4.0 — P0/P1 performance pakke):
+  - P0-1: PlexServer-instans cache i _connect() (10 min TTL)
   - P1-1: Skip redundant Lag 0b GUID-search hvis cache var populated
-    Tidligere: Hvis cache miss'ede på en film, kørte vi STADIG den dyre
-    section.search(guid=...) Lag 0b — selvom vi allerede ved at filmen ikke
-    er i cachen (som er bygget af samme datakilde). Nu skipper vi Lag 0b når
-    cachen var komplet, og går direkte til Lag 1 (titel-søgning).
-    Estimeret besparelse: 200-500ms per cache miss.
 
 UNCHANGED (v1.3.0 — udnyt udvidet plex_cache):
-  - 4 sync-funktioner bruger plex_cache: _check_sync (TV-path), _unwatched_sync,
-    _get_on_deck_sync, _build_actor_guid_set.
+  - 4 sync-funktioner bruger plex_cache med fallback
 
-UNCHANGED (v1.2.1 — recommend_from_seed genintroduceret):
-  - Funktion bevaret med plex_cache movie index lookup.
-
-UNCHANGED (v1.2.0 — _check_sync Lag 0 bruger plex_cache for film):
-  - Movie path uændret — bruger get_plex_movie_index_sync.
-
-UNCHANGED (v1.1.0 — switchHomeUser failure cache):
-  - _connect() cacher Plex Home User auth-fejl per username i 1 time.
-
-UNCHANGED (v1.0.2 — sci-fi genre fix):
-  - _GENRE_SYNONYMS udvidet med "sciencefiction" og "science fiction".
-
-UNCHANGED (v1.0.1 — GUID Lag 0 fix):
-  - _check_sync Lag 0 bruger section.search(guid=f'tmdb://{tmdb_id}').
-
-UNCHANGED (v0.9.9 — find_unwatched fix):
-  - _unwatched_sync bruger section.all() i stedet for section.search().
+UNCHANGED (v1.2.1 — recommend_from_seed genintroduceret)
+UNCHANGED (v1.2.0 — _check_sync Lag 0 bruger plex_cache for film)
+UNCHANGED (v1.1.0 — switchHomeUser failure cache)
+UNCHANGED (v1.0.2 — sci-fi genre fix)
+UNCHANGED (v1.0.1 — GUID Lag 0 fix)
+UNCHANGED (v0.9.9 — find_unwatched fix)
 
 TOKEN OPTIMISATION (data-diæt):
   - Alle list-resultater er capped til 25 items maksimum.
@@ -79,26 +72,15 @@ _FRANCHISE_MAX_PER_LIST = 40
 _ACTOR_MAX_MISSING      = 15
 
 # ── switchHomeUser failure cache ──────────────────────────────────────────────
-_SWITCH_FAIL_TTL_SECS = 3600  # 1 time
-_switch_fail_cache: dict[str, float] = {}  # username (lower) → unix timestamp
+_SWITCH_FAIL_TTL_SECS = 3600
+_switch_fail_cache: dict[str, float] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # P0-1: PlexServer instance cache
 # ══════════════════════════════════════════════════════════════════════════════
-# Hver gang _connect() kaldes opretter vi en PlexServer-instans, hvilket kræver
-# en HTTP-handshake + auth-roundtrip (~50-100ms). Mange tool-flows kalder
-# _connect() 5-10 gange, hvilket betyder at vi spilder 250-1000ms per bruger-
-# interaktion på connection-setup.
-#
-# Løsning: Cache PlexServer-instansen per bruger i 10 minutter. PlexServer-
-# objekter er thread-safe (de bruger requests internt med session pooling),
-# så vi kan trygt dele dem på tværs af tool-kald.
-#
-# TTL er 10 min — kort nok til at fange token-rotation, langt nok til at
-# dække en hel bruger-session uden re-auth.
 
-_PLEX_INSTANCE_TTL_SECS = 600  # 10 minutter
+_PLEX_INSTANCE_TTL_SECS = 600
 _plex_instance_cache: dict[str, tuple[float, PlexServer]] = {}
 
 
@@ -127,10 +109,7 @@ def _is_animation(item) -> bool:
 
 
 def _extract_tmdb_id_from_guids(item) -> int | None:
-    """
-    Udtræk TMDB ID fra et Plex-items .guids liste.
-    Format: [Guid(id='tmdb://671'), Guid(id='imdb://tt0241527'), ...]
-    """
+    """Udtræk TMDB ID fra et Plex-items .guids liste."""
     try:
         guids = getattr(item, "guids", []) or []
         for guid in guids:
@@ -145,7 +124,7 @@ def _extract_tmdb_id_from_guids(item) -> int | None:
 
 
 def _extract_imdb_id_from_guids(item) -> str | None:
-    """Udtræk IMDb ID (f.eks. 'tt21909366') fra et Plex-items .guids liste."""
+    """Udtræk IMDb ID fra et Plex-items .guids liste."""
     try:
         guids = getattr(item, "guids", []) or []
         for guid in guids:
@@ -224,10 +203,7 @@ _GENRE_SYNONYMS: dict[str, list[str]] = {
 
 
 def _genre_matches(norm_genre: str, item_genre_tags: list[str]) -> bool:
-    """
-    Tjek om et genre-filter matcher en films genre-tags.
-    Matcher på tværs af dansk/engelsk via _GENRE_SYNONYMS.
-    """
+    """Tjek om et genre-filter matcher en films genre-tags."""
     search_terms = {norm_genre}
     search_terms.update(_GENRE_SYNONYMS.get(norm_genre, []))
 
@@ -243,22 +219,9 @@ def _genre_matches(norm_genre: str, item_genre_tags: list[str]) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _connect(plex_username: str | None = None) -> PlexServer | dict:
-    """
-    Hent (cached) PlexServer-instans for en bruger.
-
-    Cache-strategi (P0-1, v1.4.0):
-      - PlexServer-instanser cachet i 10 min per bruger
-      - Sparer ~50-100ms per kald ved at undgå HTTP-handshake + auth
-      - Thread-safe: PlexServer bruger requests-session pooling internt
-      - Cache nulstilles ved Railway redeploy
-
-    Returns:
-      - PlexServer-instans ved success
-      - Dict med {"status": "error", "message": "..."} ved fejl
-    """
+    """Hent (cached) PlexServer-instans for en bruger."""
     cache_key = (plex_username or "").strip().lower() or "__admin__"
 
-    # ── Cache-tjek: returner cached instans hvis ung nok ─────────────────────
     cached = _plex_instance_cache.get(cache_key)
     if cached is not None:
         built_at, instance = cached
@@ -269,17 +232,14 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
                 plex_username or "admin", age,
             )
             return instance
-        # TTL udløbet — fjern fra cache og byg ny
         logger.debug(
             "PlexServer cache TTL udløbet for '%s' — opretter ny",
             plex_username or "admin",
         )
         _plex_instance_cache.pop(cache_key, None)
 
-    # ── Byg ny PlexServer-instans (samme logik som før) ──────────────────────
     instance = _build_plex_server(plex_username)
 
-    # Cache kun hvis det blev en gyldig instans (ikke fejl-dict)
     if not isinstance(instance, dict):
         _plex_instance_cache[cache_key] = (time.time(), instance)
 
@@ -287,10 +247,7 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
 
 
 def _build_plex_server(plex_username: str | None = None) -> PlexServer | dict:
-    """
-    Byg en ny PlexServer-instans (uden cache).
-    Identisk med den gamle _connect()-logik fra v1.3.0.
-    """
+    """Byg en ny PlexServer-instans (uden cache)."""
     try:
         admin_plex = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=15)
     except Exception as e:
@@ -300,7 +257,6 @@ def _build_plex_server(plex_username: str | None = None) -> PlexServer | dict:
     if not plex_username:
         return admin_plex
 
-    # ── Cache-tjek: tidligere fejlet switchHomeUser? ─────────────────────────
     norm = plex_username.strip().lower()
     cached_at = _switch_fail_cache.get(norm)
     if cached_at is not None:
@@ -358,12 +314,7 @@ def _build_plex_server(plex_username: str | None = None) -> PlexServer | dict:
 
 
 def invalidate_plex_instance_cache(plex_username: str | None = None) -> None:
-    """
-    Tving rebuild af PlexServer-instans for en bruger.
-    Bruges fx hvis Plex-token er rotated eller forbindelse er stale.
-
-    Hvis plex_username er None, invalideres ALLE caches.
-    """
+    """Tving rebuild af PlexServer-instans for en bruger."""
     if plex_username is None:
         count = len(_plex_instance_cache)
         _plex_instance_cache.clear()
@@ -439,10 +390,8 @@ def _check_sync(
     Fire lag (v1.4.0):
       Lag 0 (cache):   plex_cache.get_plex_movie_index_sync() ELLER
                        plex_cache.get_plex_tv_index_sync().
-                       Bygget via section.all() + GUID-extract — pålideligt.
       Lag 0b (GUID):   Server-side section.search(guid=...). Springs over hvis
-                       cachen var komplet og ikke fandt filmen — det er
-                       redundant arbejde der spilder 200-500ms (P1-1).
+                       cachen var komplet (P1-1).
       Lag 1 (eksakt):  section.search(title) + _titles_match.
       Lag 2/3 (fuzzy): section.search(title) + _titles_match_fuzzy.
     """
@@ -477,8 +426,6 @@ def _check_sync(
         }
 
     # ── Lag 0: Cached index (BÅDE film og TV) ────────────────────────────────
-    # P1-1: Husk om cachen var populated så vi kan skippe Lag 0b GUID-search
-    # hvis filmen ikke fandtes der (det ville være redundant arbejde).
     cache_was_populated = False
     if tmdb_id:
         try:
@@ -489,7 +436,7 @@ def _check_sync(
                 from services.plex_cache import get_plex_movie_index_sync
                 cached_index = get_plex_movie_index_sync(plex_username)
 
-            if cached_index:  # Cache havde indhold
+            if cached_index:
                 cache_was_populated = True
                 cached_item = cached_index.get(tmdb_id)
                 if cached_item is not None:
@@ -499,11 +446,7 @@ def _check_sync(
 
     for section in _sections(plex, plex_type):
 
-        # ── Lag 0b: Server-side GUID-filter ──────────────────────────────────
-        # P1-1: Skip Lag 0b hvis cache var populated. Cachen er bygget af
-        # section.all() + GUID-extract — hvis filmen ikke var der, er den
-        # ikke i Plex (eller har ingen TMDB GUID, hvilket Lag 0b heller ikke
-        # vil opdage). Spar 200-500ms.
+        # ── Lag 0b: Server-side GUID-filter (skip hvis cache var populated) ──
         if tmdb_id and not cache_was_populated:
             try:
                 guid_hits = section.search(guid=f"tmdb://{tmdb_id}")
@@ -578,7 +521,15 @@ def _franchise_plex_check_sync(
     tmdb_movies: list[dict],
     plex_username: str | None = None,
 ) -> dict:
-    """GUID-matching som primær metode, fuzzy titel som fallback."""
+    """
+    GUID-matching som primær metode, fuzzy titel som fallback.
+
+    v1.4.1 (fix #3): Strikt år-match for fuzzy fallback.
+    Tidligere kunne en hindi-film "अक्यूज़्ड" matche "Shrek 5" (2027) fordi
+    fuzzy substring-match accepterede manglende år. Nu kræver vi at fuzzy
+    matches HAR år og er indenfor 1 år. Eksakt titel-matches bevarer den
+    gamle logik (mere tilladende).
+    """
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
@@ -623,18 +574,40 @@ def _franchise_plex_check_sync(
         in_plex    = False
         plex_entry = None
 
+        # ── Primær: TMDB GUID-match (trygt og pålideligt) ────────────────────
         if tmdb_id and tmdb_id in plex_by_tmdb_id:
             in_plex    = True
             plex_entry = plex_by_tmdb_id[tmdb_id]
         else:
+            # ── Fallback: Titel-matching ──────────────────────────────────────
+            # v1.4.1 (fix #3): Differentieret år-tolerance afhængigt af match-type.
             for entry in plex_index.values():
-                if (_titles_match(entry["title"], tmdb_title) or
-                        _titles_match(entry["title"], original_title) or
-                        _titles_match_fuzzy(entry["title"], tmdb_title)):
-                    if not tmdb_year or not entry["year"] or abs(entry["year"] - tmdb_year) <= 1:
-                        in_plex    = True
-                        plex_entry = entry
-                        break
+                exact_match = (
+                    _titles_match(entry["title"], tmdb_title) or
+                    _titles_match(entry["title"], original_title)
+                )
+                fuzzy_match = _titles_match_fuzzy(entry["title"], tmdb_title)
+
+                if not (exact_match or fuzzy_match):
+                    continue
+
+                # FUZZY match (substring): kræv strikt år-validering.
+                # Forhindrer cross-genre false positives som
+                # "Shrek 5" → "अक्यूज़्ड" hindi-film.
+                if fuzzy_match and not exact_match:
+                    if not tmdb_year or not entry["year"]:
+                        continue  # Manglende år → kan ikke validere → skip
+                    if abs(entry["year"] - tmdb_year) > 1:
+                        continue  # Forkert år → skip
+                else:
+                    # EKSAKT titel-match: tillad lidt mere slæk på år.
+                    # Dækker fx Plex har 2024 mens TMDB har 2023 ved sen release.
+                    if tmdb_year and entry["year"] and abs(entry["year"] - tmdb_year) > 1:
+                        continue
+
+                in_plex    = True
+                plex_entry = entry
+                break
 
         result_entry = {
             "title":   tmdb_title,
@@ -660,10 +633,7 @@ def _unwatched_sync(
     genre: str | None,
     plex_username: str | None = None,
 ) -> dict:
-    """
-    Find usete film eller serier i Plex-biblioteket.
-    Bruger plex_cache.get_unwatched_by_genre for hurtig path med fallback.
-    """
+    """Find usete film eller serier i Plex-biblioteket."""
     candidates: list = []
     try:
         from services.plex_cache import get_unwatched_by_genre
@@ -715,10 +685,7 @@ def _unwatched_sync(
 
 
 def _get_or_create_event_loop():
-    """
-    Hent existing event loop eller opret nyt hvis ingen findes.
-    Bruges fra sync-funktioner der vil kalde async cache-funktioner.
-    """
+    """Hent existing event loop eller opret nyt hvis ingen findes."""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_closed():
@@ -760,10 +727,7 @@ def _get_plex_metadata_sync(title: str, year: int | None = None) -> dict:
 
 
 def _get_on_deck_sync(plex_username: str | None = None) -> dict:
-    """
-    Hent On Deck (fortsæt med at se) for brugeren.
-    Bruger plex_cache.get_on_deck_cached med fallback.
-    """
+    """Hent On Deck (fortsæt med at se) for brugeren."""
     items: list = []
 
     try:
@@ -931,7 +895,7 @@ def _build_actor_guid_set(
 
 def _validate_user_sync(plex_username: str) -> dict:
     """
-    Note: Bruger _build_plex_server() direkte (ikke _connect)
+    Bruger _build_plex_server() direkte (ikke _connect)
     fordi vi ikke vil cache instanser under validering.
     """
     try:
@@ -1272,9 +1236,7 @@ async def recommend_from_seed(
     max_results: int = 8,
     only_unwatched: bool = True,
 ) -> dict:
-    """
-    Combined tool: TMDB anbefalinger → Plex cross-check → unwatched-filter.
-    """
+    """Combined tool: TMDB anbefalinger → Plex cross-check → unwatched-filter."""
     from services.tmdb_service import get_recommendations
 
     try:

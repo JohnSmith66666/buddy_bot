@@ -2059,7 +2059,21 @@ async def handle_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 # /info_movie_<id> og /info_tv_<id> handler (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# /info_movie_<id> og /info_tv_<id> handler (v0.12.1 — fix #1 double-fetch)
+# ══════════════════════════════════════════════════════════════════════════════
+
 async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Bruger trykkede paa et /info_movie_<id> eller /info_tv_<id> link.
+
+    v0.12.1 (fix #1): Skip det indledende get_media_details kald.
+    show_confirmation henter alligevel detaljer selv, saa det dobbelte
+    kald spildte 150-200ms per infokort + halvt saa mange TMDB-kald.
+    Vi bruger 'Slaar op...' som placeholder-titel — show_confirmation
+    overskriver den med rigtige detaljer fra TMDB (samme moenster som
+    INFO_SIGNAL flowet i _process_ai_reply).
+    """
     if not await _guard(update):
         return
     logger.info("HANDLER MODTOG: %s", update.message.text)
@@ -2069,11 +2083,11 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         text  = (update.message.text or "").strip()
         match = re.match(r"^/info_?(movie|tv)_?(\d+)$", text)
         if not match:
-            logger.warning("HANDLER: ingen match på '%s' — ignorerer", update.message.text)
+            logger.warning("HANDLER: ingen match paa '%s' — ignorerer", update.message.text)
             return
     media_type    = match.group(1)
     tmdb_id       = int(match.group(2))
-    logger.info("Bruger trykkede på info-link: type=%s, id=%s", media_type, tmdb_id)
+    logger.info("Bruger trykkede paa info-link: type=%s, id=%s", media_type, tmdb_id)
     user_id       = update.effective_user.id
     plex_username = await database.get_plex_username(user_id)
     await update.message.chat.send_action("typing")
@@ -2081,20 +2095,17 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "🤖 Beregner svar med lynets hast... næsten...",
         reply_markup=ReplyKeyboardRemove(),
     )
-    details = await get_media_details(tmdb_id, media_type)
-    if not details:
-        await loading_msg.delete()
-        await update.message.reply_text("Kunne ikke hente info — prøv igen.")
-        return
-    title = details.get("title") or "Ukendt"
-    year  = details.get("release_date", details.get("first_air_date", ""))[:4]
+
+    # v0.12.1: Spring den dobbelte get_media_details over.
+    # show_confirmation henter alligevel detaljer fra TMDB — vi gemmer
+    # bare en placeholder-titel der overskrives senere.
     import secrets as _sec
     token = _sec.token_hex(8)
     await database.save_pending_request(token, user_id, {
         "media_type": media_type,
         "tmdb_id":    tmdb_id,
-        "title":      title,
-        "year":       int(year) if year else None,
+        "title":      "Slaar op...",
+        "year":       None,
         "step":       "picked",
     })
     try:
