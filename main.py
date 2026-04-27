@@ -1945,7 +1945,19 @@ async def _handle_plex_input(update: Update, raw_input: str) -> None:
 # Command handlers (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── BRUGERGUIDE URL ───────────────────────────────────────────────────────────
+# Hostet på GitHub Pages. Opdater denne hvis du flytter guiden til andet repo.
+BRUGERGUIDE_URL = "https://johnsmith66666.github.io/buddy-guide/"
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Velkomst-handler for /start.
+
+    v0.12.2: Kort velkomstbesked med klikbart link til brugerguiden.
+    Tilbagevendende brugere ser den korte version, mens første-gangs-brugere
+    routes via _needs_plex_setup() til Plex-onboarding først.
+    """
     if not await _guard(update):
         return
     user = update.effective_user
@@ -1953,18 +1965,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await database.log_message(user.id, "incoming", "/start")
     if await _needs_plex_setup(update):
         return
+
+    # Telegram Markdown link-format: [tekst](url)
     reply = (
         f"👋 Hej {user.first_name}!\n\n"
-        "Jeg er din personlige medie-assistent. Du kan bl.a. spørge mig om:\n"
-        "• 🎬 Film og serier i dit Plex-bibliotek\n"
-        "• ➕ Bestilling af ny film eller serie\n"
-        "• 📺 Hvad der er på vej\n\n"
-        "Eller tryk på 🍿 *Hvad skal jeg se?* for at finde noget at se nu!"
+        "Jeg er din personlige medie-assistent for Plex. "
+        "Tryk på 🍿 *Hvad skal jeg se?* for at finde noget at se, "
+        "eller bare skriv til mig som til en ven.\n\n"
+        f"📖 [Brugerguide]({BRUGERGUIDE_URL})"
     )
     await update.message.reply_text(
         reply,
         parse_mode="Markdown",
         reply_markup=_build_main_reply_keyboard(),
+        disable_web_page_preview=True,  # undgå stort preview-kort
     )
     await database.log_message(user.id, "outgoing", reply)
 
