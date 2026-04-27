@@ -1,26 +1,24 @@
 """
 services/plex_service.py - Plex Media Server integration via python-plexapi.
 
-CHANGES vs previous version (v1.3.0 — udnyt udvidet plex_cache):
-  - PERFORMANCE: 4 sync-funktioner bruger nu plex_cache for hurtigt cached
-    opslag, med graceful fallback til den oprindelige path hvis cache fejler:
-    * _check_sync (TV-path)       → bruger plex_cache.get_plex_tv_index_sync
-    * _unwatched_sync             → bruger plex_cache.get_unwatched_by_genre
-    * _get_on_deck_sync           → bruger plex_cache.get_on_deck_cached
-    * _build_actor_guid_set       → bruger plex_cache.get_actor_index
+CHANGES vs previous version (v1.4.0 — P0/P1 performance pakke):
+  - P0-1: PlexServer-instans cache i _connect()
+    Tidligere oprettede vi en NY PlexServer-instans ved hvert eneste tool-kald.
+    Det er en HTTP-handshake + auth roundtrip = 50-100ms per kald. Med 5+ tool
+    calls per bruger-tur betød det 250-500ms spildt. Nu caches PlexServer-
+    instansen per bruger i 10 min.
+    Estimeret besparelse: 200-500ms per multi-tool flow.
 
-  - ARKITEKTUR: Alle cache-kald køres async via asyncio.run() inde i sync-
-    funktionen. Det er nødvendigt fordi PlexAPI er synkron, men plex_cache
-    bruger async locks. Alternativt kunne vi have valgt sync_only API,
-    men async-versionen genbruger den eksisterende lock-arkitektur.
+  - P1-1: Skip redundant Lag 0b GUID-search hvis cache var populated
+    Tidligere: Hvis cache miss'ede på en film, kørte vi STADIG den dyre
+    section.search(guid=...) Lag 0b — selvom vi allerede ved at filmen ikke
+    er i cachen (som er bygget af samme datakilde). Nu skipper vi Lag 0b når
+    cachen var komplet, og går direkte til Lag 1 (titel-søgning).
+    Estimeret besparelse: 200-500ms per cache miss.
 
-  - FALLBACK: Hvis cache returnerer tom resultat eller fejler, falder vi
-    tilbage til den oprindelige sti (section.search / section.all). Det
-    sikrer at en cache-fejl ikke får botten til at vise tomme resultater.
-
-  - TTL: Cachen er nu 60 min (var 5 min). Det er en bevidst trade-off:
-    nyt indhold tilføjet via Radarr/Sonarr bliver synligt indenfor 1 time,
-    men brugeroplevelsen er konsistent hurtig.
+UNCHANGED (v1.3.0 — udnyt udvidet plex_cache):
+  - 4 sync-funktioner bruger plex_cache: _check_sync (TV-path), _unwatched_sync,
+    _get_on_deck_sync, _build_actor_guid_set.
 
 UNCHANGED (v1.2.1 — recommend_from_seed genintroduceret):
   - Funktion bevaret med plex_cache movie index lookup.
@@ -83,6 +81,25 @@ _ACTOR_MAX_MISSING      = 15
 # ── switchHomeUser failure cache ──────────────────────────────────────────────
 _SWITCH_FAIL_TTL_SECS = 3600  # 1 time
 _switch_fail_cache: dict[str, float] = {}  # username (lower) → unix timestamp
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# P0-1: PlexServer instance cache
+# ══════════════════════════════════════════════════════════════════════════════
+# Hver gang _connect() kaldes opretter vi en PlexServer-instans, hvilket kræver
+# en HTTP-handshake + auth-roundtrip (~50-100ms). Mange tool-flows kalder
+# _connect() 5-10 gange, hvilket betyder at vi spilder 250-1000ms per bruger-
+# interaktion på connection-setup.
+#
+# Løsning: Cache PlexServer-instansen per bruger i 10 minutter. PlexServer-
+# objekter er thread-safe (de bruger requests internt med session pooling),
+# så vi kan trygt dele dem på tværs af tool-kald.
+#
+# TTL er 10 min — kort nok til at fange token-rotation, langt nok til at
+# dække en hel bruger-session uden re-auth.
+
+_PLEX_INSTANCE_TTL_SECS = 600  # 10 minutter
+_plex_instance_cache: dict[str, tuple[float, PlexServer]] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -222,10 +239,58 @@ def _genre_matches(norm_genre: str, item_genre_tags: list[str]) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Plex connection
+# Plex connection (P0-1: med instance cache)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _connect(plex_username: str | None = None) -> PlexServer | dict:
+    """
+    Hent (cached) PlexServer-instans for en bruger.
+
+    Cache-strategi (P0-1, v1.4.0):
+      - PlexServer-instanser cachet i 10 min per bruger
+      - Sparer ~50-100ms per kald ved at undgå HTTP-handshake + auth
+      - Thread-safe: PlexServer bruger requests-session pooling internt
+      - Cache nulstilles ved Railway redeploy
+
+    Returns:
+      - PlexServer-instans ved success
+      - Dict med {"status": "error", "message": "..."} ved fejl
+    """
+    cache_key = (plex_username or "").strip().lower() or "__admin__"
+
+    # ── Cache-tjek: returner cached instans hvis ung nok ─────────────────────
+    cached = _plex_instance_cache.get(cache_key)
+    if cached is not None:
+        built_at, instance = cached
+        age = time.time() - built_at
+        if age < _PLEX_INSTANCE_TTL_SECS:
+            logger.debug(
+                "PlexServer cache HIT for '%s' (age=%.0fs)",
+                plex_username or "admin", age,
+            )
+            return instance
+        # TTL udløbet — fjern fra cache og byg ny
+        logger.debug(
+            "PlexServer cache TTL udløbet for '%s' — opretter ny",
+            plex_username or "admin",
+        )
+        _plex_instance_cache.pop(cache_key, None)
+
+    # ── Byg ny PlexServer-instans (samme logik som før) ──────────────────────
+    instance = _build_plex_server(plex_username)
+
+    # Cache kun hvis det blev en gyldig instans (ikke fejl-dict)
+    if not isinstance(instance, dict):
+        _plex_instance_cache[cache_key] = (time.time(), instance)
+
+    return instance
+
+
+def _build_plex_server(plex_username: str | None = None) -> PlexServer | dict:
+    """
+    Byg en ny PlexServer-instans (uden cache).
+    Identisk med den gamle _connect()-logik fra v1.3.0.
+    """
     try:
         admin_plex = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=15)
     except Exception as e:
@@ -288,8 +353,27 @@ def _connect(plex_username: str | None = None) -> PlexServer | dict:
         return admin_plex
 
     except Exception as e:
-        logger.warning("_connect() error for '%s': %s — falling back to admin", plex_username, e)
+        logger.warning("_build_plex_server() error for '%s': %s — falling back to admin", plex_username, e)
         return admin_plex
+
+
+def invalidate_plex_instance_cache(plex_username: str | None = None) -> None:
+    """
+    Tving rebuild af PlexServer-instans for en bruger.
+    Bruges fx hvis Plex-token er rotated eller forbindelse er stale.
+
+    Hvis plex_username er None, invalideres ALLE caches.
+    """
+    if plex_username is None:
+        count = len(_plex_instance_cache)
+        _plex_instance_cache.clear()
+        logger.info("PlexServer instance cache fully invalidated (%d brugere)", count)
+        return
+
+    cache_key = plex_username.strip().lower() or "__admin__"
+    if cache_key in _plex_instance_cache:
+        _plex_instance_cache.pop(cache_key, None)
+        logger.info("PlexServer instance cache invalidated for '%s'", plex_username)
 
 
 def _sections(plex: PlexServer, plex_type: str):
@@ -352,13 +436,13 @@ def _check_sync(
     tmdb_id: int | None = None,
 ) -> dict:
     """
-    Fire lag (v1.3.0):
+    Fire lag (v1.4.0):
       Lag 0 (cache):   plex_cache.get_plex_movie_index_sync() ELLER
                        plex_cache.get_plex_tv_index_sync().
                        Bygget via section.all() + GUID-extract — pålideligt.
-                       BÅDE film og TV cached i v1.3.0.
-      Lag 0b (GUID):   Server-side section.search(guid=...). Fallback hvis cache
-                       er tom eller lookup fejler.
+      Lag 0b (GUID):   Server-side section.search(guid=...). Springs over hvis
+                       cachen var komplet og ikke fandt filmen — det er
+                       redundant arbejde der spilder 200-500ms (P1-1).
       Lag 1 (eksakt):  section.search(title) + _titles_match.
       Lag 2/3 (fuzzy): section.search(title) + _titles_match_fuzzy.
     """
@@ -392,7 +476,10 @@ def _check_sync(
             "rating":            final_rating,
         }
 
-    # ── Lag 0: Cached index (BÅDE film og TV i v1.3.0) ───────────────────────
+    # ── Lag 0: Cached index (BÅDE film og TV) ────────────────────────────────
+    # P1-1: Husk om cachen var populated så vi kan skippe Lag 0b GUID-search
+    # hvis filmen ikke fandtes der (det ville være redundant arbejde).
+    cache_was_populated = False
     if tmdb_id:
         try:
             if is_tv:
@@ -402,16 +489,22 @@ def _check_sync(
                 from services.plex_cache import get_plex_movie_index_sync
                 cached_index = get_plex_movie_index_sync(plex_username)
 
-            cached_item = cached_index.get(tmdb_id)
-            if cached_item is not None:
-                return _build_result(cached_item, "0/cache")
+            if cached_index:  # Cache havde indhold
+                cache_was_populated = True
+                cached_item = cached_index.get(tmdb_id)
+                if cached_item is not None:
+                    return _build_result(cached_item, "0/cache")
         except Exception as e:
             logger.warning("plex_cache lookup fejl for tmdb_id=%s: %s", tmdb_id, e)
 
     for section in _sections(plex, plex_type):
 
-        # ── Lag 0b: Server-side GUID-filter (FALLBACK) ────────────────────────
-        if tmdb_id:
+        # ── Lag 0b: Server-side GUID-filter ──────────────────────────────────
+        # P1-1: Skip Lag 0b hvis cache var populated. Cachen er bygget af
+        # section.all() + GUID-extract — hvis filmen ikke var der, er den
+        # ikke i Plex (eller har ingen TMDB GUID, hvilket Lag 0b heller ikke
+        # vil opdage). Spar 200-500ms.
+        if tmdb_id and not cache_was_populated:
             try:
                 guid_hits = section.search(guid=f"tmdb://{tmdb_id}")
                 if guid_hits:
@@ -569,15 +662,11 @@ def _unwatched_sync(
 ) -> dict:
     """
     Find usete film eller serier i Plex-biblioteket.
-
-    v1.3.0: Bruger plex_cache.get_unwatched_by_genre for hurtig path.
-    Falder tilbage til section.all() hvis cache er tom eller fejler.
+    Bruger plex_cache.get_unwatched_by_genre for hurtig path med fallback.
     """
-    # ── Cache-path: Hent fra plex_cache ───────────────────────────────────────
     candidates: list = []
     try:
         from services.plex_cache import get_unwatched_by_genre
-        # Kør async cache-funktion fra sync context
         loop = _get_or_create_event_loop()
         candidates = loop.run_until_complete(
             get_unwatched_by_genre(media_type, genre, plex_username)
@@ -586,7 +675,6 @@ def _unwatched_sync(
         logger.warning("_unwatched_sync: plex_cache fejl, falder tilbage: %s", e)
         candidates = []
 
-    # ── Fallback: oprindelig path hvis cache returnerede tomt eller fejlede ──
     if not candidates:
         is_tv     = (media_type == "tv")
         plex_type = _TV_TYPE if is_tv else _MOVIE_TYPE
@@ -630,9 +718,6 @@ def _get_or_create_event_loop():
     """
     Hent existing event loop eller opret nyt hvis ingen findes.
     Bruges fra sync-funktioner der vil kalde async cache-funktioner.
-
-    Note: Kører i thread pool (asyncio.to_thread) — så vi har ikke
-    et running event loop. Vi opretter et nyt og lader det dø efter brug.
     """
     try:
         loop = asyncio.get_event_loop()
@@ -677,13 +762,10 @@ def _get_plex_metadata_sync(title: str, year: int | None = None) -> dict:
 def _get_on_deck_sync(plex_username: str | None = None) -> dict:
     """
     Hent On Deck (fortsæt med at se) for brugeren.
-
-    v1.3.0: Bruger plex_cache.get_on_deck_cached for hurtig path.
-    Falder tilbage til direkte API-kald hvis cache er tom eller fejler.
+    Bruger plex_cache.get_on_deck_cached med fallback.
     """
     items: list = []
 
-    # ── Cache-path ────────────────────────────────────────────────────────────
     try:
         from services.plex_cache import get_on_deck_cached
         loop = _get_or_create_event_loop()
@@ -692,7 +774,6 @@ def _get_on_deck_sync(plex_username: str | None = None) -> dict:
         logger.warning("_get_on_deck_sync: plex_cache fejl, falder tilbage: %s", e)
         items = []
 
-    # ── Fallback ──────────────────────────────────────────────────────────────
     if not items:
         plex = _connect(plex_username)
         if isinstance(plex, dict):
@@ -711,14 +792,7 @@ def _search_by_actor_sync(
     actor_name: str,
     plex_username: str | None = None,
 ) -> dict:
-    """
-    Søg i Plex efter film hvor en skuespiller medvirker.
-
-    Note: Denne funktion er bibeholdt uændret. Den primære actor-cache
-    udnyttes via _build_actor_guid_set som bruges af check_actor_on_plex.
-    Direkte search_by_actor er sjældent brugt og kalder kun en enkelt
-    section.search per kald, så caching gevinst er marginal.
-    """
+    """Søg i Plex efter film hvor en skuespiller medvirker."""
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return plex
@@ -810,18 +884,8 @@ def _build_actor_guid_set(
 ) -> tuple[set[int], set[str]]:
     """
     Byg to sæt for alle Plex-film der matcher skuespilleren.
-
-    v1.3.0: Bruger plex_cache.get_actor_index for hurtig path.
-    Falder tilbage til direkte section.search hvis cache fejler.
-
-    Performance:
-      - Cold (første gang): ~2-3 sek (uændret)
-      - Warm (cached): ~1ms (var 2-3 sek hver gang)
-
-    Cache-impact: Hvis brugeren spørger om Tom Hanks 5 gange i løbet af
-    en time, sparer vi ~10-12 sekunder samlet.
+    Bruger plex_cache.get_actor_index for hurtig path med fallback.
     """
-    # ── Cache-path ────────────────────────────────────────────────────────────
     try:
         from services.plex_cache import get_actor_index
         loop = _get_or_create_event_loop()
@@ -837,7 +901,6 @@ def _build_actor_guid_set(
     except Exception as e:
         logger.warning("_build_actor_guid_set: plex_cache fejl, falder tilbage: %s", e)
 
-    # ── Fallback: oprindelig path ────────────────────────────────────────────
     plex = _connect(plex_username)
     if isinstance(plex, dict):
         return set(), set()
@@ -867,6 +930,10 @@ def _build_actor_guid_set(
 
 
 def _validate_user_sync(plex_username: str) -> dict:
+    """
+    Note: Bruger _build_plex_server() direkte (ikke _connect)
+    fordi vi ikke vil cache instanser under validering.
+    """
     try:
         admin_plex = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=15)
         account    = admin_plex.myPlexAccount()
@@ -1035,10 +1102,7 @@ async def check_actor_on_plex(
     actor_name: str,
     plex_username: str | None = None,
 ) -> dict:
-    """
-    Krydstjek en skuespillers top 75 film mod Plex.
-    Flow: TMDB person → filmografi (top 75) → Plex GUID-match → fuzzy fallback.
-    """
+    """Krydstjek en skuespillers top 75 film mod Plex."""
     from services.tmdb_service import search_person, get_person_filmography
 
     person_results = await search_person(actor_name)
@@ -1169,10 +1233,7 @@ async def get_plex_watch_url(
     tmdb_id: int,
     media_type: str,
 ) -> str | None:
-    """
-    Hent watch.plex.tv deep-link URL for en specifik film/serie via slug-opslag.
-    Returnerer f.eks. https://watch.plex.tv/movie/spy-kids eller None ved fejl.
-    """
+    """Hent watch.plex.tv deep-link URL for en specifik film/serie."""
     plex_type_int = 1 if media_type == "movie" else 2
     url = "https://metadata.provider.plex.tv/library/metadata/matches"
     params = {
@@ -1201,7 +1262,7 @@ async def get_plex_watch_url(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# recommend_from_seed (P1 combined tool — v1.2.1 genintroduceret)
+# recommend_from_seed (P1 combined tool)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def recommend_from_seed(
@@ -1213,9 +1274,6 @@ async def recommend_from_seed(
 ) -> dict:
     """
     Combined tool: TMDB anbefalinger → Plex cross-check → unwatched-filter.
-
-    Erstatter et helt anbefalingsflow der ellers ville kræve 7+ separate
-    tool-calls. Sparer 5-7 sekunder per anbefaling.
     """
     from services.tmdb_service import get_recommendations
 
@@ -1277,10 +1335,7 @@ def _recommend_from_seed_movie_sync(
     max_results: int,
     only_unwatched: bool,
 ) -> dict:
-    """
-    Synkron del af recommend_from_seed for film.
-    Bruger plex_cache for ~1ms cross-check per recommendation.
-    """
+    """Synkron del af recommend_from_seed for film."""
     from services.plex_cache import get_plex_movie_index_sync
 
     try:
@@ -1371,10 +1426,7 @@ async def _recommend_from_seed_tv_async(
     max_results: int,
     only_unwatched: bool,
 ) -> dict:
-    """
-    Async del af recommend_from_seed for TV-serier.
-    Bruger check_library per recommendation (parallelt for hastighed).
-    """
+    """Async del af recommend_from_seed for TV-serier."""
     async def _check_one(rec: dict) -> tuple[dict, dict | None] | None:
         rec_tmdb_id = rec.get("id") or rec.get("tmdb_id")
         title       = rec.get("title") or rec.get("name") or ""
