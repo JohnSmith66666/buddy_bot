@@ -2005,29 +2005,35 @@ async def handle_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
     await execute_order(query, token, plex_username)
 
 
+
 async def handle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle ❌ Annuller knap pa infokort og soegeresultater.
+
+    UX (v0.11.1): Sletter hele beskeden (foto + caption + knapper) og viser
+    en kort 'Annulleret' toast i toppen af Telegram. Tidligere version
+    redigerede kun caption'en, hvilket efterlod plakaten staende uden
+    handlingsmuligheder — det forvirrede brugere og rodede chat-historik.
+
+    Toast vs. ny besked: Toast er Telegram-native UX (forsvinder selv efter
+    ~3 sek), holder chat-historikken ren, og giver tydelig feedback om at
+    handlingen lykkedes.
+    """
     query = update.callback_query
-    await query.answer()
+
+    # Vis toast i toppen af Telegram (forsvinder selv)
+    await query.answer(text="Annulleret 👍", show_alert=False)
+
+    # Ryd op i pending_requests (samme som foer)
     token = query.data.split(":", 1)[1]
     if token != "none":
         await database.get_pending_request(token)
-    cancel_text = "Bestillingen blev annulleret. 👍"
-    is_photo = bool(getattr(query.message, "photo", None))
+
+    # Slet hele beskeden — foto, caption og knapper
     try:
-        if is_photo:
-            await query.edit_message_caption(caption=cancel_text)
-        else:
-            await query.edit_message_text(cancel_text)
+        await query.message.delete()
     except Exception as e:
-        logger.warning("handle_cancel_callback edit fejl: %s — sender ny besked", e)
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-        try:
-            await query.message.chat.send_message(cancel_text)
-        except Exception as e2:
-            logger.error("handle_cancel_callback fallback fejl: %s", e2)
+        logger.warning("handle_cancel_callback delete fejl: %s", e)
 
 
 async def handle_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
