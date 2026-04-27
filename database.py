@@ -1,29 +1,17 @@
 """
 database.py - PostgreSQL connection pool, table management,
-user whitelist, Plex username storage, onboarding state, interaction logging,
+user whitelist, Plex username storage, onboarding state, interaktionshistorik,
 pending requests OG TMDB metadata-cache.
 
-CHANGES vs previous version (v0.11.0 — P0/P1 performance pakke):
-  - P0-2: log_message statistical DELETE
-    Tidligere kørte vi DELETE-cleanup ved HVER eneste log-besked, hvilket
-    gav 2 DB-roundtrips per besked (INSERT + DELETE). Nu kører DELETE kun
-    statistisk hver 10. gang (10% af kaldene), hvilket reducerer DB-load
-    med ~50% uden at risikere overflow:
-    * Med LOG_HISTORY_LIMIT=500 kan tabellen vokse til ~5000 rækker per
-      bruger før næste cleanup, hvilket er trivielt.
-    * INSERT er fortsat øjeblikkelig — kun cleanup er deferred.
+CHANGES vs previous version (v0.12.0 — audit helper):
+  - NY: count_titles_by_subgenre(subgenre_id, media_type) → int
+    Tæller hvor mange titler der matcher en subgenre for et givent media_type.
+    Bruges af /audit_tv_subgenres admin-kommando til at finde stærke/svage/
+    tomme subgenrer for TV-data.
 
-  - P1-3: TABLESAMPLE for find_films_by_subgenre
-    Tidligere brugte SQL `ORDER BY RANDOM() LIMIT N` på filtreret tabel,
-    hvilket kræver fuld sortering af alle matchende rækker. Med 6500+
-    film og GIN-index var det ~50-100ms.
-
-    Nu bruger vi en hybrid:
-    1. WHERE-filter med GIN-indekser (uændret)
-    2. TABLESAMPLE BERNOULLI(20) sampler 20% af de matchende rækker
-    3. ORDER BY RANDOM() på sampling-resultatet (meget mindre datasæt)
-
-    Resultatet er ~30-50ms hurtigere subgenre-queries.
+UNCHANGED (v0.11.0 — P0/P1 performance pakke):
+  - P0-2: log_message statistical DELETE (10% kald → 50% mindre DB-load).
+  - P1-3: CTE-baseret subgenre query (30-50ms hurtigere find_films_by_subgenre).
 
 UNCHANGED (v0.10.8 — Etape 1 af subgenre-projekt):
   - find_films_by_subgenre(subgenre_id, limit=20) → list[dict]
@@ -53,9 +41,7 @@ _pool: asyncpg.Pool | None = None
 # ── P0-2: Probability for log cleanup ─────────────────────────────────────────
 # Hver gang log_message kaldes, kører vi DELETE med denne sandsynlighed.
 # 0.1 = 10% af kaldene. Med 50 brugere × 20 beskeder/dag = 1000 logs/dag,
-# kører DELETE ~100 gange/dag i stedet for 1000 gange. Tabellen kan i
-# worst case vokse til LOG_HISTORY_LIMIT × ~10 = 5000 rækker per bruger
-# mellem cleanups, hvilket er trivielt for PostgreSQL.
+# kører DELETE ~100 gange/dag i stedet for 1000 gange.
 _LOG_CLEANUP_PROBABILITY = 0.1
 
 
@@ -297,25 +283,9 @@ async def log_message(
 ) -> None:
     """
     Log en besked til interaction_log tabellen.
-
-    P0-2 OPTIMERING (v0.11.0):
-      Tidligere kørte INSERT + DELETE på hvert eneste kald (2 DB-roundtrips).
-      Nu kører DELETE kun statistisk hver 10. gang, hvilket halverer DB-load
-      uden risiko for log-overflow.
-
-    Mekanisme:
-      - INSERT kører altid (vi vil aldrig miste en log-besked)
-      - DELETE kører med _LOG_CLEANUP_PROBABILITY (10%) sandsynlighed
-      - Worst case: tabellen kan vokse til LOG_HISTORY_LIMIT × ~10 rows
-        per bruger mellem cleanups = ~5000 rows = trivielt for PostgreSQL
-
-    Performance impact:
-      - Før: 2 DB-roundtrips per log
-      - Nu:  ~1.1 DB-roundtrips per log (1.0 INSERT + 0.1 DELETE)
-      - Besparelse: ~45% færre DB-kald
+    P0-2: DELETE kører kun statistisk hver 10. gang for at spare DB-load.
     """
     async with _pool_ref().acquire() as conn:
-        # INSERT er altid - vi mister aldrig logs
         await conn.execute(
             """
             INSERT INTO interaction_log (telegram_id, direction, message_text, logged_at)
@@ -324,7 +294,6 @@ async def log_message(
             telegram_id, direction, message_text, datetime.now(timezone.utc),
         )
 
-        # DELETE kun statistisk - sparer ~50% af DB-roundtrips
         if random.random() < _LOG_CLEANUP_PROBABILITY:
             await conn.execute(
                 """
@@ -637,12 +606,10 @@ async def get_top_keywords(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Subgenre lookup (P1-3: TABLESAMPLE optimization)
+# Subgenre lookup
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Mapping fra dansk Plex-genre (på serveren) til engelske TMDB-genrer.
-# Plex-serveren bruger blandet sprog (Komedie, Action, Drama...) mens
-# tmdb_genres-kolonnen indeholder engelske TMDB-værdier (Comedy, Action, Drama).
+# Mapping fra dansk Plex-genre til engelske TMDB-genrer.
 _PLEX_TO_TMDB_GENRE = {
     "Komedie":      ["Comedy"],
     "Gyser":        ["Horror"],
@@ -680,32 +647,13 @@ async def find_films_by_subgenre(
     Find film der matcher en subgenre (keywords + valgfri Plex-genre).
 
     P1-3 OPTIMERING (v0.11.0):
-      Tidligere brugte vi `ORDER BY RANDOM() LIMIT N` på filtrerede resultater,
-      hvilket kræver fuld sortering af alle matchende rækker. Med 6500+ film
-      og ~500 matchende per query var det 50-100ms per kald.
+      CTE-baseret query der filtrerer FØRST, derefter randomiserer.
+      30-50ms hurtigere på populære subgenrer.
 
-      Nu bruger vi en hybrid TABLESAMPLE-approach:
-      1. Først: Tjek antal matches via COUNT(*) (~5ms)
-      2. Hvis mange matches (>200): TABLESAMPLE BERNOULLI(20) + ORDER BY RANDOM
-         på det reducerede sample (~10-20ms)
-      3. Hvis få matches (<200): Fall back til ORDER BY RANDOM på alle
-         (samme performance som før, men trivielt)
-
-      Resultat: 30-50ms hurtigere på populære subgenrer.
-
-    Args:
-      subgenre_id: ID fra subgenre_service.SUBGENRES (fx 'horror_slasher')
-      limit:       max antal kandidater (default 30)
-
-    Returns:
-      Liste af dicts med tmdb_id, title, year, tmdb_genres, keywords.
-      Tom liste hvis subgenre_id er ukendt eller ingen matches.
-
-    Smart-blanding strategi (uændret):
+    Smart-blanding strategi:
       Vi henter et bredt udsnit (limit*3 candidates), deler i nye/klassikere
       buckets på Python-side og fletter dem alternativt.
     """
-    # Lazy import for at undgå cirkulær dependency med subgenre_service
     from services.subgenre_service import get_subgenre
 
     subgenre = get_subgenre(subgenre_id)
@@ -720,13 +668,8 @@ async def find_films_by_subgenre(
         logger.warning("find_films_by_subgenre: subgenre '%s' har ingen keywords", subgenre_id)
         return []
 
-    # Fetch bredt udsnit til Python-side blanding
     fetch_limit = limit * 3
 
-    # ── Byg WHERE clause ──────────────────────────────────────────────────────
-    # PostgreSQL's '?|' jsonb-operator: TRUE hvis et af de givne tekst-keys
-    # eksisterer som top-level element i JSONB-arrayet. GIN-indekset på
-    # keywords accelererer dette til ~ms.
     where_parts: list[str] = [
         "status = 'fetched'",
         "media_type = 'movie'",
@@ -741,19 +684,6 @@ async def find_films_by_subgenre(
 
     where_clause = " AND ".join(where_parts)
 
-    # ── P1-3: Hybrid SQL strategy ─────────────────────────────────────────────
-    # PostgreSQL's TABLESAMPLE BERNOULLI samples en procentvis del af rækkerne.
-    # Det er meget hurtigere end ORDER BY RANDOM() på store sæt.
-    #
-    # Strategi:
-    # - For populære subgenrer (mange matches): Sample 20% først, derefter random.
-    # - For sjældne subgenrer (få matches): Brug ORDER BY RANDOM (ingen ændring).
-    #
-    # CTE (Common Table Expression) tillader os at filtrere FØRST,
-    # derefter sample. TABLESAMPLE virker kun direkte på tabeller, ikke
-    # på filtrerede subqueries. Derfor:
-    # - Vi bruger ORDER BY RANDOM() men først efter LIMIT-en
-    # - Det er stadig hurtigere end fuld random sort fordi LIMIT cutter tidligt
     sql = f"""
         WITH filtered AS (
             SELECT tmdb_id, title, year, tmdb_genres, keywords
@@ -774,12 +704,6 @@ async def find_films_by_subgenre(
         logger.error("find_films_by_subgenre SQL-fejl for '%s': %s", subgenre_id, e)
         return []
 
-    # ── Smart-blanding på Python-side ─────────────────────────────────────────
-    # Vi har RANDOM() i SQL — så rows er allerede randomiseret. For at gøre
-    # blandingen smart deler vi i to buckets:
-    #   - "Nye" = år >= (current_year - 5)
-    #   - "Klassikere" = resten
-    # og fletter dem alternativt indtil vi har 'limit' film.
     current_year = datetime.now(timezone.utc).year
     cutoff_year  = current_year - 5
 
@@ -787,7 +711,6 @@ async def find_films_by_subgenre(
     classic_films: list[dict] = []
 
     for row in rows:
-        # Parse JSONB-strings til Python-lister
         try:
             tmdb_genres = json.loads(row["tmdb_genres"]) if isinstance(row["tmdb_genres"], str) else row["tmdb_genres"]
         except Exception:
@@ -810,7 +733,6 @@ async def find_films_by_subgenre(
         else:
             classic_films.append(film_dict)
 
-    # Smart fletning: alternér mellem nye og klassikere
     result: list[dict] = []
     new_idx, classic_idx = 0, 0
     use_new = True
@@ -841,3 +763,74 @@ async def find_films_by_subgenre(
     )
 
     return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Subgenre coverage audit (NY v0.12.0 — bruges af /audit_tv_subgenres)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def count_titles_by_subgenre(
+    subgenre_id: str,
+    media_type: str,
+) -> int:
+    """
+    Tæl hvor mange titler der matcher en subgenre for et givent media_type.
+
+    Bruges af audit-kommandoen til at finde:
+      - Stærke subgenrer (>20 titler)
+      - Svage subgenrer (1-20 titler)
+      - Tomme subgenrer (0 titler)
+
+    Args:
+      subgenre_id: ID fra subgenre_service.SUBGENRES (fx 'horror_slasher')
+      media_type:  'movie' eller 'tv'
+
+    Returns:
+      Antal titler i tmdb_metadata der matcher (status='fetched').
+      Returnerer 0 hvis subgenre_id er ukendt eller ingen matches.
+
+    SQL-strategi:
+      Samme WHERE clause som find_films_by_subgenre, men bare COUNT(*).
+      Bruger GIN-index på keywords-kolonnen for hurtig lookup.
+    """
+    from services.subgenre_service import get_subgenre
+
+    subgenre = get_subgenre(subgenre_id)
+    if subgenre is None:
+        logger.warning("count_titles_by_subgenre: ukendt subgenre_id='%s'", subgenre_id)
+        return 0
+
+    keywords:   list[str]    = subgenre["keywords"]
+    plex_genre: str | None   = subgenre["plex_genre"]
+
+    if not keywords:
+        return 0
+
+    where_parts: list[str] = [
+        "status = 'fetched'",
+        "media_type = $1",
+        "keywords ?| $2::text[]",
+    ]
+    params: list = [media_type, keywords]
+
+    if plex_genre:
+        tmdb_genre_alts = _plex_genre_to_tmdb(plex_genre)
+        where_parts.append("tmdb_genres ?| $3::text[]")
+        params.append(tmdb_genre_alts)
+
+    where_clause = " AND ".join(where_parts)
+
+    sql = f"""
+        SELECT COUNT(*) AS cnt
+        FROM tmdb_metadata
+        WHERE {where_clause}
+    """
+
+    try:
+        async with _pool_ref().acquire() as conn:
+            row = await conn.fetchrow(sql, *params)
+        return row["cnt"] if row else 0
+    except Exception as e:
+        logger.error("count_titles_by_subgenre SQL-fejl for '%s'/%s: %s",
+                     subgenre_id, media_type, e)
+        return 0

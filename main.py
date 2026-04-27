@@ -1,42 +1,20 @@
 """
 main.py - Buddy bot entry point.
 
-CHANGES vs previous version (v0.11.0 — Etape 3 af subgenre-projekt):
-  - 🎉 STOR REFAKTORERING: Hele 'Hvad skal jeg se?' flow erstattet.
-    Det gamle AI-prompt-baserede flow med 17 stemninger er fjernet.
-    Det nye flow er datadrevet via subgenre_service + find_unwatched_v2.
+CHANGES vs previous version (v0.12.0 — audit værktøj):
+  - NY: cmd_audit_tv_subgenres admin-kommando.
+    Tester alle 36 subgenrer mod TV-data i tmdb_metadata.
+    Returnerer rapport med stærke/svage/tomme subgenrer + anbefaling.
+    Forberedelse til Etape C (TV-flow implementation).
+  - NY: /audit_tv_subgenres registreret i main() entry point.
 
-  - NYT 4-TRINS UI:
-    * Trin 1: Bundknap '🍿 Hvad skal jeg se?' (uændret reply keyboard)
-    * Trin 2: 9 kategori-knapper (1 pr. række) + Overrask + Afbryd
-    * Trin 3: 3-6 subgenre-knapper (1 pr. række) + Overrask + Tilbage + Afbryd
-    * Trin 4: 5 film-resultater (titel + ⭐ rating + /info_movie_X) +
-              4 actions (🔄 nye / ⏭️ næste subgenre / ⬅️ tilbage / ❌ færdig)
+UNCHANGED (v0.11.x — Etape 3 af subgenre-projekt):
+  - Hele 'Hvad skal jeg se?' flow datadrevet via subgenre_service + find_unwatched_v2.
+  - 4-trins UI: bundknap → 9 kategorier → 3-6 subgenrer → 5 forslag.
+  - Bestillingsflow, info-links, AI-handler, webhook-server, onboarding.
 
-  - KALDER find_unwatched_v2 DIREKTE — ingen AI-prompt construction.
-    Hurtigere (~2 sek vs 8-10 sek), billigere ($0 vs $0.01 per kald),
-    præcisere (datadrevet keyword-matching i stedet for genre-tag).
-
-  - SLETTET (~250 linjer død kode):
-    * WATCH_MOODS dictionary (17 stemninger med dansk/engelsk genre-mapping)
-    * WATCH_PAGES paginering (3 sider × 5-6 stemninger)
-    * _build_type_selection_keyboard, _build_mood_keyboard, _build_mood_message_text
-    * _build_watch_prompt (AI-prompt construction)
-    * handle_watch_type_callback, handle_watch_mood_callback, handle_watch_page_callback
-    * handle_watch_search_callback, handle_watch_surprise_callback (gammel version)
-    * _execute_ai_handoff (kæmpe AI-flow)
-
-  - BEVARET (al ikke-watch-flow funktionalitet):
-    * Bundknap-tekst '🍿 Hvad skal jeg se?' (brugervante)
-    * Alle admin-kommandoer (/test_v2, /seed_metadata, /fetch_metadata, etc.)
-    * Bestillingsflow (pick / confirm / cancel / back / watchlist)
-    * Info-links (/info_movie_X, /info_tv_X)
-    * AI-handler for fri-tekst (Claude med tools)
-    * Webhook-server (Radarr/Sonarr)
-    * Onboarding (Plex-username verification)
-
-  - VERSION CHECK opdateret til v0.11.0-beta.
-
+UNCHANGED (v0.12.1 — fix #1 double-fetch).
+UNCHANGED (v0.12.2 — brugerguide-link i cmd_start).
 UNCHANGED (v0.10.8 — /test_v2 admin DEBUG).
 UNCHANGED (v0.10.7 — fuld keyword-eksport).
 UNCHANGED (v0.10.6 — Step 2 af subgenre-projekt).
@@ -1878,6 +1856,132 @@ async def cmd_test_v2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# /audit_tv_subgenres — Admin-kommando til at audite TV subgenre-dækning
+# (NY v0.12.0 — forberedelse til Etape C TV-flow implementation)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def cmd_audit_tv_subgenres(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Test alle 36 subgenrer mod tmdb_metadata for media_type='tv'.
+
+    Returnerer rapport med:
+      - Stærke subgenrer (>20 serier)
+      - Svage subgenrer (1-20 serier)
+      - Tomme subgenrer (0 serier)
+      - Anbefaling om subgenrer skal skjules eller udvides
+
+    Bruges som forberedelse til at bygge TV Watch Flow.
+    """
+    user = update.effective_user
+    if user is None or user.id != config.ADMIN_TELEGRAM_ID:
+        return
+
+    await update.message.chat.send_action("typing")
+    loading = await update.message.reply_text(
+        "🔍 *Auditer TV Subgenres*\n\n"
+        "Tester alle 36 subgenrer mod TV-data...",
+        parse_mode="Markdown",
+    )
+
+    # Test alle subgenrer parallelt
+    sub_ids = list_subgenre_ids()
+
+    counts = await asyncio.gather(*[
+        database.count_titles_by_subgenre(sub_id, media_type="tv")
+        for sub_id in sub_ids
+    ])
+
+    # Build resultat-liste sorteret efter antal
+    results = [
+        (sub_id, count, get_subgenre(sub_id))
+        for sub_id, count in zip(sub_ids, counts)
+    ]
+    results.sort(key=lambda x: x[1], reverse=True)
+
+    # Kategoriser
+    strong = [r for r in results if r[1] > 20]
+    medium = [r for r in results if 1 <= r[1] <= 20]
+    empty  = [r for r in results if r[1] == 0]
+
+    # Hent total antal serier i database
+    try:
+        status = await database.get_metadata_status()
+        total_tv = status["by_media_type"]["tv"]["fetched"]
+    except Exception:
+        total_tv = 0
+
+    # Format rapport
+    lines = [
+        "📊 *TV Subgenre Coverage*",
+        "═══════════════════════",
+        "",
+        f"📺 *Total serier i database:* {total_tv:,}",
+        f"📋 *Subgenrer testet:* {len(sub_ids)}",
+        "",
+        f"✅ *Stærke (>20 serier):* {len(strong)}",
+        f"⚠️ *Svage (1-20 serier):* {len(medium)}",
+        f"❌ *Tomme (0 serier):* {len(empty)}",
+        "",
+    ]
+
+    if strong:
+        lines.append("✅ *STÆRKE SUBGENRER:*")
+        for sub_id, count, sub in strong:
+            label = sub["label"] if sub else sub_id
+            lines.append(f"  • {label} — *{count}* serier")
+        lines.append("")
+
+    if medium:
+        lines.append("⚠️ *SVAGE SUBGENRER (1-20):*")
+        for sub_id, count, sub in medium:
+            label = sub["label"] if sub else sub_id
+            lines.append(f"  • {label} — *{count}* serier")
+        lines.append("")
+
+    if empty:
+        lines.append("❌ *TOMME SUBGENRER (0 serier):*")
+        for sub_id, count, sub in empty:
+            label = sub["label"] if sub else sub_id
+            lines.append(f"  • {label}")
+        lines.append("")
+
+    # Anbefaling
+    lines.append("💡 *ANBEFALING:*")
+    if len(empty) > 0:
+        lines.append(f"  • Skjul {len(empty)} tomme subgenrer for TV-mode")
+    if len(strong) >= 25:
+        lines.append("  • God dækning — byg TV-flow med eksisterende katalog")
+    elif len(strong) >= 15:
+        lines.append("  • OK dækning — overvej at tilføje 2-3 TV-specifikke subgenrer")
+    else:
+        lines.append("  • Lav dækning — anbefaler at tilføje TV-specifikke subgenrer")
+
+    report = "\n".join(lines)
+
+    # Telegram begrænser beskeder til 4096 tegn — split hvis nødvendigt
+    try:
+        await loading.delete()
+    except Exception:
+        pass
+
+    if len(report) <= 3500:
+        await update.message.reply_text(report, parse_mode="Markdown")
+    else:
+        # Split ved tom linje før 3500 chars
+        split_at = report.rfind("\n\n", 0, 3500)
+        if split_at == -1:
+            split_at = 3500
+        await update.message.reply_text(report[:split_at], parse_mode="Markdown")
+        await asyncio.sleep(0.3)
+        await update.message.reply_text(report[split_at:], parse_mode="Markdown")
+
+    logger.info(
+        "audit_tv_subgenres: %d stærke, %d svage, %d tomme af %d total",
+        len(strong), len(medium), len(empty), len(sub_ids),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Markdown helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2068,10 +2172,6 @@ async def handle_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         pass
     await show_search_results(query.message, search_query, media_type)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# /info_movie_<id> og /info_tv_<id> handler (uændret)
-# ══════════════════════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════════════════════
 # /info_movie_<id> og /info_tv_<id> handler (v0.12.1 — fix #1 double-fetch)
@@ -2332,9 +2432,10 @@ async def on_startup(application: Application) -> None:
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — v0.11.0-beta | "
+        "VERSION CHECK — v0.12.0-beta | "
         "subgenre-watch-flow: JA | tmdb-metadata-cache: JA | "
         "find-unwatched-v2: JA | test-v2-cmd: JA | "
+        "audit-tv-subgenres: JA | "
         "top-keywords-dump: JA | gammel-watch-moods: SLETTET"
     )
 
@@ -2373,6 +2474,9 @@ def main() -> None:
 
     # Etape 2 debug-kommando
     app.add_handler(CommandHandler("test_v2",         cmd_test_v2))
+
+    # Etape C forberedelse — TV subgenre audit (NY v0.12.0)
+    app.add_handler(CommandHandler("audit_tv_subgenres", cmd_audit_tv_subgenres))
 
     # Admin approval
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve_user:\d+$"))
