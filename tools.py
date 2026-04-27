@@ -1,14 +1,25 @@
 """
 tools.py - Claude Tool Use definitions for Buddy.
 
-CHANGES vs previous version (v1.1.0 — recommend_from_seed combined tool):
+CHANGES vs previous version (v1.2.0 — Etape 4: find_unwatched_v2 som AI-tool):
+  - Tilføjet find_unwatched_v2: Dataversion af film-anbefalingstoolet baseret
+    på subgenre-systemet (36 subgenrer i 9 kategorier). Henter usete film fra
+    Plex der matcher specifikke TMDB-keywords + Plex-genre kombinationer.
+    Erstatter find_unwatched når brugeren beder om en specifik undergenre
+    (fx 'horror med slasher-vibe', 'heist film', 'tidsrejse-film').
+  - VIGTIGT: Description'en indeholder ALLE 36 subgenre-IDs så Claude kan
+    vælge den rigtige uden at skulle gætte. Subgenre-IDs er stabile og
+    kan kun ændres ved at opdatere SUBGENRES dict i subgenre_service.py.
+  - Bevarer find_unwatched som fallback for brede genre-spørgsmål.
+
+UNCHANGED (v1.1.0 — recommend_from_seed combined tool):
   - Tilføjet recommend_from_seed: Combined tool der erstatter sekvensen
     get_recommendations + N×check_plex_library + viewCount-filtrering med
     ét kald. Sparer 5-7 sekunder på anbefalingsflow.
     Returnerer KUN titler på Plex (og usete hvis only_unwatched=true).
 
 UNCHANGED (v1.0.4 — search_plex_by_actor instruktør-fix):
-  - search_plex_by_actor: Tilføjet eksplicit advarsel om atværktøjet KUN
+  - search_plex_by_actor: Tilføjet eksplicit advarsel om at værktøjet KUN
     finder skuespillerroller i Plex — ikke instruktørfilm.
 
 UNCHANGED (v0.9.4 — search_media year-filter):
@@ -296,8 +307,64 @@ TOOLS = [
         },
     },
     {
+        "name": "find_unwatched_v2",
+        "description": (
+            "PRIMÆRT VÆRKTØJ til subgenre-anbefalinger. "
+            "Find usete film i Plex der matcher en specifik undergenre via TMDB-keywords "
+            "+ Plex-genre kombinationer. Datadrevet — bruger forhandsindekserede "
+            "metadata for 6500+ film, så svar er hurtige (<2 sek) og præcise.\n\n"
+            "BRUG DETTE NÅR brugeren beder om en specifik undergenre (ikke en bred kategori):\n"
+            "  - 'find en heist film jeg ikke har set' → crime_heist\n"
+            "  - 'noget med tidsrejse' → scifi_time\n"
+            "  - 'vis mig en slasher' → horror_slasher\n"
+            "  - 'romantisk komedie' → comedy_romcom\n"
+            "  - 'Anden Verdenskrig film' → true_wwii\n"
+            "  - 'noget med superhelte' → action_superhero\n\n"
+            "BRUG IKKE dette hvis brugeren beder om brede genrer ('action', 'horror') "
+            "uden specifik undergenre — brug find_unwatched i stedet.\n\n"
+            "GYLDIGE SUBGENRE_IDS (vælg den der bedst matcher brugerens forespørgsel):\n"
+            "  Komedie:    comedy_dark, comedy_romcom, comedy_standup, comedy_satire\n"
+            "  Action:     action_superhero, action_martial, action_survival, action_roadtrip\n"
+            "  Gyser:      horror_psycho, horror_slasher, horror_creature, horror_supernatural\n"
+            "  Krimi:      crime_heist, crime_noir, crime_serialkiller, crime_mafia\n"
+            "  Sci-fi:     scifi_time, scifi_dystopia, scifi_alien, fantasy_magic\n"
+            "  Drama:      drama_youth, drama_tearjerker, drama_family, drama_love\n"
+            "  Familie:    family_cartoon, family_christmas, family_animal\n"
+            "  Sandt:      true_story, true_biography, true_wwii\n"
+            "  Speciel:    special_revenge, special_musical, special_lgbt, "
+            "special_sports, special_spy, special_indie\n\n"
+            "Returnerer: {status, subgenre, subgenre_label, results: [5 film med "
+            "tmdb_id og titel], stats}. Resultaterne er ALLEREDE filtreret til usete "
+            "film på Plex — vis dem direkte i ✅-format med /info_movie_X links.\n\n"
+            "VIGTIGT: Hvis status='missing', betyder det at brugeren har set alt i "
+            "den valgte subgenre. Foreslå da en relateret subgenre i stedet."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subgenre_id": {
+                    "type": "string",
+                    "description": (
+                        "Subgenre-ID fra listen ovenfor. Vaelg den der bedst matcher "
+                        "brugerens forespoergsel. Skal vaere lowercase + underscore."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Antal forslag at returnere. Standard 5. Maks 10.",
+                },
+            },
+            "required": ["subgenre_id"],
+        },
+    },
+    {
         "name": "find_unwatched",
-        "description": "Find tilfaeldige usete film eller serier i Plex.",
+        "description": (
+            "Find tilfaeldige usete film eller serier i Plex. "
+            "Brug dette til BREDE genre-spoergsmaal ('find noget action', 'en horror-film'). "
+            "For SPECIFIKKE undergenrer ('heist', 'slasher', 'tidsrejse') — brug i "
+            "stedet find_unwatched_v2 som er hurtigere og mere praecis."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {

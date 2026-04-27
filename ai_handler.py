@@ -1,34 +1,28 @@
 """
 ai_handler.py - Agentic loop for Buddy.
 
-CHANGES vs previous version (v1.0.8 — recommend_from_seed dispatch):
+CHANGES vs previous version (v1.0.9 — Etape 4: find_unwatched_v2 dispatch):
+  - Tilføjet dispatch case for find_unwatched_v2 (subgenre-baseret anbefaling).
+    Komplementerer den eksisterende find_unwatched (brede genrer) ved at
+    tilbyde præcis matching mod 36 specifikke undergenrer.
+  - Importeret find_unwatched_v2 fra services.v2_service.
+  - Brugeren kan nu skrive 'find en heist film' og få direkte resultat
+    via subgenre-systemet i stedet for at gå gennem Watch Flow knapperne.
+
+UNCHANGED (v1.0.8 — recommend_from_seed dispatch):
   - Tilføjet dispatch case for recommend_from_seed (P1 combined tool).
     Sparer 5-7s på anbefalingsflow ved at samle 7+ tool-calls til 1.
-  - Importeret recommend_from_seed fra services.plex_service.
 
 UNCHANGED (v1.0.7 — max_tokens fix for store filmografier):
   - max_tokens: 1500 → 4000.
-    Årsag: Mads Mikkelsens 68 cast-credits genererede svar på 1500+ output
-    tokens (68 linjer med titler, ID'er og status-emojis). Buddy ramte
-    max_tokens-grænsen og afsluttede med "(Svaret blev afbrudt for at spare
-    plads — spørg endelig hvis du vil have resten med!)".
-    4000 giver god margen selv til 100+ film uden væsentlig omkostningsstigning,
-    da grænsen kun rammes ved meget lange svar.
 
 UNCHANGED (v1.0.6 — P0 patch: changelog-kode mismatch fix):
-  - _MAX_TOOL_RESULT_CHARS = 12000 (var 6000 trods v1.0.5 changelog).
-  - _slim_data() default max_list_items=40 (var 10).
+  - _MAX_TOOL_RESULT_CHARS = 12000.
+  - _slim_data() default max_list_items=40.
 
-UNCHANGED (v1.0.5 — filmografi token-fix dokumenteret men ikke deployet):
-  - _MAX_TOOL_RESULT_CHARS: dokumenteret som 6000 → 12000 (rettet i v1.0.6).
-  - _slim_data max_list_items: dokumenteret som 10 → 40 (rettet i v1.0.6).
-
-UNCHANGED (v0.9.9 — get_recently_added fix):
-  - get_recently_added() kaldes uden plex_username argument.
-
-UNCHANGED (v0.9.5 — user_first_name fix):
-  - get_ai_response() har fået user_first_name: str | None = None parameter.
-
+UNCHANGED (v1.0.5 — filmografi token-fix dokumenteret men ikke deployet).
+UNCHANGED (v0.9.9 — get_recently_added fix).
+UNCHANGED (v0.9.5 — user_first_name fix).
 UNCHANGED:
   - v0.9.4: search_media year-filter videresendes til tmdb_service.
   - INFO_SIGNAL, TRAILER_SIGNAL, SEARCH_SIGNAL — uændret.
@@ -82,6 +76,7 @@ from services.tautulli_service import (
     get_user_history,
     get_user_watch_stats,
 )
+from services.v2_service import find_unwatched_v2
 from services.web_service import search_web
 from tools import TOOLS
 
@@ -224,6 +219,13 @@ async def _dispatch(tool_name: str, tool_input: dict, plex_username: str | None)
     if tool_name == "find_unwatched":
         return j(await find_unwatched(
             tool_input["media_type"], tool_input.get("genre"), plex_username
+        ))
+    if tool_name == "find_unwatched_v2":
+        # Etape 4: subgenre-baseret anbefaling via v2_service
+        return j(await find_unwatched_v2(
+            subgenre_id=tool_input["subgenre_id"],
+            plex_username=plex_username,
+            limit=tool_input.get("limit", 5),
         ))
     if tool_name == "get_similar_in_library":
         return j(await get_similar_in_library(tool_input["title"], plex_username))
