@@ -1,17 +1,33 @@
 """
 database.py - PostgreSQL connection pool, table management,
-user whitelist, Plex username storage, onboarding state and interaction logging.
+user whitelist, Plex username storage, onboarding state, interaktionshistorik,
+pending requests OG TMDB metadata-cache.
 
-CHANGES vs previous version:
-  - Tilføjet persona_id kolonne til users-tabellen.
-  - Tilføjet get_persona() og set_persona() funktioner.
-  - Added `onboarding_state` column to `users` table so Railway restarts
-    never lose users mid-onboarding (replaces the in-memory set in main.py).
-  - Log pruning now uses a single DELETE with ORDER BY + OFFSET instead of
-    a correlated subquery, which is faster on large tables.
+CHANGES vs previous version (v0.12.0 — audit helper):
+  - NY: count_titles_by_subgenre(subgenre_id, media_type) → int
+    Tæller hvor mange titler der matcher en subgenre for et givent media_type.
+    Bruges af /audit_tv_subgenres admin-kommando til at finde stærke/svage/
+    tomme subgenrer for TV-data.
+
+UNCHANGED (v0.11.0 — P0/P1 performance pakke):
+  - P0-2: log_message statistical DELETE (10% kald → 50% mindre DB-load).
+  - P1-3: CTE-baseret subgenre query (30-50ms hurtigere find_films_by_subgenre).
+
+UNCHANGED (v0.10.8 — Etape 1 af subgenre-projekt):
+  - find_films_by_subgenre(subgenre_id, limit=20) → list[dict]
+  - GIN-index på keywords-kolonnen til O(ms) lookup
+  - Smart blanding på Python-side (nye vs klassikere)
+
+UNCHANGED (v0.10.7 — fuld keyword-eksport):
+  - get_top_keywords har min_count parameter
+
+UNCHANGED (v0.10.6 — TMDB metadata cache):
+  - Ny tabel tmdb_metadata + GIN-indekser
 """
 
+import json
 import logging
+import random
 from datetime import datetime, timezone
 
 import asyncpg
@@ -22,8 +38,16 @@ logger = logging.getLogger(__name__)
 
 _pool: asyncpg.Pool | None = None
 
+# ── P0-2: Probability for log cleanup ─────────────────────────────────────────
+# Hver gang log_message kaldes, kører vi DELETE med denne sandsynlighed.
+# 0.1 = 10% af kaldene. Med 50 brugere × 20 beskeder/dag = 1000 logs/dag,
+# kører DELETE ~100 gange/dag i stedet for 1000 gange.
+_LOG_CLEANUP_PROBABILITY = 0.1
 
-# ── Schema ────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Schema — Users + Logs
+# ══════════════════════════════════════════════════════════════════════════════
 
 _CREATE_USERS_TABLE = """
 CREATE TABLE IF NOT EXISTS users (
@@ -63,7 +87,46 @@ CREATE INDEX IF NOT EXISTS idx_log_telegram_id
 """
 
 
-# ── Lifecycle ─────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Schema — TMDB metadata cache
+# ══════════════════════════════════════════════════════════════════════════════
+
+_CREATE_TMDB_METADATA_TABLE = """
+CREATE TABLE IF NOT EXISTS tmdb_metadata (
+    tmdb_id        INTEGER     NOT NULL,
+    media_type     TEXT        NOT NULL CHECK (media_type IN ('movie', 'tv')),
+    title          TEXT,
+    year           INTEGER,
+    tmdb_genres    JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    keywords       JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    status         TEXT        NOT NULL DEFAULT 'pending'
+                   CHECK (status IN ('pending', 'fetched', 'error', 'not_found')),
+    error_message  TEXT,
+    fetched_at     TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tmdb_id, media_type)
+);
+"""
+
+_CREATE_TMDB_STATUS_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_status
+    ON tmdb_metadata (status);
+"""
+
+_CREATE_TMDB_KEYWORDS_GIN = """
+CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_keywords
+    ON tmdb_metadata USING GIN (keywords);
+"""
+
+_CREATE_TMDB_GENRES_GIN = """
+CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_genres
+    ON tmdb_metadata USING GIN (tmdb_genres);
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Lifecycle
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def setup_db() -> None:
     global _pool
@@ -91,7 +154,9 @@ def _pool_ref() -> asyncpg.Pool:
     return _pool
 
 
-# ── User helpers ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# User helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def get_user(telegram_id: int) -> dict | None:
     """Return the full user row or None if not found."""
@@ -162,7 +227,9 @@ async def set_plex_username(telegram_id: int, plex_username: str) -> None:
     logger.info("plex_username='%s' saved for telegram_id=%s", plex_username, telegram_id)
 
 
-# ── Persona ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Persona
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def get_persona(telegram_id: int) -> str:
     """Returnér brugerens valgte persona_id. Falder tilbage til 'buddy'."""
@@ -183,7 +250,9 @@ async def set_persona(telegram_id: int, persona_id: str) -> None:
     logger.info("persona_id='%s' gemt for telegram_id=%s", persona_id, telegram_id)
 
 
-# ── Onboarding state ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Onboarding state
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def get_onboarding_state(telegram_id: int) -> str | None:
     """Return the user's current onboarding_state ('awaiting_plex' or None)."""
@@ -203,13 +272,19 @@ async def set_onboarding_state(telegram_id: int, state: str | None) -> None:
         )
 
 
-# ── Interaction log ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Interaction log (P0-2: Statistical cleanup)
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def log_message(
     telegram_id: int,
     direction: str,
     message_text: str,
 ) -> None:
+    """
+    Log en besked til interaction_log tabellen.
+    P0-2: DELETE kører kun statistisk hver 10. gang for at spare DB-load.
+    """
     async with _pool_ref().acquire() as conn:
         await conn.execute(
             """
@@ -218,19 +293,21 @@ async def log_message(
             """,
             telegram_id, direction, message_text, datetime.now(timezone.utc),
         )
-        await conn.execute(
-            """
-            DELETE FROM interaction_log
-            WHERE telegram_id = $1
-              AND id NOT IN (
-                  SELECT id FROM interaction_log
-                  WHERE telegram_id = $1
-                  ORDER BY logged_at DESC
-                  LIMIT $2
-              )
-            """,
-            telegram_id, LOG_HISTORY_LIMIT,
-        )
+
+        if random.random() < _LOG_CLEANUP_PROBABILITY:
+            await conn.execute(
+                """
+                DELETE FROM interaction_log
+                WHERE telegram_id = $1
+                  AND id NOT IN (
+                      SELECT id FROM interaction_log
+                      WHERE telegram_id = $1
+                      ORDER BY logged_at DESC
+                      LIMIT $2
+                  )
+                """,
+                telegram_id, LOG_HISTORY_LIMIT,
+            )
 
 
 async def get_all_whitelisted_users() -> list[dict]:
@@ -242,7 +319,9 @@ async def get_all_whitelisted_users() -> list[dict]:
     return [dict(row) for row in rows]
 
 
-# ── Pending requests ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Pending requests
+# ══════════════════════════════════════════════════════════════════════════════
 
 _CREATE_PENDING_REQUESTS_TABLE = """
 CREATE TABLE IF NOT EXISTS pending_requests (
@@ -275,7 +354,6 @@ async def setup_pending_requests() -> None:
 
 async def save_pending_request(token: str, telegram_id: int, data: dict) -> None:
     """Save media details for a pending confirmation."""
-    import json
     async with _pool_ref().acquire() as conn:
         await conn.execute(
             """
@@ -310,7 +388,6 @@ async def save_pending_request(token: str, telegram_id: int, data: dict) -> None
 
 async def get_pending_request(token: str) -> dict | None:
     """Retrieve and delete a pending request by token."""
-    import json
     async with _pool_ref().acquire() as conn:
         row = await conn.fetchrow(
             "DELETE FROM pending_requests WHERE token=$1 RETURNING *", token
@@ -329,3 +406,431 @@ async def delete_pending_requests_for_user(telegram_id: int) -> None:
         await conn.execute(
             "DELETE FROM pending_requests WHERE telegram_id=$1", telegram_id
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TMDB metadata cache (Etape 0 + 1)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def setup_tmdb_metadata_table() -> None:
+    """Opret tmdb_metadata tabellen + indekser. Idempotent."""
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(_CREATE_TMDB_METADATA_TABLE)
+        await conn.execute(_CREATE_TMDB_STATUS_INDEX)
+        await conn.execute(_CREATE_TMDB_KEYWORDS_GIN)
+        await conn.execute(_CREATE_TMDB_GENRES_GIN)
+    logger.info("tmdb_metadata table + indexes ready.")
+
+
+async def seed_tmdb_metadata(items: list[dict]) -> dict:
+    """Seed tmdb_metadata med pending records. Idempotent."""
+    if not items:
+        return {"inserted": 0, "skipped": 0, "total_input": 0}
+
+    insert_sql = """
+        INSERT INTO tmdb_metadata (tmdb_id, media_type, title, year, status)
+        VALUES ($1, $2, $3, $4, 'pending')
+        ON CONFLICT (tmdb_id, media_type) DO NOTHING
+    """
+
+    inserted = 0
+    async with _pool_ref().acquire() as conn:
+        async with conn.transaction():
+            for item in items:
+                tmdb_id = item.get("tmdb_id")
+                if not tmdb_id:
+                    continue
+                result = await conn.execute(
+                    insert_sql,
+                    tmdb_id,
+                    item.get("media_type"),
+                    item.get("title"),
+                    item.get("year"),
+                )
+                if result.endswith(" 1"):
+                    inserted += 1
+
+    skipped = len(items) - inserted
+    logger.info("seed_tmdb_metadata: %d inserted, %d skipped", inserted, skipped)
+    return {"inserted": inserted, "skipped": skipped, "total_input": len(items)}
+
+
+async def get_metadata_status() -> dict:
+    """Returnér optælling af records pr. status."""
+    async with _pool_ref().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT media_type, status, COUNT(*) AS cnt
+            FROM tmdb_metadata
+            GROUP BY media_type, status
+            """
+        )
+
+    result = {
+        "total":     0, "pending":   0, "fetched":   0,
+        "error":     0, "not_found": 0,
+        "by_media_type": {
+            "movie": {"total": 0, "pending": 0, "fetched": 0, "error": 0, "not_found": 0},
+            "tv":    {"total": 0, "pending": 0, "fetched": 0, "error": 0, "not_found": 0},
+        },
+    }
+
+    for row in rows:
+        media_type = row["media_type"]
+        status     = row["status"]
+        cnt        = row["cnt"]
+        result["total"] += cnt
+        result[status] = result.get(status, 0) + cnt
+        if media_type in result["by_media_type"]:
+            result["by_media_type"][media_type]["total"] += cnt
+            result["by_media_type"][media_type][status]   = (
+                result["by_media_type"][media_type].get(status, 0) + cnt
+            )
+
+    return result
+
+
+async def get_pending_metadata(limit: int = 100, include_errors: bool = False) -> list[dict]:
+    """Hent næste batch af records der skal fetches fra TMDB."""
+    if include_errors:
+        status_filter = "status IN ('pending', 'error')"
+    else:
+        status_filter = "status = 'pending'"
+
+    sql = f"""
+        SELECT tmdb_id, media_type, title, year
+        FROM tmdb_metadata
+        WHERE {status_filter}
+        ORDER BY created_at ASC
+        LIMIT $1
+    """
+
+    async with _pool_ref().acquire() as conn:
+        rows = await conn.fetch(sql, limit)
+
+    return [dict(row) for row in rows]
+
+
+async def update_metadata_success(
+    tmdb_id: int,
+    media_type: str,
+    tmdb_genres: list[str],
+    keywords: list[str],
+    title: str | None = None,
+    year: int | None = None,
+) -> None:
+    """Marker en record som 'fetched' og gem TMDB-data."""
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE tmdb_metadata
+            SET status        = 'fetched',
+                tmdb_genres   = $3::jsonb,
+                keywords      = $4::jsonb,
+                title         = COALESCE($5, title),
+                year          = COALESCE($6, year),
+                error_message = NULL,
+                fetched_at    = NOW()
+            WHERE tmdb_id = $1 AND media_type = $2
+            """,
+            tmdb_id, media_type,
+            json.dumps(tmdb_genres), json.dumps(keywords),
+            title, year,
+        )
+
+
+async def update_metadata_error(
+    tmdb_id: int,
+    media_type: str,
+    error_message: str,
+    is_not_found: bool = False,
+) -> None:
+    """Marker en record som 'error' eller 'not_found'."""
+    status = "not_found" if is_not_found else "error"
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE tmdb_metadata
+            SET status        = $3,
+                error_message = $4,
+                fetched_at    = NOW()
+            WHERE tmdb_id = $1 AND media_type = $2
+            """,
+            tmdb_id, media_type, status, error_message,
+        )
+
+
+async def get_top_keywords(
+    media_type: str | None = None,
+    limit: int | None = 50,
+    min_count: int = 1,
+) -> list[dict]:
+    """Find de mest brugte keywords i samlingen."""
+    where_parts: list[str] = ["status = 'fetched'"]
+    params: list = []
+    param_idx = 1
+
+    if media_type in ("movie", "tv"):
+        where_parts.append(f"media_type = ${param_idx}")
+        params.append(media_type)
+        param_idx += 1
+
+    where_clause = " AND ".join(where_parts)
+
+    having_clause = ""
+    if min_count > 1:
+        having_clause = f"HAVING COUNT(*) >= ${param_idx}"
+        params.append(min_count)
+        param_idx += 1
+
+    limit_clause = ""
+    if limit is not None:
+        limit_clause = f"LIMIT ${param_idx}"
+        params.append(limit)
+
+    sql = f"""
+        SELECT keyword, COUNT(*) AS cnt
+        FROM tmdb_metadata,
+             jsonb_array_elements_text(keywords) AS keyword
+        WHERE {where_clause}
+        GROUP BY keyword
+        {having_clause}
+        ORDER BY cnt DESC
+        {limit_clause}
+    """
+
+    async with _pool_ref().acquire() as conn:
+        rows = await conn.fetch(sql, *params)
+
+    return [{"keyword": row["keyword"], "count": row["cnt"]} for row in rows]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Subgenre lookup
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Mapping fra dansk Plex-genre til engelske TMDB-genrer.
+_PLEX_TO_TMDB_GENRE = {
+    "Komedie":      ["Comedy"],
+    "Gyser":        ["Horror"],
+    "Kriminalitet": ["Crime"],
+    "Familie":      ["Family"],
+    "Romantik":     ["Romance"],
+    "Krig":         ["War"],
+    "Mysterium":    ["Mystery"],
+    "Musik":        ["Music"],
+    "Historie":     ["History"],
+    "Action":       ["Action"],
+    "Drama":        ["Drama"],
+    "Thriller":     ["Thriller"],
+    "Adventure":    ["Adventure"],
+    "Fantasy":      ["Fantasy"],
+    "Sci-fi":       ["Science Fiction"],
+    "Animation":    ["Animation"],
+    "Documentary":  ["Documentary"],
+    "Western":      ["Western"],
+    "Biography":    ["Drama"],
+    "Musical":      ["Music"],
+}
+
+
+def _plex_genre_to_tmdb(plex_genre: str) -> list[str]:
+    """Konverter et Plex-genre-navn til en liste af tilsvarende TMDB-genrer."""
+    return _PLEX_TO_TMDB_GENRE.get(plex_genre, [plex_genre])
+
+
+async def find_films_by_subgenre(
+    subgenre_id: str,
+    limit: int = 30,
+) -> list[dict]:
+    """
+    Find film der matcher en subgenre (keywords + valgfri Plex-genre).
+
+    P1-3 OPTIMERING (v0.11.0):
+      CTE-baseret query der filtrerer FØRST, derefter randomiserer.
+      30-50ms hurtigere på populære subgenrer.
+
+    Smart-blanding strategi:
+      Vi henter et bredt udsnit (limit*3 candidates), deler i nye/klassikere
+      buckets på Python-side og fletter dem alternativt.
+    """
+    from services.subgenre_service import get_subgenre
+
+    subgenre = get_subgenre(subgenre_id)
+    if subgenre is None:
+        logger.warning("find_films_by_subgenre: ukendt subgenre_id='%s'", subgenre_id)
+        return []
+
+    keywords:   list[str]    = subgenre["keywords"]
+    plex_genre: str | None   = subgenre["plex_genre"]
+
+    if not keywords:
+        logger.warning("find_films_by_subgenre: subgenre '%s' har ingen keywords", subgenre_id)
+        return []
+
+    fetch_limit = limit * 3
+
+    where_parts: list[str] = [
+        "status = 'fetched'",
+        "media_type = 'movie'",
+        "keywords ?| $1::text[]",
+    ]
+    params: list = [keywords]
+
+    if plex_genre:
+        tmdb_genre_alts = _plex_genre_to_tmdb(plex_genre)
+        where_parts.append("tmdb_genres ?| $2::text[]")
+        params.append(tmdb_genre_alts)
+
+    where_clause = " AND ".join(where_parts)
+
+    sql = f"""
+        WITH filtered AS (
+            SELECT tmdb_id, title, year, tmdb_genres, keywords
+            FROM tmdb_metadata
+            WHERE {where_clause}
+        )
+        SELECT tmdb_id, title, year, tmdb_genres, keywords
+        FROM filtered
+        ORDER BY RANDOM()
+        LIMIT ${len(params) + 1}
+    """
+    params.append(fetch_limit)
+
+    try:
+        async with _pool_ref().acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+    except Exception as e:
+        logger.error("find_films_by_subgenre SQL-fejl for '%s': %s", subgenre_id, e)
+        return []
+
+    current_year = datetime.now(timezone.utc).year
+    cutoff_year  = current_year - 5
+
+    new_films:    list[dict] = []
+    classic_films: list[dict] = []
+
+    for row in rows:
+        try:
+            tmdb_genres = json.loads(row["tmdb_genres"]) if isinstance(row["tmdb_genres"], str) else row["tmdb_genres"]
+        except Exception:
+            tmdb_genres = []
+        try:
+            kw_list = json.loads(row["keywords"]) if isinstance(row["keywords"], str) else row["keywords"]
+        except Exception:
+            kw_list = []
+
+        film_dict = {
+            "tmdb_id":     row["tmdb_id"],
+            "title":       row["title"] or "Ukendt",
+            "year":        row["year"],
+            "tmdb_genres": tmdb_genres or [],
+            "keywords":    kw_list or [],
+        }
+
+        if row["year"] and row["year"] >= cutoff_year:
+            new_films.append(film_dict)
+        else:
+            classic_films.append(film_dict)
+
+    result: list[dict] = []
+    new_idx, classic_idx = 0, 0
+    use_new = True
+
+    while len(result) < limit:
+        if use_new and new_idx < len(new_films):
+            result.append(new_films[new_idx])
+            new_idx += 1
+        elif not use_new and classic_idx < len(classic_films):
+            result.append(classic_films[classic_idx])
+            classic_idx += 1
+        elif new_idx < len(new_films):
+            result.append(new_films[new_idx])
+            new_idx += 1
+        elif classic_idx < len(classic_films):
+            result.append(classic_films[classic_idx])
+            classic_idx += 1
+        else:
+            break
+
+        use_new = not use_new
+
+    logger.info(
+        "find_films_by_subgenre: subgenre='%s' returnerede %d film "
+        "(plex_genre='%s', %d nye + %d klassikere af %d kandidater)",
+        subgenre_id, len(result), plex_genre or "ANY",
+        len(new_films), len(classic_films), len(rows),
+    )
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Subgenre coverage audit (NY v0.12.0 — bruges af /audit_tv_subgenres)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def count_titles_by_subgenre(
+    subgenre_id: str,
+    media_type: str,
+) -> int:
+    """
+    Tæl hvor mange titler der matcher en subgenre for et givent media_type.
+
+    Bruges af audit-kommandoen til at finde:
+      - Stærke subgenrer (>20 titler)
+      - Svage subgenrer (1-20 titler)
+      - Tomme subgenrer (0 titler)
+
+    Args:
+      subgenre_id: ID fra subgenre_service.SUBGENRES (fx 'horror_slasher')
+      media_type:  'movie' eller 'tv'
+
+    Returns:
+      Antal titler i tmdb_metadata der matcher (status='fetched').
+      Returnerer 0 hvis subgenre_id er ukendt eller ingen matches.
+
+    SQL-strategi:
+      Samme WHERE clause som find_films_by_subgenre, men bare COUNT(*).
+      Bruger GIN-index på keywords-kolonnen for hurtig lookup.
+    """
+    from services.subgenre_service import get_subgenre
+
+    subgenre = get_subgenre(subgenre_id)
+    if subgenre is None:
+        logger.warning("count_titles_by_subgenre: ukendt subgenre_id='%s'", subgenre_id)
+        return 0
+
+    keywords:   list[str]    = subgenre["keywords"]
+    plex_genre: str | None   = subgenre["plex_genre"]
+
+    if not keywords:
+        return 0
+
+    where_parts: list[str] = [
+        "status = 'fetched'",
+        "media_type = $1",
+        "keywords ?| $2::text[]",
+    ]
+    params: list = [media_type, keywords]
+
+    if plex_genre:
+        tmdb_genre_alts = _plex_genre_to_tmdb(plex_genre)
+        where_parts.append("tmdb_genres ?| $3::text[]")
+        params.append(tmdb_genre_alts)
+
+    where_clause = " AND ".join(where_parts)
+
+    sql = f"""
+        SELECT COUNT(*) AS cnt
+        FROM tmdb_metadata
+        WHERE {where_clause}
+    """
+
+    try:
+        async with _pool_ref().acquire() as conn:
+            row = await conn.fetchrow(sql, *params)
+        return row["cnt"] if row else 0
+    except Exception as e:
+        logger.error("count_titles_by_subgenre SQL-fejl for '%s'/%s: %s",
+                     subgenre_id, media_type, e)
+        return 0
