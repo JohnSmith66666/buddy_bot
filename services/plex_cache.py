@@ -1,260 +1,332 @@
 """
-services/v2_service.py - Datadrevet film-anbefalingsservice (Etape 2).
+services/plex_cache.py - Per-bruger TTL-cache for Plex movie index.
 
-CHANGES (v0.2.0 — bruger plex_cache for konsistens og performance):
-  - REFAKTOR: _build_plex_movie_index er FJERNET (flyttet til plex_cache.py).
-  - REFAKTOR: _enrich_and_filter_sync er splittet — cache-lookup sker nu
-    async via plex_cache.get_plex_movie_index, så vi får TTL-fordelene.
-  - PERFORMANCE: Andet+kald inden for 5 min er ~1ms i stedet for ~1-2 sek.
-  - BUG FIX: _check_sync (i plex_service) bruger nu samme cache, så vi får
-    konsistente svar mellem find_unwatched_v2 og show_confirmation. Tidligere
-    kunne en film være "i Plex" iflg. v2 men "ikke i Plex" iflg. _check_sync's
-    Lag 0 GUID-tjek (`section.search(guid=...)` fejler intermittent for nogle film).
+CHANGES (v0.1.0 — initial implementation, fix til "Tilføj til Plex"-bug):
+  - NY: get_plex_movie_index(plex_username) — TTL-cached lookup
+    Bygger {tmdb_id: PlexItem} index for én bruger og cacher det i 5 min.
+    Genbruges af BÅDE find_unwatched_v2 OG _check_sync's Lag 0.
 
-UNCHANGED (v0.1.0 — initial Etape 2):
-  - find_unwatched_v2() async API uændret.
-  - DB → Plex cross-check → unwatched-filter → smart-blanding logik uændret.
-  - Status-format ('ok'/'missing'/'error') uændret.
+  - PROBLEM DETTE LØSER:
+    Før denne cache havde vi to forskellige Plex-tjek der kunne svare
+    forskelligt for samme film:
+    1. find_unwatched_v2 → _build_plex_movie_index (section.all() + GUID)
+       FANDT filmen ✅
+    2. _check_sync Lag 0 → section.search(guid='tmdb://X')
+       FANDT IKKE filmen ❌ (Plex's GUID-index er ikke altid synkron)
+    Resultat: Brugeren så 'Tilføj til Plex' selvom filmen var i biblioteket.
 
-ARKITEKTUR:
-  v2-service genbruger nu plex_cache for film-index. Det betyder:
-    - 1 enkelt sandhed for "hvilke film har vi i Plex?"
-    - Cachen deles mellem find_unwatched_v2 og _check_sync
-    - Ingen duplikeret Plex-scanning
+  - LØSNING:
+    Begge funktioner bruger nu samme cache → samme datakilde →
+    konsistente svar. Cache bygges via section.all() + manuel GUID-extract,
+    som er den mest pålidelige metode.
 
-DESIGN-PRINCIPPER:
-  - Database-laget kender intet om Plex.
-  - Plex-laget kender intet om subgenrer.
-  - Denne fil er FLISEN der binder dem sammen.
-  - Returnerer struktureret status-dict — kaster ALDRIG exceptions ud i
-    AI-laget. Fejl logges og returneres som status='error'.
+DESIGN:
+  - Per-bruger: hver Plex-username får sin egen cache (admin, Home Users)
+  - TTL: 5 minutter — kort nok til at fange viewCount-ændringer,
+    langt nok til at give massiv performance-boost ved gentagne kald
+  - Async lock: forhindrer race condition hvor 2 samtidige requests
+    bygger samme cache parallelt
+  - Lazy: cache bygges kun når en bruger rent faktisk har brug for den
+  - Self-cleanup: udløbne cache-entries fjernes automatisk ved næste GET
+
+PERFORMANCE:
+  - Cold cache (første kald): ~1-2 sek (section.all() over hele biblioteket)
+  - Warm cache (subsequent): ~1ms (dict lookup)
+  - RAM: ~5MB per bruger med 6.500 film (PlexItem-referencer)
+
+USAGE:
+  from services.plex_cache import get_plex_movie_index
+
+  index = await get_plex_movie_index(plex_username="stream365_admin")
+  plex_item = index.get(tmdb_id)  # None hvis ikke i biblioteket
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
-import random
+import time
 from functools import partial
-
-from services.plex_cache import get_plex_movie_index
-from services.plex_service import _slim
-from services.subgenre_service import get_subgenre, validate_subgenre_id
 
 logger = logging.getLogger(__name__)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Cache-konstanter
+# ══════════════════════════════════════════════════════════════════════════════
+
+_CACHE_TTL_SECS = 300  # 5 minutter
+
+# Special key for None plex_username (bruger admin-token)
+_ADMIN_KEY = "__admin__"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Public API — find_unwatched_v2
+# Cache state (per-process, nulstilles ved Railway redeploy)
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def find_unwatched_v2(
-    subgenre_id: str,
+# Format: {cache_key: (built_at_unix_timestamp, {tmdb_id: PlexItem})}
+_cache: dict[str, tuple[float, dict[int, object]]] = {}
+
+# Per-bruger lock så vi ikke bygger samme cache parallelt
+# ved 2 samtidige requests fra samme bruger
+_locks: dict[str, asyncio.Lock] = {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Public API — async variant
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def get_plex_movie_index(
     plex_username: str | None = None,
-    limit: int = 5,
-) -> dict:
+) -> dict[int, object]:
     """
-    Find usete film i Plex der matcher en subgenre.
-
-    Flow (4 trin):
-      1. DB:    Hent kandidat-tmdb_ids fra tmdb_metadata via subgenre keywords
-      2. Plex:  Hent cached {tmdb_id → PlexItem} index (bygges hvis cold)
-      3. Match: Behold kun film der findes i Plex
-      4. Filter: Behold kun film med viewCount == 0 (usete)
-      5. Output: Random sample af 'limit' film, slim-format
+    Hent {tmdb_id: PlexItem} index for en bruger med 5-min TTL-cache.
 
     Args:
-      subgenre_id:   ID fra subgenre_service (fx 'horror_slasher')
-      plex_username: Plex-brugernavn (None = admin, hvis Home User cache fejler)
-      limit:         Antal usete film at returnere (default 5)
+      plex_username: Plex-username eller None (bruger admin-token).
+                     Cache er per-bruger.
 
     Returns:
-      Success:
-        {
-          "status":         "ok",
-          "subgenre":       "horror_slasher",
-          "subgenre_label": "🪓 Motorsave & Ketchup",
-          "results":        [<slim-dict>, ...],
-          "stats": {
-            "db_candidates":  120,
-            "in_plex":        45,
-            "unwatched":      32,
-            "returned":       5,
-          },
-        }
+      dict mapping tmdb_id → PlexItem.
+      PlexItem.viewCount reflekterer den specifikke brugers watch-status.
+      Tom dict hvis Plex-forbindelsen fejler.
 
-      Empty (ingen matches eller alle set):
-        {"status": "missing", "subgenre": "...", "subgenre_label": "...", "stats": {...}}
+    Performance:
+      - Cold (første kald per bruger per 5 min): ~1-2 sek
+      - Warm (subsequent): ~1ms
 
-      Error (DB- eller Plex-fejl):
-        {"status": "error", "message": "..."}
-
-      Invalid subgenre:
-        {"status": "error", "message": "Ukendt subgenre: '...'"}
+    Thread-safety:
+      Bruger asyncio.Lock per bruger så samtidige kald deler samme cache-build
+      i stedet for at duplikere arbejdet.
     """
-    # Lazy import for at undgå circular dependency
-    import database
+    cache_key = _make_key(plex_username)
 
-    # ── 1. Validér subgenre ───────────────────────────────────────────────────
-    if not validate_subgenre_id(subgenre_id):
-        logger.warning("find_unwatched_v2: ukendt subgenre_id='%s'", subgenre_id)
-        return {
-            "status":  "error",
-            "message": f"Ukendt subgenre: '{subgenre_id}'",
-        }
-
-    subgenre       = get_subgenre(subgenre_id)
-    subgenre_label = subgenre["label"]
-
-    # ── 2. Hent kandidater fra DB ─────────────────────────────────────────────
-    # Vi henter et bredt udsnit (limit * 6) for at have luft til:
-    #   - Film der ikke er i Plex (matched mod cache)
-    #   - Film brugeren har set
-    #   - Random sample blandt resterende usete
-    db_fetch_limit = max(limit * 6, 30)
-
-    try:
-        db_films = await database.find_films_by_subgenre(
-            subgenre_id=subgenre_id,
-            limit=db_fetch_limit,
-        )
-    except Exception as e:
-        logger.error("find_unwatched_v2: DB-fejl for '%s': %s", subgenre_id, e)
-        return {
-            "status":  "error",
-            "message": f"Database-opslag fejlede: {e}",
-        }
-
-    if not db_films:
-        logger.info("find_unwatched_v2: '%s' — ingen DB-kandidater", subgenre_id)
-        return {
-            "status":         "missing",
-            "subgenre":       subgenre_id,
-            "subgenre_label": subgenre_label,
-            "stats": {
-                "db_candidates": 0,
-                "in_plex":       0,
-                "unwatched":     0,
-                "returned":      0,
-            },
-        }
-
-    # ── 3. Hent cached Plex-index (bygges hvis cold) ──────────────────────────
-    try:
-        plex_index = await get_plex_movie_index(plex_username)
-    except Exception as e:
-        logger.error("find_unwatched_v2: Plex-cache fejl for '%s': %s", plex_username, e)
-        return {
-            "status":  "error",
-            "message": f"Plex-opslag fejlede: {e}",
-        }
-
-    if not plex_index:
-        logger.warning("find_unwatched_v2: tomt Plex-index for '%s'", plex_username or "admin")
-        return {
-            "status":         "missing",
-            "subgenre":       subgenre_id,
-            "subgenre_label": subgenre_label,
-            "stats": {
-                "db_candidates": len(db_films),
-                "in_plex":       0,
-                "unwatched":     0,
-                "returned":      0,
-            },
-        }
-
-    # ── 4. Cross-check + filter (i thread pool så _slim ikke blokerer) ────────
-    try:
-        result = await asyncio.to_thread(
-            partial(
-                _filter_and_sample_sync,
-                db_films=db_films,
-                plex_index=plex_index,
-                limit=limit,
+    # ── Hurtig path: cache HIT ────────────────────────────────────────────────
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        built_at, index = cached
+        age = time.time() - built_at
+        if age < _CACHE_TTL_SECS:
+            logger.debug(
+                "plex_cache HIT for '%s' (age=%.0fs, %d film)",
+                plex_username or "admin", age, len(index),
             )
+            return index
+        # TTL udløbet — fjern fra cache og byg ny
+        logger.info(
+            "plex_cache TTL udløbet for '%s' (age=%.0fs) — rebuilds",
+            plex_username or "admin", age,
         )
-    except Exception as e:
-        logger.error("find_unwatched_v2: filter-fejl for '%s': %s", subgenre_id, e)
-        return {
-            "status":  "error",
-            "message": f"Filter-fejl: {e}",
-        }
+        _cache.pop(cache_key, None)
 
-    # ── 5. Tilføj subgenre-metadata + log ─────────────────────────────────────
-    result["subgenre"]       = subgenre_id
-    result["subgenre_label"] = subgenre_label
+    # ── Cache MISS — byg under per-bruger lock ────────────────────────────────
+    # Lock'en sikrer at hvis 2 requests rammer samme bruger samtidig,
+    # bygger vi cachen ÉN gang og deler resultatet.
+    lock = _locks.setdefault(cache_key, asyncio.Lock())
 
-    stats = result.get("stats", {})
-    logger.info(
-        "find_unwatched_v2: subgenre='%s' user='%s' — "
-        "%d DB → %d in Plex → %d unwatched → %d returned",
-        subgenre_id, plex_username or "admin",
-        stats.get("db_candidates", 0),
-        stats.get("in_plex",       0),
-        stats.get("unwatched",     0),
-        stats.get("returned",      0),
-    )
+    async with lock:
+        # Re-tjek cachen efter vi fik lock'en — en anden coroutine
+        # kan have bygget den mens vi ventede.
+        cached = _cache.get(cache_key)
+        if cached is not None:
+            built_at, index = cached
+            if time.time() - built_at < _CACHE_TTL_SECS:
+                logger.debug("plex_cache HIT efter lock-wait for '%s'", plex_username or "admin")
+                return index
 
-    return result
+        # Byg cachen
+        index = await _build_index(plex_username)
+        _cache[cache_key] = (time.time(), index)
+
+        logger.info(
+            "plex_cache rebuilt for '%s': %d film med TMDB GUID",
+            plex_username or "admin", len(index),
+        )
+        return index
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Synkron filter + sample (kører i thread pool)
+# Public API — sync variant (til _check_sync der allerede kører i thread pool)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _filter_and_sample_sync(
-    db_films: list[dict],
-    plex_index: dict[int, object],
-    limit: int,
-) -> dict:
+def get_plex_movie_index_sync(
+    plex_username: str | None = None,
+) -> dict[int, object]:
     """
-    Synkron del: cross-check DB-kandidater mod cached Plex-index, filter + sample.
+    Synkron variant af get_plex_movie_index.
 
-    Kører i thread pool fordi _slim(item) tilgår PlexItem-attributter der
-    potentielt udløser lazy loading (PlexAPI er synkron).
+    Bruges fra synkrone funktioner der allerede kører i thread pool
+    (fx _check_sync i plex_service.py). Tager samme cache som async-versionen
+    så de deler datakilde.
+
+    Args:
+      plex_username: Plex-username eller None (admin).
 
     Returns:
-      Status dict (uden subgenre-metadata — det tilføjes i find_unwatched_v2):
-        {"status": "ok"|"missing", "results": [...], "stats": {...}}
+      dict mapping tmdb_id → PlexItem. Tom dict ved fejl.
+
+    Thread-safety:
+      Modsat async-versionen bruger denne IKKE asyncio.Lock (det giver ingen
+      mening i synkron kontekst). I praksis er race conditions ufarlige fordi:
+      1. CPython's GIL gør dict.get/set atomic
+      2. Worst case er at 2 samtidige requests bygger samme cache parallelt
+         — den sidste til at skrive vinder, og begge får et gyldigt index
+      3. Cachen bygges sjældent (en gang per 5 min) så kollisioner er sjældne
+
+    Performance: Samme som async-versionen.
     """
-    in_plex:   list = []
-    unwatched: list = []
+    cache_key = _make_key(plex_username)
 
-    for db_film in db_films:
-        tmdb_id = db_film.get("tmdb_id")
-        if not tmdb_id:
-            continue
+    # ── Hurtig path: cache HIT ────────────────────────────────────────────────
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        built_at, index = cached
+        age = time.time() - built_at
+        if age < _CACHE_TTL_SECS:
+            logger.debug(
+                "plex_cache HIT (sync) for '%s' (age=%.0fs, %d film)",
+                plex_username or "admin", age, len(index),
+            )
+            return index
+        logger.info(
+            "plex_cache TTL udløbet (sync) for '%s' (age=%.0fs) — rebuilds",
+            plex_username or "admin", age,
+        )
+        _cache.pop(cache_key, None)
 
-        plex_item = plex_index.get(tmdb_id)
-        if plex_item is None:
-            continue
+    # ── Cache MISS — byg synkront ─────────────────────────────────────────────
+    index = _build_index_sync(plex_username)
+    _cache[cache_key] = (time.time(), index)
 
-        in_plex.append(plex_item)
+    logger.info(
+        "plex_cache rebuilt (sync) for '%s': %d film med TMDB GUID",
+        plex_username or "admin", len(index),
+    )
+    return index
 
-        # Watch-status: viewCount == 0 betyder ikke set
-        if not getattr(plex_item, "viewCount", 0):
-            unwatched.append(plex_item)
 
-    # ── Random sample af usete ────────────────────────────────────────────────
-    if not unwatched:
-        return {
-            "status": "missing",
-            "stats": {
-                "db_candidates": len(db_films),
-                "in_plex":       len(in_plex),
-                "unwatched":     0,
-                "returned":      0,
-            },
-        }
+# ══════════════════════════════════════════════════════════════════════════════
+# Cache management
+# ══════════════════════════════════════════════════════════════════════════════
 
-    sample_size = min(limit, len(unwatched))
-    chosen      = random.sample(unwatched, sample_size)
+def invalidate_plex_cache(plex_username: str | None = None) -> None:
+    """
+    Tving rebuild af cache for en specifik bruger ved næste get_plex_movie_index().
+
+    Bruges fx når:
+      - En film tilføjes til Plex via Radarr (vi vil have nye film med)
+      - Brugeren markerer noget som set (ikke kritisk pga. TTL)
+
+    Hvis plex_username er None, invalideres ALLE caches.
+    """
+    if plex_username is None:
+        count = len(_cache)
+        _cache.clear()
+        logger.info("plex_cache fully invalidated (%d brugere)", count)
+        return
+
+    cache_key = _make_key(plex_username)
+    if cache_key in _cache:
+        _cache.pop(cache_key, None)
+        logger.info("plex_cache invalidated for '%s'", plex_username)
+
+
+def get_cache_stats() -> dict:
+    """
+    Returnér diagnostic-info om cachen.
+    Bruges fx i admin-debug-kommandoer.
+    """
+    now = time.time()
+    entries = []
+    for key, (built_at, index) in _cache.items():
+        age = now - built_at
+        entries.append({
+            "user":         key if key != _ADMIN_KEY else "admin",
+            "age_seconds":  round(age, 1),
+            "ttl_remaining": max(0, round(_CACHE_TTL_SECS - age, 1)),
+            "film_count":   len(index),
+            "expired":      age >= _CACHE_TTL_SECS,
+        })
 
     return {
-        "status":  "ok",
-        "results": [_slim(item) for item in chosen],
-        "stats": {
-            "db_candidates": len(db_films),
-            "in_plex":       len(in_plex),
-            "unwatched":     len(unwatched),
-            "returned":      sample_size,
-        },
+        "cache_size":  len(_cache),
+        "ttl_seconds": _CACHE_TTL_SECS,
+        "entries":     entries,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Internal helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _make_key(plex_username: str | None) -> str:
+    """Normalisér plex_username til cache-key. None → admin."""
+    if plex_username is None:
+        return _ADMIN_KEY
+    return plex_username.strip().lower() or _ADMIN_KEY
+
+
+async def _build_index(plex_username: str | None) -> dict[int, object]:
+    """
+    Byg det egentlige index ved at scanne hele Plex film-biblioteket.
+    Kører i thread pool fordi PlexAPI er synkron.
+    """
+    try:
+        return await asyncio.to_thread(
+            partial(_build_index_sync, plex_username=plex_username)
+        )
+    except Exception as e:
+        logger.error("_build_index error for '%s': %s", plex_username or "admin", e)
+        return {}
+
+
+def _build_index_sync(plex_username: str | None) -> dict[int, object]:
+    """
+    Synkron implementering — kører i thread pool.
+
+    Bruger section.all() (hele biblioteket) i stedet for section.search()
+    for at undgå Plex' default-limit på 20 film. Hver film køres gennem
+    _extract_tmdb_id_from_guids så kun film med TMDB GUID inkluderes —
+    det er ~99% af biblioteket på en velvedligeholdt Plex-server.
+
+    Bemærk: Lazy import af plex_service-helpers for at undgå circular import.
+    """
+    from services.plex_service import (
+        _connect, _sections, _MOVIE_TYPE, _extract_tmdb_id_from_guids,
+    )
+
+    plex = _connect(plex_username)
+    if isinstance(plex, dict):
+        # _connect returnerer dict ved fejl
+        logger.warning(
+            "_build_index_sync: Plex-forbindelse fejlede for '%s': %s",
+            plex_username or "admin", plex,
+        )
+        return {}
+
+    sections = _sections(plex, _MOVIE_TYPE)
+    if not sections:
+        logger.warning(
+            "_build_index_sync: ingen film-sektioner for '%s'",
+            plex_username or "admin",
+        )
+        return {}
+
+    index: dict[int, object] = {}
+
+    for section in sections:
+        try:
+            all_items = section.all()
+        except Exception as e:
+            logger.warning(
+                "_build_index_sync: section.all() fejl '%s' for '%s': %s",
+                section.title, plex_username or "admin", e,
+            )
+            continue
+
+        for item in all_items:
+            tmdb_id = _extract_tmdb_id_from_guids(item)
+            if tmdb_id and tmdb_id not in index:
+                index[tmdb_id] = item
+
+    return index
