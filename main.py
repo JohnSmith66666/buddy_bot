@@ -1,6 +1,22 @@
 """
 main.py - Buddy bot entry point.
 
+CHANGES (v0.16.2 — Polish session, fundet i kode-review):
+  - FIX (Bug A): handle_admin_hint_callback har nu admin-guard for konsistens
+    med andre admin-callbacks (handle_admin_resolve_callback, handle_admin_seen_callback).
+  - FIX (Bug B): handle_feedback_reply_to_callback havde dobbelt query.answer()
+    der gav silent error i log. Validering er flyttet FØR første answer.
+  - FIX (Bug C): notify_admin_about_feedback oprettede ny telegram.Bot instans
+    PER notifikation (performance issue). Nu bruger vi _get_admin_bot_client()
+    der lazy-initaliserer og cacher én instans for hele bot-levetiden.
+  - FIX (Bug D): handle_admin_resolve/seen_callback fejlede edit på photo-
+    notifikationer. Tilføjet fallback til edit_message_caption for photo-beskeder.
+  - CLEANUP: Fjernet 5 unused imports (FEEDBACK_TYPES, SUBGENRES_MOVIE,
+    SUBGENRES_TV, detect_media_type, get_media_details).
+  - CLEANUP: Fjernet 4 lokale 'import time' statements — nu importeret én gang
+    i toppen af filen.
+  - CLEANUP: Fjernet 'import os as _os' alias — bruger 'os' direkte.
+
 CHANGES (v0.16.1 — Notifikationer flyttet til Admin-bot):
   - NY: notify_admin_about_feedback() bruger nu ADMIN_BOT_TOKEN (hvis sat)
     til at sende admin-notifikationen. Det betyder admin modtager beskeden
@@ -90,6 +106,7 @@ import random
 import re
 import sys
 import tempfile
+import time
 import traceback
 from aiohttp import web
 from collections import Counter
@@ -127,7 +144,6 @@ from services.confirmation_service import (
     show_search_results,
 )
 from services.feedback_service import (
-    FEEDBACK_TYPES,
     format_admin_notification,
     format_feedback_preview,
     format_user_thanks,
@@ -136,7 +152,6 @@ from services.feedback_service import (
     validate_feedback_type,
 )
 from services.plex_service import validate_plex_user
-from services.tmdb_service import get_media_details
 from services.tmdb_keywords_service import (
     fetch_metadata_batch,
     fetch_movie_metadata,
@@ -146,9 +161,6 @@ from services.tmdb_keywords_service import (
 from services.subgenre_service import (
     SUBGENRE_CATEGORIES_MOVIE,
     SUBGENRE_CATEGORIES_TV,
-    SUBGENRES_MOVIE,
-    SUBGENRES_TV,
-    detect_media_type,
     get_all_categories,
     get_category,
     get_category_for_subgenre,
@@ -207,8 +219,7 @@ FEEDBACK_STATE_TIMEOUT_SECONDS = 30 * 60  # 30 minutter
 # Username på admin-bot — bruges til deep-link fra Buddy's notifikation.
 # Hvis None eller tom, fallback'er knappen til at vise et hint i stedet.
 # Sættes via env-var ADMIN_BOT_USERNAME (uden @-prefix).
-import os as _os
-ADMIN_BOT_USERNAME: str = (_os.getenv("ADMIN_BOT_USERNAME") or "").strip().lstrip("@")
+ADMIN_BOT_USERNAME: str = (os.getenv("ADMIN_BOT_USERNAME") or "").strip().lstrip("@")
 
 # v0.16.1 — Admin-bot's token bruges til at sende notifikationer FRA admin-bot's
 # kanal (i stedet for Buddy main-kanalen). Dermed adskilles roller:
@@ -216,7 +227,35 @@ ADMIN_BOT_USERNAME: str = (_os.getenv("ADMIN_BOT_USERNAME") or "").strip().lstri
 #   • Admin = systembeskeder, notifikationer, admin-tools
 # Hvis env-varen ikke er sat, falder vi tilbage til at sende notifikationen
 # via Buddy main (gammel adfærd).
-ADMIN_BOT_TOKEN: str = (_os.getenv("ADMIN_BOT_TOKEN") or "").strip()
+ADMIN_BOT_TOKEN: str = (os.getenv("ADMIN_BOT_TOKEN") or "").strip()
+
+# v0.16.2 — Lazy-initialized admin-bot client. Genbruges på tværs af alle
+# notifikationer for at undgå at oprette ny HTTP-pool per kald (performance).
+_admin_bot_client = None
+
+
+def _get_admin_bot_client():
+    """
+    Lazy-init af admin-bot Bot-instans (v0.16.2 performance-fix).
+
+    Returnerer cached instans hvis allerede oprettet — ellers opretter
+    ny én gang og cacher den. Bruges af notify_admin_about_feedback().
+
+    Returns:
+      telegram.Bot instans, eller None hvis ADMIN_BOT_TOKEN ikke er sat.
+    """
+    global _admin_bot_client
+    if not ADMIN_BOT_TOKEN:
+        return None
+    if _admin_bot_client is None:
+        try:
+            from telegram import Bot as _AdminBot
+            _admin_bot_client = _AdminBot(token=ADMIN_BOT_TOKEN)
+            logger.info("Admin-bot client lazy-initialiseret")
+        except Exception as e:
+            logger.warning("Kunne ikke initialisere admin-bot client: %s", e)
+            return None
+    return _admin_bot_client
 
 
 def _media_label(media_type: str) -> str:
@@ -1043,7 +1082,7 @@ def _get_feedback_draft(context: ContextTypes.DEFAULT_TYPE) -> dict:
         "reply_to_id": 1,             # v0.16.0 — feedback ID hvis dette er svar tilbage
       }
     """
-    import time
+
     draft = context.user_data.get("feedback_draft")
     if draft is None:
         draft = {
@@ -1066,7 +1105,7 @@ def _is_feedback_state_expired(context: ContextTypes.DEFAULT_TYPE) -> bool:
       True hvis state har været aktivt mere end FEEDBACK_STATE_TIMEOUT_SECONDS,
       eller hvis draft slet ikke findes (corrupted state).
     """
-    import time
+
     draft = context.user_data.get("feedback_draft")
     if draft is None:
         return True
@@ -1136,7 +1175,7 @@ async def handle_feedback_type_callback(
     ft = get_feedback_type(type_id)
 
     # Gem feedback_type i draft + reset timestamp
-    import time
+
     draft = _get_feedback_draft(context)
     draft["feedback_type"] = type_id
     draft["message_parts"] = []
@@ -1585,15 +1624,24 @@ async def handle_admin_resolve_callback(
         return
 
     # Opdater notifikations-beskeden så admin ser at det er klaret
+    # v0.16.2: Hvis notifikationen er en photo-besked (har caption i stedet
+    # for text), bruger vi edit_message_caption som fallback.
     try:
         # Tilføj "✅ LØST" badge til den eksisterende besked
         original = query.message.text or query.message.caption or ""
         new_text = f"✅ *LØST*\n\n{original}"
         # Fjern knapper (de skal ikke kunne trykkes igen)
-        await query.edit_message_text(
-            text=new_text,
-            parse_mode="Markdown",
-        )
+        if query.message.text:
+            await query.edit_message_text(
+                text=new_text,
+                parse_mode="Markdown",
+            )
+        else:
+            # Photo-besked → brug edit_message_caption
+            await query.edit_message_caption(
+                caption=new_text,
+                parse_mode="Markdown",
+            )
     except Exception as e:
         logger.warning("handle_admin_resolve_callback edit fejl: %s", e)
         # Best-effort — feedback er stadig løst i DB selv om visning fejler
@@ -1637,13 +1685,20 @@ async def handle_admin_seen_callback(
         return
 
     # Opdater notifikations-beskeden — fjern knapperne men behold teksten
+    # v0.16.2: Photo-besked support via edit_message_caption fallback
     try:
         original = query.message.text or query.message.caption or ""
         new_text = f"👁 *SET*\n\n{original}"
-        await query.edit_message_text(
-            text=new_text,
-            parse_mode="Markdown",
-        )
+        if query.message.text:
+            await query.edit_message_text(
+                text=new_text,
+                parse_mode="Markdown",
+            )
+        else:
+            await query.edit_message_caption(
+                caption=new_text,
+                parse_mode="Markdown",
+            )
     except Exception as e:
         logger.warning("handle_admin_seen_callback edit fejl: %s", e)
 
@@ -1656,8 +1711,17 @@ async def handle_admin_hint_callback(
     """
     Fallback når ADMIN_BOT_USERNAME ikke er sat.
     Viser hint om at admin skal bruge admin-bot manuelt.
+
+    v0.16.2: Tilføjet admin-guard for konsistens med andre admin-callbacks.
     """
     query = update.callback_query
+    user  = query.from_user
+
+    # v0.16.2: Konsistent admin-only check (samme mønster som andre admin-callbacks)
+    if user.id != config.ADMIN_TELEGRAM_ID:
+        await query.answer("Kun admin kan bruge denne knap.", show_alert=True)
+        return
+
     parts = query.data.split(":", 1)
     fb_id = parts[1] if len(parts) == 2 else "?"
 
@@ -1680,19 +1744,24 @@ async def handle_feedback_reply_to_callback(
     Starter ny feedback-flow med pre-udfyldt "Re: \\#<id> " som første
     message_part. Brugeren kan så skrive deres svar og sende det som
     ny feedback der refererer til den oprindelige.
+
+    v0.16.2: Validering flyttet FØR første query.answer() for at undgå
+    dobbelt-answer warning fra Telegram API.
     """
     query = update.callback_query
-    await query.answer()
 
-    if not await _guard(update):
-        return
-
-    user = query.from_user
-
+    # v0.16.2: Validér FØR vi svarer på callbacken
     parts = query.data.split(":", 1)
     if len(parts) != 2 or not parts[1].isdigit():
         await query.answer("Ugyldig reference", show_alert=True)
         return
+
+    if not await _guard(update):
+        await query.answer()  # luk callback hvis guard fejler
+        return
+
+    await query.answer()
+    user = query.from_user
 
     original_feedback_id = int(parts[1])
 
@@ -1706,7 +1775,7 @@ async def handle_feedback_reply_to_callback(
         logger.warning("handle_feedback_reply_to_callback DB fejl: %s", e)
 
     # Initialiser ny feedback-draft som fortsættelse
-    import time
+
     _clear_feedback_draft(context)
     draft = _get_feedback_draft(context)
     draft["feedback_type"]       = original_type
@@ -1799,18 +1868,14 @@ async def notify_admin_about_feedback(
     # Hvis ADMIN_BOT_TOKEN er sat → brug admin-bot client (notifikationen
     # popper op i Buddy_admin-chatten, ikke Buddy main).
     # Ellers → fallback til Buddy main bot (gammel adfærd).
+    # v0.16.2: Bruger nu cached/lazy-init client i stedet for at oprette
+    # ny Bot-instans per notifikation (performance).
     notification_bot = context.bot  # default: Buddy main
     notification_via = "buddy_main"
-    if ADMIN_BOT_TOKEN:
-        try:
-            from telegram import Bot as _AdminBot
-            notification_bot = _AdminBot(token=ADMIN_BOT_TOKEN)
-            notification_via = "admin_bot"
-        except Exception as e:
-            logger.warning(
-                "Kunne ikke initialisere admin-bot client (%s) — falder tilbage til Buddy main",
-                e,
-            )
+    admin_client = _get_admin_bot_client()
+    if admin_client is not None:
+        notification_bot = admin_client
+        notification_via = "admin_bot"
 
     # Send tekst-besked
     try:
@@ -3736,14 +3801,15 @@ async def on_startup(application: Application) -> None:
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — v0.16.1-beta | "
+        "VERSION CHECK — v0.16.2-beta | "
         "feedback-system: JA (v3 inline-buttons) | media-aware-watch-flow: JA | "
         "tmdb-metadata-cache: JA | find-unwatched-v2: JA | "
         "test-v2-cmd: JA | audit-tv-subgenres: JA | "
         "top-keywords-dump: JA | first-time-tester-detect: JA | "
         "loading-spinner: JA | preview-step: JA | auto-timeout: JA | "
         "/cancel-cmd: JA | admin-inline-buttons: JA | reply-back-button: JA | "
-        "admin-notif-via-admin-bot: %s"
+        "admin-notif-via-admin-bot: %s | "
+        "polish-fixes: A,B,C,D"
         % ("JA" if ADMIN_BOT_TOKEN else "NEJ (fallback til Buddy)")
     )
     if not ADMIN_BOT_USERNAME:
