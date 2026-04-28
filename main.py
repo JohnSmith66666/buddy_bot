@@ -1,7 +1,18 @@
 """
 main.py - Buddy bot entry point.
 
-CHANGES (v0.14.0 — Feedback system):
+CHANGES (v0.15.0 — Batch A polering):
+  - NY: Loading-spinner ved feedback-submit. Når brugeren trykker '✅ Send'
+    vises straks "Sender din feedback... 🚀" — derefter erstattes beskeden
+    med tak/fejl. Forbedrer responsiv-følelsen markant for små momenter.
+  - NY: First-time tester detection. notify_admin_about_feedback() tjekker
+    via database.is_first_time_feedback() OM brugeren har sendt feedback
+    før. Hvis IKKE → admin-notifikationen får et tydeligt
+    "🆕 NY TESTER — første feedback nogensinde!" badge øverst.
+  - INGEN ANDRE ÆNDRINGER: Watch flow, AI-handler, alle admin-kommandoer
+    og bestillingsflow er uberørt.
+
+UNCHANGED (v0.14.0 — Feedback system):
   - NY KNAP: '💬 Feedback' tilføjet i bundmenuen ved siden af '🍿 Hvad skal jeg se?'.
     Knappen vises KUN efter Plex-onboarding er færdig (jvf. brugerens valg).
     _build_main_reply_keyboard() har nu 2 knapper i 2 rækker.
@@ -1160,6 +1171,25 @@ async def handle_feedback_submit_callback(
 
     await query.answer("Sender din feedback... 🚀")
 
+    # v0.15.0: Vis loading-spinner med det samme — submit-besked udskiftes
+    # når DB-write + admin-notifikation er færdig. Forbedrer responsivitet.
+    try:
+        await query.edit_message_text(
+            "🚀 *Sender din feedback...*\n\n_Et øjeblik..._",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+    # v0.15.0: Tjek FØR submit om brugeren har sendt feedback før.
+    # Skal være før submit_feedback() — efter submit findes der allerede
+    # mindst én record så funktionen ville altid returnere False.
+    is_first_time = False
+    try:
+        is_first_time = await database.is_first_time_feedback(user.id)
+    except Exception as e:
+        logger.warning("is_first_time_feedback fejl: %s", e)
+
     # Gem i DB
     try:
         feedback_id = await database.submit_feedback(
@@ -1196,7 +1226,9 @@ async def handle_feedback_submit_callback(
     try:
         feedback_row = await database.get_feedback(feedback_id)
         if feedback_row:
-            await notify_admin_about_feedback(context, feedback_row)
+            await notify_admin_about_feedback(
+                context, feedback_row, is_first_time=is_first_time,
+            )
     except Exception as e:
         logger.error("notify_admin_about_feedback fejl: %s", e)
 
@@ -1251,7 +1283,9 @@ async def _abort_feedback_flow(
 
 
 async def notify_admin_about_feedback(
-    context: ContextTypes.DEFAULT_TYPE, feedback: dict,
+    context: ContextTypes.DEFAULT_TYPE,
+    feedback: dict,
+    is_first_time: bool = False,
 ) -> None:
     """
     Send notifikation til admin via Buddy-bot direkte.
@@ -1262,12 +1296,17 @@ async def notify_admin_about_feedback(
 
     NB: Admin-botten har sin egen kanal hvor den lister alt feedback.
     DENNE notifikation er bare en "hej, der er noget nyt" via Buddy-chat.
+
+    v0.15.0: Tager nu 'is_first_time' parameter — videresendes til
+    format_admin_notification() der så tilføjer "🆕 NY TESTER" badge.
     """
     if not feedback:
         return
 
     admin_id = config.ADMIN_TELEGRAM_ID
-    notification_text = format_admin_notification(feedback)
+    notification_text = format_admin_notification(
+        feedback, is_first_time=is_first_time,
+    )
     file_ids = feedback.get("screenshot_file_ids", []) or []
 
     # Send tekst-besked
@@ -3117,11 +3156,12 @@ async def on_startup(application: Application) -> None:
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — v0.14.0-beta | "
-        "feedback-system: JA | media-aware-watch-flow: JA | "
+        "VERSION CHECK — v0.15.0-beta | "
+        "feedback-system: JA (v2 polish) | media-aware-watch-flow: JA | "
         "tmdb-metadata-cache: JA | find-unwatched-v2: JA | "
         "test-v2-cmd: JA | audit-tv-subgenres: JA | "
-        "top-keywords-dump: JA"
+        "top-keywords-dump: JA | first-time-tester-detect: JA | "
+        "loading-spinner: JA"
     )
 
 

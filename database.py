@@ -3,7 +3,13 @@ database.py - PostgreSQL connection pool, table management,
 user whitelist, Plex username storage, onboarding state, interaktionshistorik,
 pending requests, TMDB metadata-cache OG feedback-system.
 
-CHANGES vs previous version (v0.14.0 — feedback system):
+CHANGES (v0.14.1 — first-time tester detection):
+  - NY: is_first_time_feedback(telegram_id) → bool
+    Returnerer True hvis brugeren ALDRIG har sendt feedback før.
+    Bruges af main.py til at tagge admin-notifikationen med "🆕 NY TESTER"
+    så Jesper instant ved at det er en førstegangs-bruger.
+
+UNCHANGED (v0.14.0 — feedback system):
   - NY: feedback tabel + indekser til opsamling af bruger-feedback.
     Tabellen gemmer kategoriseret feedback (idea/bug/question/praise),
     Telegram screenshot file_ids som JSONB array, og admin-svar med
@@ -1225,3 +1231,30 @@ async def count_feedback_by_status() -> dict:
         "by_status": by_status,
         "by_type":   by_type,
     }
+
+
+async def is_first_time_feedback(telegram_id: int) -> bool:
+    """
+    Tjek om en bruger sender feedback for FØRSTE gang.
+
+    Skal kaldes FØR submit_feedback() — efter submit findes der allerede
+    mindst én record for brugeren, så funktionen ville altid returnere False.
+
+    Args:
+      telegram_id: Telegram bruger-ID
+
+    Returns:
+      True hvis brugeren har 0 feedback-records, False ellers.
+    """
+    async with _pool_ref().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM feedback WHERE telegram_id = $1
+            ) AS has_feedback
+            """,
+            telegram_id,
+        )
+
+    has_feedback = bool(row and row["has_feedback"])
+    return not has_feedback

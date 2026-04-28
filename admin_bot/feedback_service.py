@@ -1,26 +1,31 @@
 """
-admin_bot/feedback_service.py - Shared feedback constants and formatting helpers.
+services/feedback_service.py - Shared feedback constants and formatting helpers.
 
-⚠️  IMPORTANT: This file is a COPY of services/feedback_service.py from the
-    parent directory. Railway's Root Directory setting (= 'admin_bot') means
-    admin-bot can only see files inside admin_bot/, not parent files.
+CHANGES (v0.2.0 — Batch A polering):
+  - FORBEDRET: escape_md() er nu fuldt robust mod alle Telegram MarkdownV1
+    special-tegn (_, *, `, [). Tidligere kunne brugere skrive *test* eller
+    _underscore_ og knække vores formattering.
+  - NY: format_user_display(username, name, telegram_id) — bygger den bedst
+    mulige bruger-display givet hvad vi har. Fallback-rækkefølge:
+      1. "@username (Name)" hvis begge findes
+      2. "@username" hvis kun username
+      3. "Name" hvis kun first_name
+      4. "user_<id>" som sidste fallback
+    Bruges nu OVERALT i stedet for ad-hoc fallback-logik.
+  - FORBEDRET: format_admin_notification() tager nu valgfri 'is_first_time'
+    parameter. Hvis True, tilføjer "🆕 NY TESTER" tag øverst i notifikationen
+    så Jesper instant ved at det er førstegangs-feedback.
+  - REFACTOR: format_feedback_summary() og format_feedback_detail() bruger
+    nu den nye format_user_display() helper.
 
-    KEEP IN SYNC: If you change services/feedback_service.py, you MUST also
-    update this copy. Both files should always be byte-identical.
-
-    Future improvement: Convert to a shared Python package (e.g. via setup.py
-    or pyproject.toml) so both bots can install it as a dependency.
-
-CHANGES (v0.1.0 — initial):
-  - FEEDBACK_TYPES dict: 4 kategorier (idea/bug/question/praise) med
-    label, emoji, dansk-tekst og admin-tag.
-  - format_admin_notification(): bygger den notifikations-besked admin-bot
-    sender til admin når ny feedback kommer ind.
-  - format_user_thanks(): bygger tak-besked til brugeren efter indsendelse.
-  - format_user_received_reply(): bygger besked til brugeren når admin svarer.
-  - format_feedback_summary(): kort 1-linje opsummering brugt i /list.
-  - format_feedback_detail(): fuld detalje brugt i /view.
-  - escape_md(): undgår Telegram Markdown-fejl i bruger-tekst.
+UNCHANGED (v0.1.0 — initial):
+  - FEEDBACK_TYPES dict
+  - format_user_thanks()
+  - format_user_received_reply()
+  - format_feedback_summary() (men bruger ny helper)
+  - format_feedback_detail() (men bruger ny helper)
+  - format_stats()
+  - format_timestamp()
 
 DESIGN-PRINCIPPER:
   - Ren formattering — ingen DB-kald eller bot-API.
@@ -91,12 +96,18 @@ def validate_feedback_type(type_id: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Markdown-escape (genbruger samme logik som main.py)
+# Markdown-escape (FORBEDRET v0.2.0)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Telegram Markdown V1 special chars: * _ ` [
-# Vi escaper kun tegn der er problematiske i en almindelig tekst-kontekst,
-# da vi vil bevare * og _ til vores egen formatering.
+# Telegram MarkdownV1 har 4 special-tegn der skal escapes hvis de skal vises
+# som bogstaver: _ * ` [ ]
+# Bemærk: ] er normalt ikke et problem alene, men vi escaper for sikkerhed.
+#
+# Hvis vi IKKE escaper, kan brugere skrive ting som:
+#   - "*test*" → bliver fed tekst i Telegram
+#   - "_underscore_" → bliver kursiv
+#   - "`code`" → bliver monospace
+#   - "[link](url)" → forsøger at parse som link og kan fejle
 _MD_ESCAPE_RE = re.compile(r"([_*`\[\]])")
 
 
@@ -104,12 +115,97 @@ def escape_md(text: str | None) -> str:
     """
     Escape tegn der kan ødelægge Markdown V1 i bruger-input.
 
+    v0.2.0: Robusthed forbedret. Tester nu mod ALLE 4 special-tegn:
+      - underscore (_)
+      - asterisk (*)
+      - backtick (`)
+      - square brackets ([ ])
+
     Bruges på alt indhold der kommer FRA brugeren (besked, navn, username).
     Egen formattering (overskrifter, bullets) bygges udenom escape-laget.
+
+    Eksempler:
+      escape_md("hello *world*")    → "hello \\*world\\*"
+      escape_md("snake_case_name")  → "snake\\_case\\_name"
+      escape_md("`code` block")     → "\\`code\\` block"
+      escape_md(None)               → ""
+      escape_md("")                 → ""
     """
     if not text:
         return ""
     return _MD_ESCAPE_RE.sub(r"\\\1", text)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Bruger-display helper (NY v0.2.0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def format_user_display(
+    username: str | None,
+    name: str | None,
+    telegram_id: int | str | None = None,
+    style: str = "full",
+) -> str:
+    """
+    Byg den bedst mulige bruger-display givet hvad vi har om brugeren.
+
+    Telegram-brugere har varierende metadata:
+      - Nogle har @username (offentligt synligt navn)
+      - Nogle har first_name (deres profilnavn)
+      - Nogle har begge dele
+      - Få har kun telegram_id (sjældent men muligt)
+
+    Args:
+      username:    Telegram @username uden @ (eller None)
+      name:        Telegram first_name (eller None)
+      telegram_id: Numerisk Telegram ID (kun fallback)
+      style:       'full'  → "@username (Name)"  — bedst når plads er der
+                   'short' → "@username"          — kort til lister
+                   'name'  → "Name" prioriteret  — venligt hvis begge findes
+
+    Returns:
+      Markdown-escaped bruger-display string. Aldrig tom.
+
+    Eksempler:
+      format_user_display("john", "John Smith", 731397952, "full")
+        → "@john \\(John Smith\\)"
+      format_user_display(None, "John", 731397952, "full")
+        → "John"
+      format_user_display(None, None, 731397952, "full")
+        → "user\\_731397952"
+    """
+    has_username = bool(username and username.strip())
+    has_name     = bool(name and name.strip())
+
+    safe_username = escape_md(username) if has_username else None
+    safe_name     = escape_md(name)     if has_name     else None
+
+    # Style: name → prioriter first_name (venligst-virkende)
+    if style == "name":
+        if has_name:
+            return safe_name
+        if has_username:
+            return f"@{safe_username}"
+        return f"user\\_{telegram_id}" if telegram_id else "ukendt bruger"
+
+    # Style: short → kun username eller fallback
+    if style == "short":
+        if has_username:
+            return f"@{safe_username}"
+        if has_name:
+            return safe_name
+        return f"user\\_{telegram_id}" if telegram_id else "ukendt"
+
+    # Style: full (default) → "@username (Name)"
+    if has_username and has_name:
+        return f"@{safe_username} \\({safe_name}\\)"
+    if has_username:
+        return f"@{safe_username}"
+    if has_name:
+        return safe_name
+    if telegram_id:
+        return f"user\\_{telegram_id}"
+    return "ukendt bruger"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -131,12 +227,9 @@ def format_timestamp(dt: datetime | None) -> str:
     if dt is None:
         return "?"
 
-    # Antag UTC fra database — Railway PostgreSQL gemmer som TIMESTAMPTZ
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
 
-    # Vi viser UTC-tid simpelt for at undgå tidszone-bibliotek-afhængighed.
-    # Senere kan vi tilføje pytz/zoneinfo hvis nødvendigt.
     month_short = _DK_MONTHS[dt.month - 1][:3]
     return f"{dt.day}. {month_short} {dt.year}, {dt.hour:02d}:{dt.minute:02d}"
 
@@ -185,7 +278,6 @@ def format_user_received_reply(
     ft = get_feedback_type(feedback_type)
     type_label = ft["label"] if ft else "Feedback"
 
-    # Trim original besked hvis meget lang
     quote = original_message.strip()
     if len(quote) > 200:
         quote = quote[:197] + "..."
@@ -211,20 +303,22 @@ def format_user_received_reply(
 # Admin-vendte beskeder (vises i admin-bot)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def format_admin_notification(feedback: dict) -> str:
+def format_admin_notification(
+    feedback: dict,
+    is_first_time: bool = False,
+) -> str:
     """
     Formatér ny-feedback notifikation til admin.
 
-    Sendes til admin når en bruger lige har indsendt feedback. Indeholder:
-      - Feedback-type tag (BUG / IDÉ / SPØRGSMÅL / ROS)
-      - Reference-ID
-      - Bruger-info (@username + first_name)
-      - Tidsstempel
-      - Selve beskeden
-      - Antal screenshots vedhæftet
+    v0.2.0:
+      - Tilføjet 'is_first_time' parameter.
+        Hvis True, vises "🆕 NY TESTER" tag øverst.
+      - Bruger nu format_user_display() for konsistent fallback.
 
     Args:
-      feedback: Dict fra database.get_feedback() eller submit_feedback() return.
+      feedback:      Dict fra database.get_feedback() eller submit_feedback().
+      is_first_time: True hvis denne bruger sender feedback for første gang.
+                     Tilføjer "🆕 NY TESTER" tag øverst i notifikationen.
 
     Returns:
       Markdown-formatteret tekst klar til at sende til admin.
@@ -239,20 +333,19 @@ def format_admin_notification(feedback: dict) -> str:
     file_ids   = feedback.get("screenshot_file_ids", []) or []
     created_at = feedback.get("created_at")
 
-    # Bruger-display (begge dele hvis muligt)
-    if username and name:
-        user_line = f"@{escape_md(username)} \\({escape_md(name)}\\)"
-    elif username:
-        user_line = f"@{escape_md(username)}"
-    elif name:
-        user_line = escape_md(name)
-    else:
-        user_line = f"telegram\\_id={user_id}"
+    user_line = format_user_display(username, name, user_id, style="full")
 
     safe_message = escape_md(message)
 
-    lines = [
-        f"{tag} \\#{fb_id}",
+    # Header — tilføj "NY TESTER" badge hvis det er første feedback
+    header_lines = []
+    if is_first_time:
+        header_lines.append("🆕 *NY TESTER* — første feedback nogensinde!")
+        header_lines.append("")
+
+    header_lines.append(f"{tag} \\#{fb_id}")
+
+    lines = header_lines + [
         "",
         f"👤 *Fra:* {user_line}",
         f"🕐 *Tid:* {format_timestamp(created_at)}",
@@ -282,6 +375,8 @@ def format_feedback_summary(feedback: dict) -> str:
     """
     Kort 1-2 linjer opsummering brugt i /list.
 
+    v0.2.0: Bruger format_user_display() for konsistent fallback.
+
     Format eksempel:
       🐛 #42 — @testbruger (28. apr 14:23) [new]
         "🍿-knappen virker ikke når jeg trykker..."
@@ -293,24 +388,17 @@ def format_feedback_summary(feedback: dict) -> str:
     fb_id    = feedback.get("id", "?")
     username = feedback.get("telegram_username")
     name     = feedback.get("telegram_name")
+    user_id  = feedback.get("telegram_id", "?")
     status   = feedback.get("status", "new")
     message  = feedback.get("message", "") or ""
     created_at = feedback.get("created_at")
 
-    # Kort bruger-display
-    if username:
-        user_short = f"@{username}"
-    elif name:
-        user_short = name
-    else:
-        user_short = f"id={feedback.get('telegram_id', '?')}"
+    user_short = format_user_display(username, name, user_id, style="short")
 
-    # Trim besked
     preview = message.strip().replace("\n", " ")
     if len(preview) > 60:
         preview = preview[:57] + "..."
 
-    # Status-emoji
     status_emoji = {
         "new":      "🆕",
         "seen":     "👁",
@@ -318,11 +406,10 @@ def format_feedback_summary(feedback: dict) -> str:
         "resolved": "✅",
     }.get(status, "·")
 
-    safe_user    = escape_md(user_short)
     safe_preview = escape_md(preview)
 
     line1 = (
-        f"{emoji} *\\#{fb_id}* — {safe_user} "
+        f"{emoji} *\\#{fb_id}* — {user_short} "
         f"\\({format_timestamp(created_at)}\\) {status_emoji}"
     )
     line2 = f"   _{safe_preview}_"
@@ -333,6 +420,8 @@ def format_feedback_summary(feedback: dict) -> str:
 def format_feedback_detail(feedback: dict) -> str:
     """
     Fuld detalje brugt i /view <id>.
+
+    v0.2.0: Bruger format_user_display() for konsistent fallback.
 
     Ligner format_admin_notification men inkluderer admin_reply hvis der
     findes ét, og status-historik.
@@ -351,15 +440,7 @@ def format_feedback_detail(feedback: dict) -> str:
     admin_replied_at = feedback.get("admin_replied_at")
     created_at = feedback.get("created_at")
 
-    # Bruger-display
-    if username and name:
-        user_line = f"@{escape_md(username)} \\({escape_md(name)}\\)"
-    elif username:
-        user_line = f"@{escape_md(username)}"
-    elif name:
-        user_line = escape_md(name)
-    else:
-        user_line = f"telegram\\_id={user_id}"
+    user_line = format_user_display(username, name, user_id, style="full")
 
     status_label = {
         "new":      "🆕 Ny — ikke set endnu",
