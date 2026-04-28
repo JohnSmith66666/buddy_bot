@@ -34,7 +34,7 @@ DESIGN-PRINCIPPER:
 
 import logging
 
-from telegram import Bot, InputMediaPhoto, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
@@ -547,11 +547,22 @@ async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Send via Buddy main-bot
     buddy_bot = _get_buddy_bot()
+
+    # v0.2.0 fix: Tilføj '💬 Svar tilbage' inline-knap så bruger kan svare igen.
+    # Knappen sender callback 'fb_reply_to:<id>' som Buddy main håndterer.
+    reply_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "💬 Svar tilbage",
+            callback_data=f"fb_reply_to:{feedback_id}",
+        )
+    ]])
+
     try:
         await buddy_bot.send_message(
             chat_id=target_telegram_id,
             text=user_message,
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=reply_keyboard,
         )
     except Exception as e:
         # Fallback uden Markdown
@@ -569,6 +580,7 @@ async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await buddy_bot.send_message(
                 chat_id=target_telegram_id,
                 text=plain,
+                reply_markup=reply_keyboard,
             )
         except Exception as e2:
             logger.error("cmd_reply send fejl: %s", e2)
