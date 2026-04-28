@@ -1,0 +1,14 @@
+# Railway deployment configuration for Buddy Admin bot.
+#
+# Tells Railway exactly how to build and start the admin bot, overriding
+# any auto-detection (which incorrectly assumed FastAPI/uvicorn).
+#
+# Docs: https://docs.railway.app/reference/config-as-code
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python admin_main.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
