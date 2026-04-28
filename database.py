@@ -3,6 +3,19 @@ database.py - PostgreSQL connection pool, table management,
 user whitelist, Plex username storage, onboarding state, interaktionshistorik,
 pending requests, TMDB metadata-cache OG feedback-system.
 
+CHANGES (v0.14.2 — Batch B bulk-actions + thread-tracking):
+  - NY: update_feedback_status_bulk(ids, status) → int
+    Opdaterer status for FLERE feedback-records på én gang. Bruges af
+    admin-bot's /seen 1-20 og /resolve 5,7,9 kommandoer.
+    Returnerer antal records faktisk opdateret.
+  - NY: parse_id_range(spec) → list[int]
+    Helper der parser strings som "1-20", "5,7,9", "1,3-5,8" til en
+    liste af unique IDs. Bruges af admin-bot bulk-kommandoer.
+    Eksempler:
+      "1-5"     → [1,2,3,4,5]
+      "5,7,9"   → [5,7,9]
+      "1,3-5,8" → [1,3,4,5,8]
+
 CHANGES (v0.14.1 — first-time tester detection):
   - NY: is_first_time_feedback(telegram_id) → bool
     Returnerer True hvis brugeren ALDRIG har sendt feedback før.
@@ -1258,3 +1271,127 @@ async def is_first_time_feedback(telegram_id: int) -> bool:
 
     has_feedback = bool(row and row["has_feedback"])
     return not has_feedback
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Batch B (v0.14.2) — Bulk operations + helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def parse_id_range(spec: str) -> list[int]:
+    """
+    Parse en bruger-specificeret ID-range/list til konkrete IDs.
+
+    Bruges af admin-bot's /seen 1-20 og /resolve 5,7,9 kommandoer.
+
+    Accepterer:
+      - Enkelt ID:   "5"           → [5]
+      - Range:       "1-5"         → [1, 2, 3, 4, 5]
+      - Liste:       "5,7,9"       → [5, 7, 9]
+      - Kombineret:  "1,3-5,8"     → [1, 3, 4, 5, 8]
+
+    Whitespace ignoreres. Duplikater fjernes. Output er sorteret.
+
+    Args:
+      spec: Bruger-input string
+
+    Returns:
+      Sorteret liste af unique IDs (int).
+      Tom liste hvis spec er invalid eller ingen IDs blev fundet.
+
+    Eksempler:
+      parse_id_range("1-3, 5") → [1, 2, 3, 5]
+      parse_id_range("abc")    → []
+      parse_id_range("")       → []
+    """
+    if not spec or not spec.strip():
+        return []
+
+    ids: set[int] = set()
+
+    # Split på komma først, derefter på bindestreg for ranges
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+
+        if "-" in part:
+            # Range: "1-5"
+            try:
+                start_str, end_str = part.split("-", 1)
+                start = int(start_str.strip())
+                end   = int(end_str.strip())
+                if start > end:
+                    start, end = end, start
+                # Begræns range-størrelse for sikkerhed (max 1000 IDs)
+                if end - start > 1000:
+                    continue
+                ids.update(range(start, end + 1))
+            except (ValueError, IndexError):
+                continue
+        else:
+            # Enkelt ID
+            try:
+                ids.add(int(part))
+            except ValueError:
+                continue
+
+    # Filtrer negative + nul ud (feedback IDs starter ved 1)
+    valid_ids = sorted(i for i in ids if i > 0)
+    return valid_ids
+
+
+async def update_feedback_status_bulk(
+    feedback_ids: list[int],
+    status: str,
+) -> int:
+    """
+    Opdater status for FLERE feedback-records på én gang.
+
+    Bruges af admin-bot's /seen 1-20 og /resolve 5,7,9 kommandoer.
+    Atomisk operation — enten lykkes alle eller ingen.
+
+    Args:
+      feedback_ids: Liste af feedback IDs at opdatere
+      status:       'new' | 'seen' | 'replied' | 'resolved'
+
+    Returns:
+      Antal records der faktisk blev opdateret (kan være mindre end
+      len(feedback_ids) hvis nogle IDs ikke findes).
+
+    Raises:
+      ValueError: Hvis status er ugyldig.
+    """
+    if status not in ("new", "seen", "replied", "resolved"):
+        raise ValueError(f"Ugyldig status: '{status}'")
+
+    if not feedback_ids:
+        return 0
+
+    async with _pool_ref().acquire() as conn:
+        # Bruger ANY($1::int[]) for at undgå SQL injection og være effektiv
+        result = await conn.execute(
+            """
+            UPDATE feedback
+            SET status     = $2,
+                updated_at = NOW()
+            WHERE id = ANY($1::int[])
+            """,
+            feedback_ids, status,
+        )
+
+    # result.execute returnerer "UPDATE <count>"
+    parts = result.split()
+    if len(parts) >= 2 and parts[0] == "UPDATE":
+        try:
+            count = int(parts[1])
+        except ValueError:
+            count = 0
+    else:
+        count = 0
+
+    if count > 0:
+        logger.info(
+            "update_feedback_status_bulk: %d records → '%s' (requested: %d)",
+            count, status, len(feedback_ids),
+        )
+    return count

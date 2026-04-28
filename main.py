@@ -1,7 +1,28 @@
 """
 main.py - Buddy bot entry point.
 
-CHANGES (v0.15.0 — Batch A polering):
+CHANGES (v0.16.0 — Batch B nye flows):
+  - NY: Auto-timeout på feedback-state. Hvis bruger har været i
+    'awaiting_feedback' state i over 30 minutter uden at sende eller
+    afbryde, ryddes state automatisk ved næste interaktion.
+  - NY: /cancel kommando — virker som escape hatch fra feedback-state.
+    Brugeren kan altid skrive /cancel for at komme ud af feedback-flow.
+  - NY: Preview-trin før send (Option Y). Når brugeren trykker '✅ Send',
+    vises en preview-besked med deres samlede feedback. De kan så vælge:
+    [✅ Bekræft og Send] / [✏️ Rediger (skriv mere)] / [❌ Afbryd]
+  - NY: Inline-knapper på admin-notifikation (Option C — hybrid):
+      [💬 Svar i admin-bot] → URL-deep-link til admin-bot med /reply <id>
+      [✅ Resolve]            → callback i Buddy main, opdaterer DB direkte
+      [👁 Set]                → callback i Buddy main, opdaterer DB direkte
+  - NY: Inline svar-knap til bruger på admin-svar besked.
+    [💬 Svar tilbage] åbner feedback-flow med pre-udfyldt "Re: \\#<id> "
+    så svaret oprettes som ny feedback med klar reference.
+  - REFACTOR: Submit-flow har nu 2 trin internt:
+      compose → preview → submit
+    Tidligere: compose → submit. Det giver brugeren mulighed for at
+    se hele beskeden før den sendes.
+
+UNCHANGED (v0.15.0 — Batch A polering):
   - NY: Loading-spinner ved feedback-submit. Når brugeren trykker '✅ Send'
     vises straks "Sender din feedback... 🚀" — derefter erstattes beskeden
     med tak/fejl. Forbedrer responsiv-følelsen markant for små momenter.
@@ -95,6 +116,7 @@ from services.confirmation_service import (
 from services.feedback_service import (
     FEEDBACK_TYPES,
     format_admin_notification,
+    format_feedback_preview,
     format_user_thanks,
     get_feedback_type,
     list_feedback_type_ids,
@@ -163,6 +185,17 @@ FEEDBACK_STATE = "awaiting_feedback"
 
 # Max længde på besked-tekst (Telegram tillader 4096 i én besked)
 FEEDBACK_MAX_LENGTH = 4000
+
+# v0.16.0 — Batch B
+# Auto-timeout for feedback-state (sekunder). Efter dette ryddes state
+# automatisk så brugeren ikke sidder fast.
+FEEDBACK_STATE_TIMEOUT_SECONDS = 30 * 60  # 30 minutter
+
+# Username på admin-bot — bruges til deep-link fra Buddy's notifikation.
+# Hvis None eller tom, fallback'er knappen til at vise et hint i stedet.
+# Sættes via env-var ADMIN_BOT_USERNAME (uden @-prefix).
+import os as _os
+ADMIN_BOT_USERNAME: str = (_os.getenv("ADMIN_BOT_USERNAME") or "").strip().lstrip("@")
 
 
 def _media_label(media_type: str) -> str:
@@ -890,12 +923,89 @@ def _build_feedback_category_keyboard() -> InlineKeyboardMarkup:
 
 def _build_feedback_compose_keyboard() -> InlineKeyboardMarkup:
     """
-    Trin 2: Mens brugeren skriver — '✅ Send' og '❌ Afbryd' knapper.
+    Trin 2: Mens brugeren skriver — '👀 Forhåndsvis' og '❌ Afbryd' knapper.
+
+    v0.16.0: Knappen hedder nu 'Forhåndsvis' i stedet for 'Send' fordi
+    den åbner preview-trinnet, ikke sender direkte.
     """
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Send", callback_data="fb_submit")],
-        [InlineKeyboardButton("❌ Afbryd", callback_data="fb_cancel")],
+        [InlineKeyboardButton("👀 Forhåndsvis", callback_data="fb_preview")],
+        [InlineKeyboardButton("❌ Afbryd",     callback_data="fb_cancel")],
     ])
+
+
+def _build_feedback_preview_keyboard() -> InlineKeyboardMarkup:
+    """
+    Trin 3 (NY v0.16.0): Preview-trin med Bekræft / Rediger / Afbryd.
+
+    Bruges når bruger har trykket '👀 Forhåndsvis' og ser preview af
+    deres samlede feedback før den faktisk sendes.
+    """
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Bekræft og Send", callback_data="fb_submit")],
+        [InlineKeyboardButton("✏️ Rediger (skriv mere)", callback_data="fb_edit")],
+        [InlineKeyboardButton("❌ Afbryd",            callback_data="fb_cancel")],
+    ])
+
+
+def _build_user_received_reply_keyboard(feedback_id: int) -> InlineKeyboardMarkup:
+    """
+    Inline-knap på besked brugeren modtager når admin svarer (v0.16.0 #5b).
+
+    Knappen åbner feedback-flow med pre-udfyldt "Re: \\#<id> ".
+    """
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "💬 Svar tilbage",
+            callback_data=f"fb_reply_to:{feedback_id}",
+        )
+    ]])
+
+
+def _build_admin_notification_keyboard(
+    feedback_id: int,
+    user_id: int,
+) -> InlineKeyboardMarkup:
+    """
+    Inline-knapper på admin-notifikation (v0.16.0 #5).
+
+    Hybrid-design (Option C):
+      - 💬 Svar i admin-bot → URL deep-link til admin-bot's chat
+        med pre-fyldt /reply kommando.
+      - ✅ Resolve / 👁 Set → callback i Buddy main, kalder DB direkte.
+
+    Args:
+      feedback_id: ID på feedback-recorden
+      user_id:     telegram_id på afsenderen (bruges ikke pt., men
+                   kan bruges i fremtidige features)
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+
+    # Knap 1: Åbn admin-bot for at svare
+    if ADMIN_BOT_USERNAME:
+        # Deep-link med start parameter — admin-bot kan parse /start <param>
+        # for at åbne /reply <id> flow direkte.
+        # Format: https://t.me/<botname>?start=reply_<id>
+        deep_link = f"https://t.me/{ADMIN_BOT_USERNAME}?start=reply_{feedback_id}"
+        rows.append([
+            InlineKeyboardButton("💬 Svar i admin-bot", url=deep_link)
+        ])
+    else:
+        # Fallback hvis ADMIN_BOT_USERNAME ikke er sat
+        rows.append([
+            InlineKeyboardButton(
+                "💬 Brug /reply i admin-bot",
+                callback_data=f"fb_admin_hint:{feedback_id}",
+            )
+        ])
+
+    # Række 2: Hurtig-actions direkte i Buddy main
+    rows.append([
+        InlineKeyboardButton("✅ Resolve", callback_data=f"fb_admin_resolve:{feedback_id}"),
+        InlineKeyboardButton("👁 Set",     callback_data=f"fb_admin_seen:{feedback_id}"),
+    ])
+
+    return InlineKeyboardMarkup(rows)
 
 
 def _get_feedback_draft(context: ContextTypes.DEFAULT_TYPE) -> dict:
@@ -908,8 +1018,11 @@ def _get_feedback_draft(context: ContextTypes.DEFAULT_TYPE) -> dict:
         "message_parts": ["første del", "anden del"],
         "screenshot_file_ids": ["AgACAg...", ...],
         "compose_message_id": 12345,  # message_id af 'Skriv din feedback' beskeden
+        "started_at": 1730123456.789, # v0.16.0 — timestamp for timeout-detection
+        "reply_to_id": 1,             # v0.16.0 — feedback ID hvis dette er svar tilbage
       }
     """
+    import time
     draft = context.user_data.get("feedback_draft")
     if draft is None:
         draft = {
@@ -917,9 +1030,29 @@ def _get_feedback_draft(context: ContextTypes.DEFAULT_TYPE) -> dict:
             "message_parts":         [],
             "screenshot_file_ids":   [],
             "compose_message_id":    None,
+            "started_at":            time.time(),
+            "reply_to_id":           None,
         }
         context.user_data["feedback_draft"] = draft
     return draft
+
+
+def _is_feedback_state_expired(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Tjek om feedback-state er udløbet (v0.16.0 #2).
+
+    Returns:
+      True hvis state har været aktivt mere end FEEDBACK_STATE_TIMEOUT_SECONDS,
+      eller hvis draft slet ikke findes (corrupted state).
+    """
+    import time
+    draft = context.user_data.get("feedback_draft")
+    if draft is None:
+        return True
+    started_at = draft.get("started_at", 0)
+    if not started_at:
+        return False
+    return (time.time() - started_at) > FEEDBACK_STATE_TIMEOUT_SECONDS
 
 
 def _clear_feedback_draft(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -981,11 +1114,13 @@ async def handle_feedback_type_callback(
 
     ft = get_feedback_type(type_id)
 
-    # Gem feedback_type i draft
+    # Gem feedback_type i draft + reset timestamp
+    import time
     draft = _get_feedback_draft(context)
     draft["feedback_type"] = type_id
     draft["message_parts"] = []
     draft["screenshot_file_ids"] = []
+    draft["started_at"] = time.time()  # v0.16.0 — for timeout-tracking
 
     # Sæt onboarding-state så handle_text router videre tekst til feedback-input
     await database.set_onboarding_state(user.id, FEEDBACK_STATE)
@@ -1060,7 +1195,7 @@ async def _handle_feedback_text_input(
 
     await update.message.reply_text(
         f"📥 _Modtaget — du har sendt {summary}._\n\n"
-        f"Tryk *✅ Send* når du er færdig, eller skriv mere.",
+        f"Tryk *👀 Forhåndsvis* når du er færdig, eller skriv mere.",
         parse_mode="Markdown",
         reply_markup=_build_feedback_compose_keyboard(),
     )
@@ -1112,7 +1247,7 @@ async def handle_feedback_photo(
 
     msg = f"📷 _Screenshot modtaget ({photos_count} i alt)._"
     if parts_count > 0:
-        msg += "\n\nTryk *✅ Send* når du er færdig."
+        msg += "\n\nTryk *👀 Forhåndsvis* når du er færdig."
 
     await update.message.reply_text(
         msg,
@@ -1124,6 +1259,112 @@ async def handle_feedback_photo(
         "Feedback flow: telegram_id=%s tilføjede foto (#%d)",
         user.id, photos_count,
     )
+
+
+async def handle_feedback_preview_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    v0.16.0 #7: Bruger trykkede '👀 Forhåndsvis' — vis preview-besked.
+
+    Viser en samlet preview af feedback (kategori, tekst, screenshots-count)
+    og giver brugeren 3 valg: Bekræft og Send / Rediger / Afbryd.
+    """
+    query = update.callback_query
+
+    if not await _guard(update):
+        return
+
+    user = query.from_user
+    draft = _get_feedback_draft(context)
+
+    feedback_type = draft.get("feedback_type")
+    if not feedback_type or not validate_feedback_type(feedback_type):
+        await query.answer("Hov, der mangler en kategori — start forfra.", show_alert=True)
+        await _abort_feedback_flow(query, context, user.id)
+        return
+
+    message_parts = draft.get("message_parts", [])
+    file_ids      = draft.get("screenshot_file_ids", [])
+
+    # Brugeren skal have skrevet noget — eller sendt mindst ét screenshot
+    has_text  = any(p.strip() for p in message_parts)
+    has_photo = bool(file_ids)
+    if not has_text and not has_photo:
+        await query.answer(
+            "Du har ikke skrevet eller sendt noget endnu — skriv din feedback først.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer()
+
+    preview_text = format_feedback_preview(
+        feedback_type    = feedback_type,
+        message_parts    = message_parts,
+        screenshot_count = len(file_ids),
+    )
+
+    try:
+        await query.edit_message_text(
+            text=preview_text,
+            parse_mode="Markdown",
+            reply_markup=_build_feedback_preview_keyboard(),
+        )
+    except Exception as e:
+        logger.warning("handle_feedback_preview_callback edit fejl: %s", e)
+
+
+async def handle_feedback_edit_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    v0.16.0 #7: Bruger trykkede '✏️ Rediger' i preview — gå tilbage til compose.
+
+    Brugeren kan nu skrive flere beskeder eller sende flere screenshots.
+    Den eksisterende draft bevares (de mister ikke det de allerede har skrevet).
+    """
+    query = update.callback_query
+    await query.answer("Du kan skrive mere nu.")
+
+    if not await _guard(update):
+        return
+
+    draft = _get_feedback_draft(context)
+    feedback_type = draft.get("feedback_type")
+    ft = get_feedback_type(feedback_type) if feedback_type else None
+    type_label = ft["label"] if ft else "feedback"
+
+    parts_count  = len(draft.get("message_parts", []))
+    photos_count = len(draft.get("screenshot_file_ids", []))
+
+    bits = []
+    if parts_count == 1:
+        bits.append("1 tekstbesked")
+    elif parts_count > 1:
+        bits.append(f"{parts_count} tekstbeskeder")
+    if photos_count == 1:
+        bits.append("1 screenshot")
+    elif photos_count > 1:
+        bits.append(f"{photos_count} screenshots")
+
+    summary = " + ".join(bits) if bits else "intet endnu"
+
+    prompt = (
+        f"{type_label}\n\n"
+        f"📝 *Skriv mere eller send flere screenshots*\n\n"
+        f"_Du har allerede sendt: {summary}_\n\n"
+        f"Tryk *👀 Forhåndsvis* igen når du er færdig."
+    )
+
+    try:
+        await query.edit_message_text(
+            text=prompt,
+            parse_mode="Markdown",
+            reply_markup=_build_feedback_compose_keyboard(),
+        )
+    except Exception as e:
+        logger.warning("handle_feedback_edit_callback edit fejl: %s", e)
 
 
 async def handle_feedback_submit_callback(
@@ -1282,6 +1523,212 @@ async def _abort_feedback_flow(
             logger.warning("_abort_feedback_flow DB fejl: %s", e)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# v0.16.0 #5 — Admin-callback handlers (kun admin må trykke)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_admin_resolve_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Admin trykkede '✅ Resolve' på en feedback-notifikation.
+
+    Kalder DB direkte (ingen cross-bot kommunikation nødvendig).
+    Opdaterer notifikations-beskeden så den viser at feedback er løst.
+    """
+    query = update.callback_query
+    user  = query.from_user
+
+    # Kun admin må bruge disse knapper
+    if user.id != config.ADMIN_TELEGRAM_ID:
+        await query.answer("Kun admin kan bruge denne knap.", show_alert=True)
+        return
+
+    parts = query.data.split(":", 1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        await query.answer("Ugyldig knap", show_alert=True)
+        return
+
+    feedback_id = int(parts[1])
+    await query.answer("Markerer som løst...")
+
+    try:
+        updated = await database.update_feedback_status(feedback_id, "resolved")
+    except Exception as e:
+        logger.error("handle_admin_resolve_callback DB fejl: %s", e)
+        await query.answer(f"Fejl: {e}", show_alert=True)
+        return
+
+    if not updated:
+        await query.answer(f"Feedback #{feedback_id} ikke fundet", show_alert=True)
+        return
+
+    # Opdater notifikations-beskeden så admin ser at det er klaret
+    try:
+        # Tilføj "✅ LØST" badge til den eksisterende besked
+        original = query.message.text or query.message.caption or ""
+        new_text = f"✅ *LØST*\n\n{original}"
+        # Fjern knapper (de skal ikke kunne trykkes igen)
+        await query.edit_message_text(
+            text=new_text,
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning("handle_admin_resolve_callback edit fejl: %s", e)
+        # Best-effort — feedback er stadig løst i DB selv om visning fejler
+
+    logger.info("admin_resolve via knap: feedback_id=%d", feedback_id)
+
+
+async def handle_admin_seen_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Admin trykkede '👁 Set' på en feedback-notifikation.
+
+    Kalder DB direkte. Opdaterer notifikations-beskeden så admin
+    ser at feedback er markeret som set.
+    """
+    query = update.callback_query
+    user  = query.from_user
+
+    if user.id != config.ADMIN_TELEGRAM_ID:
+        await query.answer("Kun admin kan bruge denne knap.", show_alert=True)
+        return
+
+    parts = query.data.split(":", 1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        await query.answer("Ugyldig knap", show_alert=True)
+        return
+
+    feedback_id = int(parts[1])
+    await query.answer("Markerer som set...")
+
+    try:
+        updated = await database.update_feedback_status(feedback_id, "seen")
+    except Exception as e:
+        logger.error("handle_admin_seen_callback DB fejl: %s", e)
+        await query.answer(f"Fejl: {e}", show_alert=True)
+        return
+
+    if not updated:
+        await query.answer(f"Feedback #{feedback_id} ikke fundet", show_alert=True)
+        return
+
+    # Opdater notifikations-beskeden — fjern knapperne men behold teksten
+    try:
+        original = query.message.text or query.message.caption or ""
+        new_text = f"👁 *SET*\n\n{original}"
+        await query.edit_message_text(
+            text=new_text,
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning("handle_admin_seen_callback edit fejl: %s", e)
+
+    logger.info("admin_seen via knap: feedback_id=%d", feedback_id)
+
+
+async def handle_admin_hint_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Fallback når ADMIN_BOT_USERNAME ikke er sat.
+    Viser hint om at admin skal bruge admin-bot manuelt.
+    """
+    query = update.callback_query
+    parts = query.data.split(":", 1)
+    fb_id = parts[1] if len(parts) == 2 else "?"
+
+    await query.answer(
+        f"Åbn admin-bot og skriv:\n/reply {fb_id} <din besked>",
+        show_alert=True,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v0.16.0 #5b — Bruger trykker '💬 Svar tilbage' på admin-svar
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_feedback_reply_to_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Bruger trykkede '💬 Svar tilbage' på admin's svar (v0.16.0 #5b).
+
+    Starter ny feedback-flow med pre-udfyldt "Re: \\#<id> " som første
+    message_part. Brugeren kan så skrive deres svar og sende det som
+    ny feedback der refererer til den oprindelige.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    if not await _guard(update):
+        return
+
+    user = query.from_user
+
+    parts = query.data.split(":", 1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        await query.answer("Ugyldig reference", show_alert=True)
+        return
+
+    original_feedback_id = int(parts[1])
+
+    # Hent original feedback for at gætte rigtig kategori (vi bruger samme)
+    original_type = "question"  # default
+    try:
+        original = await database.get_feedback(original_feedback_id)
+        if original:
+            original_type = original.get("feedback_type") or "question"
+    except Exception as e:
+        logger.warning("handle_feedback_reply_to_callback DB fejl: %s", e)
+
+    # Initialiser ny feedback-draft som fortsættelse
+    import time
+    _clear_feedback_draft(context)
+    draft = _get_feedback_draft(context)
+    draft["feedback_type"]       = original_type
+    draft["message_parts"]       = [f"Re: #{original_feedback_id}"]
+    draft["screenshot_file_ids"] = []
+    draft["started_at"]          = time.time()
+    draft["reply_to_id"]         = original_feedback_id
+
+    # Sæt onboarding-state
+    await database.set_onboarding_state(user.id, FEEDBACK_STATE)
+
+    ft = get_feedback_type(original_type)
+    type_label = ft["label"] if ft else "Feedback"
+
+    prompt = (
+        f"💬 *Svar på feedback \\#{original_feedback_id}*\n\n"
+        f"_Kategori: {type_label}_\n\n"
+        f"📝 *Skriv dit svar nu*\n\n"
+        f"Du kan:\n"
+        f"  • Skrive en eller flere tekstbeskeder\n"
+        f"  • Sende billeder/screenshots\n"
+        f"  • Trykke *👀 Forhåndsvis* når du er færdig\n\n"
+        f"_Beskeden 'Re: \\#{original_feedback_id}' tilføjes automatisk._"
+    )
+
+    # Send som ny besked (kan ikke edit'e den eksisterende admin-svar besked
+    # fordi det ville fjerne admin's faktiske svar)
+    try:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=prompt,
+            parse_mode="Markdown",
+            reply_markup=_build_feedback_compose_keyboard(),
+        )
+    except Exception as e:
+        logger.warning("handle_feedback_reply_to_callback send fejl: %s", e)
+
+    logger.info(
+        "feedback_reply_to: telegram_id=%s starter svar på #%d",
+        user.id, original_feedback_id,
+    )
+
+
 async def notify_admin_about_feedback(
     context: ContextTypes.DEFAULT_TYPE,
     feedback: dict,
@@ -1304,9 +1751,17 @@ async def notify_admin_about_feedback(
         return
 
     admin_id = config.ADMIN_TELEGRAM_ID
+    fb_id    = feedback.get("id", 0)
+    user_id  = feedback.get("telegram_id", 0)
+
+    # v0.16.0 #5: brug compact format (knapper erstatter hint-linjer)
     notification_text = format_admin_notification(
-        feedback, is_first_time=is_first_time,
+        feedback, is_first_time=is_first_time, compact=True,
     )
+
+    # v0.16.0 #5: tilføj inline-knapper til admin-notifikationen
+    notification_keyboard = _build_admin_notification_keyboard(fb_id, user_id)
+
     file_ids = feedback.get("screenshot_file_ids", []) or []
 
     # Send tekst-besked
@@ -1315,6 +1770,7 @@ async def notify_admin_about_feedback(
             chat_id=admin_id,
             text=notification_text,
             parse_mode="Markdown",
+            reply_markup=notification_keyboard,
         )
     except Exception as e:
         # Fallback uden Markdown hvis der er parsing-fejl
@@ -1326,6 +1782,7 @@ async def notify_admin_about_feedback(
             await context.bot.send_message(
                 chat_id=admin_id,
                 text=plain,
+                reply_markup=notification_keyboard,
             )
         except Exception as e2:
             logger.error("notify_admin_about_feedback fallback fejl: %s", e2)
@@ -2838,6 +3295,52 @@ async def cmd_skift_plex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    v0.16.0 #2: /cancel — escape hatch fra feedback-state (eller andre states).
+
+    Hvis brugeren er fastlåst i feedback-flow, kan de skrive /cancel for
+    at komme ud. Rydder draft + onboarding_state.
+    """
+    if not await _guard(update):
+        return
+
+    user = update.effective_user
+    await database.log_message(user.id, "incoming", "/cancel")
+
+    onboarding_state = await database.get_onboarding_state(user.id)
+
+    if onboarding_state == FEEDBACK_STATE:
+        _clear_feedback_draft(context)
+        await database.set_onboarding_state(user.id, None)
+        await update.message.reply_text(
+            "✅ *Feedback annulleret*\n\n"
+            "Ingen feedback blev sendt. Tryk på 💬 Feedback igen når du har lyst.",
+            parse_mode="Markdown",
+            reply_markup=_build_main_reply_keyboard(),
+        )
+        logger.info("cmd_cancel: ryddede feedback-state for telegram_id=%s", user.id)
+        return
+
+    if onboarding_state == "awaiting_plex":
+        # Brugeren er midt i Plex-onboarding — det vil vi IKKE annullere
+        # fordi de har brug for at gennemføre det.
+        await update.message.reply_text(
+            "Hov! Du skal lige først give mig dit Plex-brugernavn for at "
+            "komme videre. 🎬\n\n"
+            "Skriv det herunder.",
+        )
+        return
+
+    # Hvis der ikke er noget at annullere
+    await update.message.reply_text(
+        "Der er ikke noget at annullere lige nu. 👌\n\n"
+        "Tryk 🍿 *Hvad skal jeg se?* eller 💬 *Feedback* for at komme i gang.",
+        parse_mode="Markdown",
+        reply_markup=_build_main_reply_keyboard(),
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Bestillingsflow callbacks (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2961,6 +3464,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # v0.14.0: Hvis bruger er i feedback-input fasen, route teksten der
     if onboarding_state == FEEDBACK_STATE:
+        # v0.16.0 #2: Auto-timeout efter 30 min uden aktivitet
+        if _is_feedback_state_expired(context):
+            logger.info(
+                "Feedback-state udløbet for telegram_id=%s — rydder",
+                user.id,
+            )
+            _clear_feedback_draft(context)
+            await database.set_onboarding_state(user.id, None)
+            await update.message.reply_text(
+                "⏰ *Din feedback-session er udløbet*\n\n"
+                "Det er gået for længe siden du startede. Tryk på "
+                "💬 Feedback-knappen igen for at starte forfra.\n\n"
+                "_Tip: Skriv /cancel for at komme ud af feedback-flow når som helst._",
+                parse_mode="Markdown",
+                reply_markup=_build_main_reply_keyboard(),
+            )
+            return
         await _handle_feedback_text_input(update, context, text)
         return
 
@@ -3156,13 +3676,19 @@ async def on_startup(application: Application) -> None:
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — v0.15.0-beta | "
-        "feedback-system: JA (v2 polish) | media-aware-watch-flow: JA | "
+        "VERSION CHECK — v0.16.0-beta | "
+        "feedback-system: JA (v3 inline-buttons) | media-aware-watch-flow: JA | "
         "tmdb-metadata-cache: JA | find-unwatched-v2: JA | "
         "test-v2-cmd: JA | audit-tv-subgenres: JA | "
         "top-keywords-dump: JA | first-time-tester-detect: JA | "
-        "loading-spinner: JA"
+        "loading-spinner: JA | preview-step: JA | auto-timeout: JA | "
+        "/cancel-cmd: JA | admin-inline-buttons: JA | reply-back-button: JA"
     )
+    if not ADMIN_BOT_USERNAME:
+        logger.warning(
+            "ADMIN_BOT_USERNAME env-var er ikke sat — admin-notifikations-knappen "
+            "'💬 Svar i admin-bot' vil falde tilbage til et tekst-hint."
+        )
 
 
 async def on_shutdown(application: Application) -> None:
@@ -3185,6 +3711,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start",           cmd_start))
     app.add_handler(CommandHandler("skift_plex",      cmd_skift_plex))
+    app.add_handler(CommandHandler("cancel",          cmd_cancel))
 
     # Engangs admin-kommandoer
     app.add_handler(CommandHandler("genres",          cmd_genres))
@@ -3216,10 +3743,18 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_subgenre_back_callback,     pattern=r"^sg_back:"))
     app.add_handler(CallbackQueryHandler(handle_subgenre_cancel_callback,   pattern=r"^sg_cancel$"))
 
-    # ── Feedback Flow (NYT v0.14.0) ─────────────────────────────────────────
+    # ── Feedback Flow (NYT v0.14.0, opgraderet v0.16.0) ────────────────────
     app.add_handler(CallbackQueryHandler(handle_feedback_type_callback,    pattern=r"^fb_type:"))
+    app.add_handler(CallbackQueryHandler(handle_feedback_preview_callback, pattern=r"^fb_preview$"))
+    app.add_handler(CallbackQueryHandler(handle_feedback_edit_callback,    pattern=r"^fb_edit$"))
     app.add_handler(CallbackQueryHandler(handle_feedback_submit_callback,  pattern=r"^fb_submit$"))
     app.add_handler(CallbackQueryHandler(handle_feedback_cancel_callback,  pattern=r"^fb_cancel$"))
+    # v0.16.0 #5b: Bruger trykker 'Svar tilbage' på admin-svar
+    app.add_handler(CallbackQueryHandler(handle_feedback_reply_to_callback, pattern=r"^fb_reply_to:"))
+    # v0.16.0 #5: Admin trykker hurtig-knapper på notifikation
+    app.add_handler(CallbackQueryHandler(handle_admin_resolve_callback, pattern=r"^fb_admin_resolve:"))
+    app.add_handler(CallbackQueryHandler(handle_admin_seen_callback,    pattern=r"^fb_admin_seen:"))
+    app.add_handler(CallbackQueryHandler(handle_admin_hint_callback,    pattern=r"^fb_admin_hint:"))
 
     # Bestillingsflow
     app.add_handler(CallbackQueryHandler(handle_pick_callback,      pattern=r"^pick:"))

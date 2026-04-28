@@ -1,6 +1,19 @@
 """
 admin_bot/feedback_handlers.py - Command handlers for the Buddy Admin bot.
 
+CHANGES (v0.2.0 — Batch B bulk actions + deep-link):
+  - NY: Bulk-parsing i /seen og /resolve. Begge kommandoer accepterer nu
+    enkelt ID, range (1-20), liste (5,7,9), eller kombineret (1,3-5,8).
+    Eksempler:
+      /seen 1-20      → Markér 20 records som set
+      /resolve 5,7,9  → Markér 3 records som løst
+      /resolve 1-3,8  → Kombineret (1,2,3,8)
+  - NY: Deep-link support i /start. Hvis admin starter botten via et link
+    der har 'start=reply_<id>' parameter (sendt fra Buddy main's inline-knap),
+    åbnes hint om at bruge /reply <id> direkte.
+  - REFACTOR: cmd_resolve og cmd_seen bruger nu admin_database.parse_id_range()
+    + update_feedback_status_bulk() for bulk-operations.
+
 CHANGES (v0.1.0 — initial):
   - cmd_start(): Velkomstbesked med kommando-oversigt.
   - cmd_help(): Detaljeret hjælp til alle kommandoer.
@@ -121,12 +134,15 @@ HELP_TEXT = (
     "  • Testeren modtager beskeden via Buddy main-bot\n"
     "  • Markeres automatisk som 'replied'\n\n"
 
-    "✅ */resolve <id>* — Markér som løst\n"
-    "  • Eksempel: `/resolve 42`\n"
-    "  • Forsvinder fra default `/list`\n\n"
+    "✅ */resolve <id|range|liste>* — Markér som løst (NU MED BULK!)\n"
+    "  • `/resolve 42` — enkelt\n"
+    "  • `/resolve 1-20` — range\n"
+    "  • `/resolve 5,7,9` — liste\n"
+    "  • `/resolve 1,3-5,8` — kombineret\n\n"
 
-    "👁 */seen <id>* — Markér som set (uden svar)\n"
-    "  • Eksempel: `/seen 42`\n\n"
+    "👁 */seen <id|range|liste>* — Markér som set (NU MED BULK!)\n"
+    "  • Samme syntax som `/resolve`\n"
+    "  • Eksempel: `/seen 1-20`\n\n"
 
     "📊 */stats* — Vis statistik\n"
     "  • Total optælling, fordeling pr. type og status\n\n"
@@ -136,11 +152,32 @@ HELP_TEXT = (
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Velkomst-besked når admin trykker /start."""
+    """Velkomst-besked når admin trykker /start.
+
+    v0.2.0: Hvis bruger starter via deep-link (https://t.me/<bot>?start=reply_<id>),
+    parser vi parameteret og giver et hint om at bruge /reply <id>.
+    """
     if not _is_admin(update):
         await _reject_non_admin(update)
         return
 
+    # v0.2.0: Tjek om der er en deep-link parameter
+    args = context.args
+    if args and args[0].startswith("reply_"):
+        try:
+            feedback_id = int(args[0].split("_", 1)[1])
+            await update.message.reply_text(
+                f"💬 *Klar til at svare på feedback \\#{feedback_id}*\n\n"
+                f"Skriv din besked til testeren her:\n\n"
+                f"`/reply {feedback_id} <din besked>`\n\n"
+                f"_Eller brug `/view {feedback_id}` for at se feedback først._",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        except (ValueError, IndexError):
+            pass
+
+    # Normal velkomstbesked
     try:
         await update.message.reply_text(
             WELCOME_TEXT,
@@ -573,81 +610,162 @@ async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_resolve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Marker en feedback som 'resolved' uden at sende svar."""
+    """
+    Marker en eller flere feedback som 'resolved' uden at sende svar.
+
+    v0.2.0: Understøtter nu bulk-operations:
+      /resolve 5         → enkelt
+      /resolve 1-20      → range
+      /resolve 5,7,9     → liste
+      /resolve 1,3-5,8   → kombineret
+    """
     if not _is_admin(update):
         await _reject_non_admin(update)
         return
 
     args = context.args
-    if not args or not args[0].isdigit():
+    if not args:
         await update.message.reply_text(
-            "📖 Brug: `/resolve <id>`\n\nEksempel: `/resolve 42`",
+            "📖 *Brug:* `/resolve <id|range|liste>`\n\n"
+            "*Eksempler:*\n"
+            "  `/resolve 42` — enkelt\n"
+            "  `/resolve 1-20` — range\n"
+            "  `/resolve 5,7,9` — liste\n"
+            "  `/resolve 1,3-5,8` — kombineret",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    feedback_id = int(args[0])
+    # Saml alle args (kan være "1-3, 5" eller "1,3,5" osv.)
+    spec = " ".join(args).strip()
+
+    feedback_ids = db.parse_id_range(spec)
+    if not feedback_ids:
+        await update.message.reply_text(
+            f"⚠️ Kunne ikke parse '{spec}'.\n\n"
+            f"Brug fx `/resolve 5` eller `/resolve 1-20`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Sikkerhedstjek: max 100 IDs ad gangen
+    if len(feedback_ids) > 100:
+        await update.message.reply_text(
+            f"⚠️ For mange IDs ({len(feedback_ids)}). Max 100 per kommando.",
+        )
+        return
 
     try:
-        updated = await db.update_feedback_status(feedback_id, "resolved")
+        if len(feedback_ids) == 1:
+            updated = await db.update_feedback_status(feedback_ids[0], "resolved")
+            count = 1 if updated else 0
+        else:
+            count = await db.update_feedback_status_bulk(feedback_ids, "resolved")
     except Exception as e:
         logger.error("cmd_resolve DB-fejl: %s", e)
         await update.message.reply_text(f"❌ DB-fejl: {e}")
         return
 
-    if not updated:
+    if count == 0:
         await update.message.reply_text(
-            f"⚠️ Ingen feedback med ID `{feedback_id}` fundet.",
-            parse_mode=ParseMode.MARKDOWN,
+            f"⚠️ Ingen feedback fundet med de angivne IDs.",
         )
         return
 
-    await update.message.reply_text(
-        f"✅ Feedback \\#{feedback_id} markeret som *løst*.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    logger.info("cmd_resolve: feedback_id=%d marked resolved", feedback_id)
+    # Bekræft
+    if len(feedback_ids) == 1:
+        await update.message.reply_text(
+            f"✅ Feedback \\#{feedback_ids[0]} markeret som *løst*.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        ids_preview = ", ".join(f"\\#{i}" for i in feedback_ids[:5])
+        if len(feedback_ids) > 5:
+            ids_preview += f" \\(+{len(feedback_ids) - 5} flere\\)"
+        await update.message.reply_text(
+            f"✅ *{count} feedback markeret som løst*\n"
+            f"_(af {len(feedback_ids)} angivne IDs)_\n\n"
+            f"IDs: {ids_preview}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
+    logger.info("cmd_resolve: %d/%d records marked resolved", count, len(feedback_ids))
 
-# ══════════════════════════════════════════════════════════════════════════════
-# /seen — Markér som set (uden svar)
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_seen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Marker en feedback som 'seen' uden at sende svar."""
+    """
+    Marker en eller flere feedback som 'seen' uden at sende svar.
+
+    v0.2.0: Understøtter nu bulk-operations (samme syntax som /resolve).
+    """
     if not _is_admin(update):
         await _reject_non_admin(update)
         return
 
     args = context.args
-    if not args or not args[0].isdigit():
+    if not args:
         await update.message.reply_text(
-            "📖 Brug: `/seen <id>`\n\nEksempel: `/seen 42`",
+            "📖 *Brug:* `/seen <id|range|liste>`\n\n"
+            "*Eksempler:*\n"
+            "  `/seen 42` — enkelt\n"
+            "  `/seen 1-20` — range\n"
+            "  `/seen 5,7,9` — liste\n"
+            "  `/seen 1,3-5,8` — kombineret",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    feedback_id = int(args[0])
+    spec = " ".join(args).strip()
+
+    feedback_ids = db.parse_id_range(spec)
+    if not feedback_ids:
+        await update.message.reply_text(
+            f"⚠️ Kunne ikke parse '{spec}'.\n\n"
+            f"Brug fx `/seen 5` eller `/seen 1-20`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if len(feedback_ids) > 100:
+        await update.message.reply_text(
+            f"⚠️ For mange IDs ({len(feedback_ids)}). Max 100 per kommando.",
+        )
+        return
 
     try:
-        updated = await db.update_feedback_status(feedback_id, "seen")
+        if len(feedback_ids) == 1:
+            updated = await db.update_feedback_status(feedback_ids[0], "seen")
+            count = 1 if updated else 0
+        else:
+            count = await db.update_feedback_status_bulk(feedback_ids, "seen")
     except Exception as e:
         logger.error("cmd_seen DB-fejl: %s", e)
         await update.message.reply_text(f"❌ DB-fejl: {e}")
         return
 
-    if not updated:
+    if count == 0:
         await update.message.reply_text(
-            f"⚠️ Ingen feedback med ID `{feedback_id}` fundet.",
-            parse_mode=ParseMode.MARKDOWN,
+            f"⚠️ Ingen feedback fundet med de angivne IDs.",
         )
         return
 
-    await update.message.reply_text(
-        f"👁 Feedback \\#{feedback_id} markeret som *set*.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    logger.info("cmd_seen: feedback_id=%d marked seen", feedback_id)
+    if len(feedback_ids) == 1:
+        await update.message.reply_text(
+            f"👁 Feedback \\#{feedback_ids[0]} markeret som *set*.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        ids_preview = ", ".join(f"\\#{i}" for i in feedback_ids[:5])
+        if len(feedback_ids) > 5:
+            ids_preview += f" \\(+{len(feedback_ids) - 5} flere\\)"
+        await update.message.reply_text(
+            f"👁 *{count} feedback markeret som set*\n"
+            f"_(af {len(feedback_ids)} angivne IDs)_\n\n"
+            f"IDs: {ids_preview}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    logger.info("cmd_seen: %d/%d records marked seen", count, len(feedback_ids))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
