@@ -1,6 +1,12 @@
 """
 admin_bot/feedback_handlers.py - Command handlers for the Buddy Admin bot.
 
+CHANGES (v0.2.1 — Polish: configurable admin display name):
+  - NY: ADMIN_DISPLAY_NAME konstant læses fra env-var (default 'admin').
+    Sendes til format_user_received_reply() når admin svarer på feedback.
+    Tidligere var "Jesper" hardcoded i bruger-beskeden — nu kan navnet
+    konfigureres via Railway env-var uden code-deploy.
+
 CHANGES (v0.2.0 — Batch B bulk actions + deep-link):
   - NY: Bulk-parsing i /seen og /resolve. Begge kommandoer accepterer nu
     enkelt ID, range (1-20), liste (5,7,9), eller kombineret (1,3-5,8).
@@ -33,6 +39,7 @@ DESIGN-PRINCIPPER:
 """
 
 import logging
+import os
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
@@ -51,6 +58,15 @@ from feedback_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Admin-display navn (v0.2.1 — Polish: konfigurerbart navn)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Navnet der vises i bruger-beskeden "Svar fra <ADMIN_DISPLAY_NAME>".
+# Sættes via env-var ADMIN_DISPLAY_NAME. Default 'admin' hvis ikke sat.
+ADMIN_DISPLAY_NAME: str = (os.getenv("ADMIN_DISPLAY_NAME") or "admin").strip()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -538,11 +554,14 @@ async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # Byg bruger-besked via Buddy
+    # v0.2.1: Send ADMIN_DISPLAY_NAME med så "Svar fra X" bruger den
+    # konfigurerede værdi i stedet for hardcoded navn.
     user_message = format_user_received_reply(
-        feedback_id      = feedback_id,
-        feedback_type    = record.get("feedback_type", ""),
-        original_message = record.get("message", ""),
-        admin_reply      = reply_text,
+        feedback_id        = feedback_id,
+        feedback_type      = record.get("feedback_type", ""),
+        original_message   = record.get("message", ""),
+        admin_reply        = reply_text,
+        admin_display_name = ADMIN_DISPLAY_NAME,
     )
 
     # Send via Buddy main-bot
