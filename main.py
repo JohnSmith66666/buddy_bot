@@ -1,27 +1,38 @@
 """
 main.py - Buddy bot entry point.
 
-CHANGES vs previous version (v0.12.0 — audit værktøj):
-  - NY: cmd_audit_tv_subgenres admin-kommando.
-    Tester alle 36 subgenrer mod TV-data i tmdb_metadata.
-    Returnerer rapport med stærke/svage/tomme subgenrer + anbefaling.
-    Forberedelse til Etape C (TV-flow implementation).
-  - NY: /audit_tv_subgenres registreret i main() entry point.
+CHANGES (v0.14.0 — Feedback system):
+  - NY KNAP: '💬 Feedback' tilføjet i bundmenuen ved siden af '🍿 Hvad skal jeg se?'.
+    Knappen vises KUN efter Plex-onboarding er færdig (jvf. brugerens valg).
+    _build_main_reply_keyboard() har nu 2 knapper i 2 rækker.
+  - NY: setup_feedback_table() kaldes ved startup.
+  - NY: Komplet feedback-flow med 4 kategorier (idea/bug/question/praise):
+      Bruger trykker '💬 Feedback'
+        → Trin 1: Vælg kategori (4 inline-knapper)
+        → Trin 2: Skriv besked (tekst + valgfri ubegrænsede screenshots)
+        → Trin 3: Tryk '✅ Send' for at indsende
+        → Tak-besked + reference-ID
+        → Admin får notifikation via Buddy-bot direkte
+  - NY: Onboarding-state 'awaiting_feedback' for tekst-input fasen.
+  - NY: context.user_data bruges til at holde feedback-draft (kategori,
+    tekst, screenshot file_ids) MENS brugeren skriver. State på telegram_id
+    nulstilles efter Send eller Afbryd. Pragmatisk valg fordi feedback-flow
+    er kort-livet (sekunder/minutter) — ikke kritisk hvis Railway restarter.
+  - NY: Photo-handler — når bruger er i 'awaiting_feedback', opfanges photos
+    og file_id gemmes til feedback-recorden.
+  - NY: notify_admin_about_feedback() sender Markdown-besked til admin
+    direkte via context.bot (samme mønster som admin_handlers.notify_admin_new_user).
+    Inkluderer screenshots hvis vedhæftet.
 
-UNCHANGED (v0.11.x — Etape 3 af subgenre-projekt):
-  - Hele 'Hvad skal jeg se?' flow datadrevet via subgenre_service + find_unwatched_v2.
-  - 4-trins UI: bundknap → 9 kategorier → 3-6 subgenrer → 5 forslag.
-  - Bestillingsflow, info-links, AI-handler, webhook-server, onboarding.
+UNCHANGED (v0.13.0 — media-aware Watch Flow):
+  - Media-valg trin (Film/Serie/Overrask).
+  - Alle subgenre callbacks bærer media_type.
+  - 4 navigations-niveauer i Trin 5.
 
-UNCHANGED (v0.12.1 — fix #1 double-fetch).
+UNCHANGED (v0.12.0 — audit værktøj cmd_audit_tv_subgenres).
 UNCHANGED (v0.12.2 — brugerguide-link i cmd_start).
-UNCHANGED (v0.10.8 — /test_v2 admin DEBUG).
-UNCHANGED (v0.10.7 — fuld keyword-eksport).
-UNCHANGED (v0.10.6 — Step 2 af subgenre-projekt).
-UNCHANGED (v0.10.5 — /test_metadata kommando).
-UNCHANGED (v0.10.4 — /test_enrich DRY-RUN).
-UNCHANGED (v0.10.3 — /dump_genres admin-kommando).
-UNCHANGED (v0.10.2 — /genres admin-kommando).
+UNCHANGED (v0.12.1 — fix #1 double-fetch).
+UNCHANGED (v0.10.x — alle admin-kommandoer).
 """
 
 import asyncio
@@ -44,6 +55,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputFile,
+    InputMediaPhoto,
     KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
@@ -69,6 +81,14 @@ from services.confirmation_service import (
     show_confirmation,
     show_search_results,
 )
+from services.feedback_service import (
+    FEEDBACK_TYPES,
+    format_admin_notification,
+    format_user_thanks,
+    get_feedback_type,
+    list_feedback_type_ids,
+    validate_feedback_type,
+)
 from services.plex_service import validate_plex_user
 from services.tmdb_service import get_media_details
 from services.tmdb_keywords_service import (
@@ -78,8 +98,11 @@ from services.tmdb_keywords_service import (
     search_tmdb_by_title,
 )
 from services.subgenre_service import (
-    SUBGENRE_CATEGORIES,
-    SUBGENRES,
+    SUBGENRE_CATEGORIES_MOVIE,
+    SUBGENRE_CATEGORIES_TV,
+    SUBGENRES_MOVIE,
+    SUBGENRES_TV,
+    detect_media_type,
     get_all_categories,
     get_category,
     get_category_for_subgenre,
@@ -101,21 +124,61 @@ _URL_RE = re.compile(r"(https?://[^\s)\]>\"]+)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WATCH FLOW (NY v0.11.0) — Konstanter og helpers
+# WATCH FLOW (v0.13.0) — Konstanter og helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Bundknap-tekst (uændret for at bevare brugervante)
 WATCH_FLOW_TRIGGER = "🍿 Hvad skal jeg se?"
+FEEDBACK_TRIGGER   = "💬 Feedback"
 
 # Header-tekster i de forskellige trin
-TRIN2_HEADER = "🍿 *Find en film*\n\nVælg en stemning 👇"
-TRIN3_HEADER_TPL = "{label}\n\nVælg en undergenre 👇"
+TRIN2_HEADER = (
+    "🍿 *Hvad er du i humør til?*\n\n"
+    "Vælg om du vil se en film, en serie — eller om jeg skal overraske dig 🎲"
+)
+
+TRIN3_HEADER_MOVIE = "🎬 *Find en film*\n\nVælg en stemning 👇"
+TRIN3_HEADER_TV    = "📺 *Find en serie*\n\nVælg en stemning 👇"
+
+TRIN4_HEADER_TPL = "{label}\n\nVælg en undergenre 👇"
 
 
-def _build_main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Persistent bundknap — vises i bunden af chatten."""
+# ══════════════════════════════════════════════════════════════════════════════
+# FEEDBACK FLOW (v0.14.0) — Konstanter
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Onboarding-state navn for feedback-input fasen
+FEEDBACK_STATE = "awaiting_feedback"
+
+# Max længde på besked-tekst (Telegram tillader 4096 i én besked)
+FEEDBACK_MAX_LENGTH = 4000
+
+
+def _media_label(media_type: str) -> str:
+    """Dansk label for media_type — bruges i headers."""
+    return "film" if media_type == "movie" else "serie"
+
+
+def _media_emoji(media_type: str) -> str:
+    """Emoji for media_type."""
+    return "🎬" if media_type == "movie" else "📺"
+
+
+def _build_main_reply_keyboard(include_feedback: bool = True) -> ReplyKeyboardMarkup:
+    """
+    Persistent bundknap — vises i bunden af chatten.
+
+    v0.14.0: Tilføjet '💬 Feedback'-knap som anden række.
+    include_feedback=False bruges hvis vi vil skjule den (fx før onboarding).
+    """
+    rows = [
+        [KeyboardButton(WATCH_FLOW_TRIGGER)],
+    ]
+    if include_feedback:
+        rows.append([KeyboardButton(FEEDBACK_TRIGGER)])
+
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(WATCH_FLOW_TRIGGER)]],
+        rows,
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -125,91 +188,140 @@ def _build_main_reply_keyboard() -> ReplyKeyboardMarkup:
 # Watch Flow keyboards — bygges fra subgenre_service data
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_categories_keyboard() -> InlineKeyboardMarkup:
+def _build_media_keyboard() -> InlineKeyboardMarkup:
     """
-    Trin 2: 9 hovedkategorier (1 knap pr. række) + Overrask + Afbryd.
-    Callback-data: 'sg_cat:<category_id>' eller 'sg_cat:random'
+    Trin 2: Vælg media-type.
+
+    Callback-data:
+      sg_media:movie   — gå til film-kategorier
+      sg_media:tv      — gå til TV-kategorier
+      sg_media:random  — random media + random subgenre → direkte til Trin 5
+      sg_cancel        — afbryd
     """
-    rows: list[list[InlineKeyboardButton]] = []
-
-    for cat in get_all_categories():
-        rows.append([
-            InlineKeyboardButton(cat["label"], callback_data=f"sg_cat:{cat['id']}")
-        ])
-
-    # Bundrække: Overrask + Afbryd
-    rows.append([
-        InlineKeyboardButton("🎲 Overrask mig", callback_data="sg_cat:random"),
-    ])
-    rows.append([
-        InlineKeyboardButton("❌ Afbryd", callback_data="sg_cancel"),
-    ])
-
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("🎬 Film",       callback_data="sg_media:movie")],
+        [InlineKeyboardButton("📺 Serie",      callback_data="sg_media:tv")],
+        [InlineKeyboardButton("🎲 Overrask mig", callback_data="sg_media:random")],
+        [InlineKeyboardButton("❌ Afbryd",     callback_data="sg_cancel")],
+    ]
     return InlineKeyboardMarkup(rows)
 
 
-def _build_subgenres_keyboard(category_id: str) -> InlineKeyboardMarkup:
+def _build_categories_keyboard(media_type: str) -> InlineKeyboardMarkup:
     """
-    Trin 3: 3-6 subgenrer i denne kategori (1 knap pr. række)
-    + Overrask (random subgenre i samme kasse) + Tilbage + Afbryd.
+    Trin 3: 9 hovedkategorier for valgt media_type (1 knap pr. række)
+    + Overrask + Tilbage + Afbryd.
+    Callback-data: 'sg_cat:<media>:<category_id>' eller 'sg_cat:<media>:random'
     """
-    cat = get_category(category_id)
     rows: list[list[InlineKeyboardButton]] = []
 
-    if cat:
-        for sub in cat["subgenres"]:
-            rows.append([
-                InlineKeyboardButton(sub["label"], callback_data=f"sg_pick:{sub['id']}")
-            ])
+    for cat in get_all_categories(media_type=media_type):
+        rows.append([
+            InlineKeyboardButton(
+                cat["label"],
+                callback_data=f"sg_cat:{media_type}:{cat['id']}",
+            )
+        ])
 
-    # Bundrække
+    # Bundrække: Overrask + Tilbage + Afbryd
     rows.append([
         InlineKeyboardButton(
-            "🎲 Overrask mig (i denne kategori)",
-            callback_data=f"sg_random:{category_id}",
-        )
+            "🎲 Overrask mig",
+            callback_data=f"sg_cat:{media_type}:random",
+        ),
     ])
     rows.append([
-        InlineKeyboardButton("⬅️ Tilbage", callback_data="sg_back:cats"),
+        InlineKeyboardButton("⬅️ Tilbage", callback_data="sg_back:media"),
         InlineKeyboardButton("❌ Afbryd",   callback_data="sg_cancel"),
     ])
 
     return InlineKeyboardMarkup(rows)
 
 
-def _build_results_keyboard(subgenre_id: str, has_results: bool) -> InlineKeyboardMarkup:
+def _build_subgenres_keyboard(media_type: str, category_id: str) -> InlineKeyboardMarkup:
     """
-    Trin 4: Actions efter resultater.
-
-    Hvis der er resultater:
-      🔄 5 nye forslag / ⏭️ Næste subgenre / ⬅️ Tilbage / ❌ Færdig
-
-    Hvis der INGEN resultater er (alle set):
-      ⏭️ Næste subgenre / ⬅️ Tilbage / ❌ Færdig
+    Trin 4: 3-6 subgenrer i denne kategori (1 knap pr. række)
+    + Overrask (random subgenre i samme kasse) + Tilbage + Afbryd.
     """
-    cat_id = get_category_for_subgenre(subgenre_id) or "comedy"
+    cat = get_category(category_id, media_type=media_type)
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if cat:
+        for sub in cat["subgenres"]:
+            rows.append([
+                InlineKeyboardButton(
+                    sub["label"],
+                    callback_data=f"sg_pick:{media_type}:{sub['id']}",
+                )
+            ])
+
+    # Bundrække
+    rows.append([
+        InlineKeyboardButton(
+            "🎲 Overrask mig (i denne kategori)",
+            callback_data=f"sg_random:{media_type}:{category_id}",
+        )
+    ])
+    rows.append([
+        InlineKeyboardButton(
+            "⬅️ Tilbage",
+            callback_data=f"sg_back:cats:{media_type}",
+        ),
+        InlineKeyboardButton("❌ Afbryd", callback_data="sg_cancel"),
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_results_keyboard(
+    media_type: str,
+    subgenre_id: str,
+    has_results: bool,
+) -> InlineKeyboardMarkup:
+    """
+    Trin 5: Actions efter resultater — 4 navigations-niveauer.
+    """
+    cat_id = get_category_for_subgenre(subgenre_id, media_type=media_type)
     rows: list[list[InlineKeyboardButton]] = []
 
     if has_results:
         rows.append([
             InlineKeyboardButton(
                 "🔄 5 nye forslag",
-                callback_data=f"sg_refresh:{subgenre_id}",
+                callback_data=f"sg_refresh:{media_type}:{subgenre_id}",
+            ),
+        ])
+
+    if cat_id:
+        rows.append([
+            InlineKeyboardButton(
+                "⏭️ Næste subgenre",
+                callback_data=f"sg_next:{media_type}:{cat_id}",
+            ),
+            InlineKeyboardButton(
+                "⬅️ Subgenrer",
+                callback_data=f"sg_back:subs:{media_type}:{cat_id}",
+            ),
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton(
+                "⬅️ Tilbage til kategorier",
+                callback_data=f"sg_back:cats:{media_type}",
             ),
         ])
 
     rows.append([
         InlineKeyboardButton(
-            "⏭️ Næste subgenre",
-            callback_data=f"sg_next:{cat_id}",
+            "⬅️⬅️ Kategorier",
+            callback_data=f"sg_back:cats:{media_type}",
         ),
-    ])
-    rows.append([
         InlineKeyboardButton(
-            "⬅️ Tilbage til kategorier",
-            callback_data="sg_back:cats",
+            "🏠 Forfra",
+            callback_data="sg_back:media",
         ),
     ])
+
     rows.append([
         InlineKeyboardButton("❌ Færdig", callback_data="sg_cancel"),
     ])
@@ -221,25 +333,15 @@ def _build_results_keyboard(subgenre_id: str, has_results: bool) -> InlineKeyboa
 # Result formatting — fra find_unwatched_v2 dict til Markdown-besked
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _format_results_message(result: dict) -> tuple[str, bool]:
-    """
-    Format find_unwatched_v2 resultat som Markdown-besked.
-
-    Returns:
-      (message_text, has_results)
-
-    Edge cases:
-      - status='error': fejl-besked
-      - status='missing' med stats.unwatched=0: 'godt gået'-besked
-      - status='ok' med <5 forslag: 'kun X forslag'-advarsel
-      - status='ok' med 5 forslag: normal liste
-    """
+def _format_results_message(result: dict, media_type: str) -> tuple[str, bool]:
+    """Format find_unwatched_v2 resultat som Markdown-besked."""
     status         = result.get("status")
     subgenre_label = result.get("subgenre_label", "?")
     stats          = result.get("stats", {}) or {}
     unwatched      = stats.get("unwatched", 0)
+    media_word     = _media_label(media_type)
+    media_word_pl  = "film" if media_type == "movie" else "serier"
 
-    # ── Error case ─────────────────────────────────────────────────────────────
     if status == "error":
         return (
             f"❌ Hov, noget gik galt!\n\n"
@@ -248,24 +350,20 @@ def _format_results_message(result: dict) -> tuple[str, bool]:
             False,
         )
 
-    # ── Missing case (alle set ELLER ingen kandidater) ─────────────────────────
     if status == "missing":
         if stats.get("in_plex", 0) == 0:
-            # Ingen film i Plex matcher — det er sjældent men mulige edge case
             return (
-                f"😕 Hmm, jeg kunne ikke finde nogen film der matcher "
+                f"😕 Hmm, jeg kunne ikke finde nogen {media_word_pl} der matcher "
                 f"*{subgenre_label}* i dit bibliotek.\n\n"
                 f"_Prøv en anden subgenre._",
                 False,
             )
-        # Alle film i denne subgenre er allerede set
         return (
             f"🎉 *Du har set ALT i {subgenre_label} — godt gået!*\n\n"
             f"_Prøv en anden subgenre._",
             False,
         )
 
-    # ── Success case ───────────────────────────────────────────────────────────
     results = result.get("results", []) or []
     if not results:
         return (
@@ -276,46 +374,42 @@ def _format_results_message(result: dict) -> tuple[str, bool]:
 
     lines = [f"*{subgenre_label}*", ""]
 
-    # Advarsel hvis færre end 5 forslag
     if len(results) < 5:
         lines.append(
             f"⚠️ _Du har set det meste — kun {len(results)} forslag her_"
         )
         lines.append("")
 
-    for film in results:
-        title   = film.get("title") or "Ukendt"
-        year    = film.get("year")
-        rating  = film.get("rating")
-        tmdb_id = film.get("tmdb_id")
+    for item in results:
+        title   = item.get("title") or "Ukendt"
+        year    = item.get("year")
+        rating  = item.get("rating")
+        tmdb_id = item.get("tmdb_id")
 
         year_str   = f" ({year})" if year else ""
         rating_str = f" ⭐ {rating:.1f}" if rating else ""
-        info_link  = f"\n   /info_movie_{tmdb_id}" if tmdb_id else ""
+        info_link  = (
+            f"\n   /info_{media_type}_{tmdb_id}" if tmdb_id else ""
+        )
 
         lines.append(f"🟢 *{title}*{year_str}{rating_str}{info_link}")
-        lines.append("")  # tom linje mellem film for læsbarhed
+        lines.append("")
 
-    # Fjern sidste tomme linje før footer
     if lines and lines[-1] == "":
         lines.pop()
 
-    # Diskret stats nederst
     lines.append("")
-    lines.append(f"_{unwatched} usete i denne kategori_")
+    lines.append(f"_{unwatched} usete {media_word_pl} i denne kategori_")
 
     return ("\n".join(lines), True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Watch Flow trigger + handlers (NY v0.11.0)
+# Watch Flow trigger + handlers
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_watch_flow_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Trin 1 → Trin 2: Bruger trykkede '🍿 Hvad skal jeg se?'
-    Vis kategori-keyboardet.
-    """
+    """Trin 1 → Trin 2: Bruger trykkede '🍿 Hvad skal jeg se?'"""
     if not await _guard(update):
         return
 
@@ -328,20 +422,15 @@ async def handle_watch_flow_trigger(update: Update, context: ContextTypes.DEFAUL
     await update.message.reply_text(
         TRIN2_HEADER,
         parse_mode="Markdown",
-        reply_markup=_build_categories_keyboard(),
+        reply_markup=_build_media_keyboard(),
     )
     logger.info("Watch flow startet for telegram_id=%s", user.id)
 
 
-async def handle_subgenre_category_callback(
+async def handle_subgenre_media_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """
-    Trin 2 → Trin 3: Bruger valgte en kategori.
-    Vis subgenre-keyboardet for den valgte kategori.
-
-    Specialcase: 'sg_cat:random' → vælg random kategori og vis dens subgenrer.
-    """
+    """Trin 2 → Trin 3: Bruger valgte media-type."""
     query = update.callback_query
     await query.answer()
 
@@ -350,24 +439,89 @@ async def handle_subgenre_category_callback(
 
     payload = query.data.split(":", 1)[1]
 
-    # 🎲 Overrask mig på kategori-niveau
     if payload == "random":
-        category_id = random.choice(list(SUBGENRE_CATEGORIES.keys()))
-        logger.info("Watch flow: random kategori valgt → '%s'", category_id)
+        media_type = random.choice(["movie", "tv"])
+        all_ids    = list_subgenre_ids(media_type=media_type)
+        if not all_ids:
+            await query.answer("Hov, ingen subgenrer er konfigureret", show_alert=True)
+            return
+        subgenre_id = random.choice(all_ids)
+        logger.info(
+            "Watch flow: top-level random → media=%s, subgenre=%s",
+            media_type, subgenre_id,
+        )
+        await _execute_subgenre_search(
+            update, context, media_type, subgenre_id, edit_message=True,
+        )
+        return
+
+    if payload not in ("movie", "tv"):
+        logger.warning("handle_subgenre_media_callback: ukendt payload='%s'", payload)
+        await query.answer("Ugyldigt valg", show_alert=True)
+        return
+
+    media_type = payload
+    header = TRIN3_HEADER_MOVIE if media_type == "movie" else TRIN3_HEADER_TV
+
+    try:
+        await query.edit_message_text(
+            text=header,
+            parse_mode="Markdown",
+            reply_markup=_build_categories_keyboard(media_type),
+        )
+    except Exception as e:
+        logger.warning("handle_subgenre_media_callback edit fejl: %s", e)
+
+
+async def handle_subgenre_category_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Trin 3 → Trin 4: Bruger valgte en kategori."""
+    query = update.callback_query
+    await query.answer()
+
+    if not await _guard(update):
+        return
+
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        logger.warning("handle_subgenre_category_callback: malformed data='%s'", query.data)
+        await query.answer("Ugyldigt valg", show_alert=True)
+        return
+
+    _, media_type, payload = parts
+
+    if media_type not in ("movie", "tv"):
+        await query.answer("Ugyldig media-type", show_alert=True)
+        return
+
+    if payload == "random":
+        cats_dict = (
+            SUBGENRE_CATEGORIES_MOVIE if media_type == "movie"
+            else SUBGENRE_CATEGORIES_TV
+        )
+        category_id = random.choice(list(cats_dict.keys()))
+        logger.info(
+            "Watch flow: random kategori (media=%s) → '%s'",
+            media_type, category_id,
+        )
     else:
         category_id = payload
 
-    cat = get_category(category_id)
+    cat = get_category(category_id, media_type=media_type)
     if cat is None:
-        logger.warning("handle_subgenre_category_callback: ukendt category_id='%s'", category_id)
+        logger.warning(
+            "handle_subgenre_category_callback: ukendt category_id='%s' (media=%s)",
+            category_id, media_type,
+        )
         await query.answer("Den kategori findes ikke", show_alert=True)
         return
 
     try:
         await query.edit_message_text(
-            text=TRIN3_HEADER_TPL.format(label=f"*{cat['label']}*"),
+            text=TRIN4_HEADER_TPL.format(label=f"*{cat['label']}*"),
             parse_mode="Markdown",
-            reply_markup=_build_subgenres_keyboard(category_id),
+            reply_markup=_build_subgenres_keyboard(media_type, category_id),
         )
     except Exception as e:
         logger.warning("handle_subgenre_category_callback edit fejl: %s", e)
@@ -376,108 +530,132 @@ async def handle_subgenre_category_callback(
 async def handle_subgenre_pick_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """
-    Trin 3 → Trin 4: Bruger valgte en specifik subgenre.
-    Kald find_unwatched_v2 og vis 5 forslag.
-    """
+    """Trin 4 → Trin 5: Bruger valgte en specifik subgenre."""
     query = update.callback_query
     await query.answer()
 
     if not await _guard(update):
         return
 
-    subgenre_id = query.data.split(":", 1)[1]
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Ugyldigt valg", show_alert=True)
+        return
 
-    if not validate_subgenre_id(subgenre_id):
-        logger.warning("handle_subgenre_pick_callback: ukendt subgenre_id='%s'", subgenre_id)
+    _, media_type, subgenre_id = parts
+
+    if not validate_subgenre_id(subgenre_id, media_type=media_type):
+        logger.warning(
+            "handle_subgenre_pick_callback: ukendt subgenre_id='%s' (media=%s)",
+            subgenre_id, media_type,
+        )
         await query.answer("Den subgenre findes ikke", show_alert=True)
         return
 
-    await _execute_subgenre_search(update, context, subgenre_id, edit_message=True)
+    await _execute_subgenre_search(
+        update, context, media_type, subgenre_id, edit_message=True,
+    )
 
 
 async def handle_subgenre_random_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """
-    Trin 3 special: Bruger trykkede '🎲 Overrask mig (i denne kategori)'.
-    Vælg random subgenre i kategorien og vis forslag.
-    """
+    """Trin 4 special: Bruger trykkede '🎲 Overrask mig (i denne kategori)'."""
     query = update.callback_query
     await query.answer()
 
     if not await _guard(update):
         return
 
-    category_id = query.data.split(":", 1)[1]
-    cat = get_category(category_id)
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Ugyldigt valg", show_alert=True)
+        return
+
+    _, media_type, category_id = parts
+    cat = get_category(category_id, media_type=media_type)
     if cat is None or not cat["subgenres"]:
         await query.answer("Den kategori er tom", show_alert=True)
         return
 
     subgenre_id = random.choice([s["id"] for s in cat["subgenres"]])
     logger.info(
-        "Watch flow: random subgenre i kategori '%s' → '%s'",
-        category_id, subgenre_id,
+        "Watch flow: random subgenre i kategori '%s' (media=%s) → '%s'",
+        category_id, media_type, subgenre_id,
     )
 
-    await _execute_subgenre_search(update, context, subgenre_id, edit_message=True)
+    await _execute_subgenre_search(
+        update, context, media_type, subgenre_id, edit_message=True,
+    )
 
 
 async def handle_subgenre_refresh_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """
-    Trin 4 action: '🔄 5 nye forslag' — kald find_unwatched_v2 igen
-    for samme subgenre. Smart-blanding sikrer nye film hver gang.
-    """
+    """Trin 5 action: '🔄 5 nye forslag'."""
     query = update.callback_query
     await query.answer("🔄 Henter nye forslag...")
 
     if not await _guard(update):
         return
 
-    subgenre_id = query.data.split(":", 1)[1]
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Ugyldigt valg", show_alert=True)
+        return
 
-    if not validate_subgenre_id(subgenre_id):
+    _, media_type, subgenre_id = parts
+
+    if not validate_subgenre_id(subgenre_id, media_type=media_type):
         await query.answer("Den subgenre findes ikke", show_alert=True)
         return
 
-    await _execute_subgenre_search(update, context, subgenre_id, edit_message=True)
+    await _execute_subgenre_search(
+        update, context, media_type, subgenre_id, edit_message=True,
+    )
 
 
 async def handle_subgenre_next_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """
-    Trin 4 action: '⏭️ Næste subgenre' — vælg en ANDEN random subgenre
-    i samme kategori. Vis kategori-keyboardet hvis kun én subgenre.
-    """
+    """Trin 5 action: '⏭️ Næste subgenre'."""
     query = update.callback_query
     await query.answer()
 
     if not await _guard(update):
         return
 
-    category_id = query.data.split(":", 1)[1]
-    cat = get_category(category_id)
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Ugyldigt valg", show_alert=True)
+        return
 
-    if cat is None or len(cat["subgenres"]) < 2:
-        # Kun én subgenre i kategorien — gå tilbage til kategorier
+    _, media_type, category_id = parts
+    cat = get_category(category_id, media_type=media_type)
+
+    if cat is None:
+        header = TRIN3_HEADER_MOVIE if media_type == "movie" else TRIN3_HEADER_TV
         await query.edit_message_text(
-            text=TRIN2_HEADER,
+            text=header,
             parse_mode="Markdown",
-            reply_markup=_build_categories_keyboard(),
+            reply_markup=_build_categories_keyboard(media_type),
         )
         return
 
-    # Vi vil gerne vise kategorien igen så brugeren ser alle subgenrerne
-    # — det giver mere kontrol end at hoppe direkte til en random.
+    if len(cat["subgenres"]) < 2:
+        header = TRIN3_HEADER_MOVIE if media_type == "movie" else TRIN3_HEADER_TV
+        await query.edit_message_text(
+            text=header,
+            parse_mode="Markdown",
+            reply_markup=_build_categories_keyboard(media_type),
+        )
+        return
+
     try:
         await query.edit_message_text(
-            text=TRIN3_HEADER_TPL.format(label=f"*{cat['label']}*"),
+            text=TRIN4_HEADER_TPL.format(label=f"*{cat['label']}*"),
             parse_mode="Markdown",
-            reply_markup=_build_subgenres_keyboard(category_id),
+            reply_markup=_build_subgenres_keyboard(media_type, category_id),
         )
     except Exception as e:
         logger.warning("handle_subgenre_next_callback edit fejl: %s", e)
@@ -486,31 +664,85 @@ async def handle_subgenre_next_callback(
 async def handle_subgenre_back_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """
-    Trin 3/4 action: '⬅️ Tilbage til kategorier' — vis kategori-keyboard.
-    """
+    """Tilbage-navigation."""
     query = update.callback_query
     await query.answer()
 
     if not await _guard(update):
         return
 
-    try:
-        await query.edit_message_text(
-            text=TRIN2_HEADER,
-            parse_mode="Markdown",
-            reply_markup=_build_categories_keyboard(),
-        )
-    except Exception as e:
-        logger.warning("handle_subgenre_back_callback edit fejl: %s", e)
+    parts = query.data.split(":")
+    if len(parts) < 2:
+        await query.answer("Ugyldigt valg", show_alert=True)
+        return
+
+    direction = parts[1]
+
+    if direction == "media":
+        try:
+            await query.edit_message_text(
+                text=TRIN2_HEADER,
+                parse_mode="Markdown",
+                reply_markup=_build_media_keyboard(),
+            )
+        except Exception as e:
+            logger.warning("handle_subgenre_back_callback (media) fejl: %s", e)
+        return
+
+    if direction == "cats":
+        if len(parts) < 3:
+            await query.answer("Ugyldigt valg", show_alert=True)
+            return
+        media_type = parts[2]
+        if media_type not in ("movie", "tv"):
+            await query.answer("Ugyldig media-type", show_alert=True)
+            return
+        header = TRIN3_HEADER_MOVIE if media_type == "movie" else TRIN3_HEADER_TV
+        try:
+            await query.edit_message_text(
+                text=header,
+                parse_mode="Markdown",
+                reply_markup=_build_categories_keyboard(media_type),
+            )
+        except Exception as e:
+            logger.warning("handle_subgenre_back_callback (cats) fejl: %s", e)
+        return
+
+    if direction == "subs":
+        if len(parts) < 4:
+            await query.answer("Ugyldigt valg", show_alert=True)
+            return
+        media_type  = parts[2]
+        category_id = parts[3]
+        if media_type not in ("movie", "tv"):
+            await query.answer("Ugyldig media-type", show_alert=True)
+            return
+        cat = get_category(category_id, media_type=media_type)
+        if cat is None:
+            header = TRIN3_HEADER_MOVIE if media_type == "movie" else TRIN3_HEADER_TV
+            await query.edit_message_text(
+                text=header,
+                parse_mode="Markdown",
+                reply_markup=_build_categories_keyboard(media_type),
+            )
+            return
+        try:
+            await query.edit_message_text(
+                text=TRIN4_HEADER_TPL.format(label=f"*{cat['label']}*"),
+                parse_mode="Markdown",
+                reply_markup=_build_subgenres_keyboard(media_type, category_id),
+            )
+        except Exception as e:
+            logger.warning("handle_subgenre_back_callback (subs) fejl: %s", e)
+        return
+
+    logger.warning("handle_subgenre_back_callback: ukendt direction='%s'", direction)
 
 
 async def handle_subgenre_cancel_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """
-    '❌ Afbryd' eller '❌ Færdig' — luk flowet.
-    """
+    """'❌ Afbryd' eller '❌ Færdig' — luk flowet."""
     query = update.callback_query
     await query.answer()
 
@@ -529,24 +761,16 @@ async def handle_subgenre_cancel_callback(
 async def _execute_subgenre_search(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    media_type: str,
     subgenre_id: str,
     edit_message: bool = True,
 ) -> None:
-    """
-    Fælles logik for alle veje der ender i et v2-kald:
-      - handle_subgenre_pick_callback
-      - handle_subgenre_random_callback
-      - handle_subgenre_refresh_callback
-
-    Kalder find_unwatched_v2, formaterer resultatet og opdaterer beskeden.
-    Viser loading-tekst undervejs.
-    """
+    """Fælles logik for alle veje der ender i et v2-kald."""
     query = update.callback_query
     user  = query.from_user
     chat  = query.message.chat
 
-    # Loading-state — opdater beskeden med "henter..."
-    sub = get_subgenre(subgenre_id)
+    sub = get_subgenre(subgenre_id, media_type=media_type)
     sub_label = sub["label"] if sub else subgenre_id
 
     try:
@@ -557,10 +781,8 @@ async def _execute_subgenre_search(
     except Exception:
         pass
 
-    # Hent plex_username
     plex_username = await database.get_plex_username(user.id)
 
-    # Kald v2-funktionen
     try:
         result = await find_unwatched_v2(
             subgenre_id=subgenre_id,
@@ -568,38 +790,41 @@ async def _execute_subgenre_search(
             limit=5,
         )
     except Exception as e:
-        logger.error("_execute_subgenre_search fejl for '%s': %s", subgenre_id, e)
+        logger.error(
+            "_execute_subgenre_search fejl for '%s' (media=%s): %s",
+            subgenre_id, media_type, e,
+        )
         try:
             await query.edit_message_text(
                 f"❌ Hov, noget gik galt: `{e}`\n\nPrøv en anden subgenre.",
                 parse_mode="Markdown",
-                reply_markup=_build_results_keyboard(subgenre_id, has_results=False),
+                reply_markup=_build_results_keyboard(
+                    media_type, subgenre_id, has_results=False,
+                ),
             )
         except Exception:
             pass
         return
 
-    # Format resultat
-    message_text, has_results = _format_results_message(result)
-    keyboard = _build_results_keyboard(subgenre_id, has_results=has_results)
+    message_text, has_results = _format_results_message(result, media_type)
+    keyboard = _build_results_keyboard(
+        media_type, subgenre_id, has_results=has_results,
+    )
 
-    # Log brugeraktivitet
     await database.log_message(
         user.id,
         "incoming",
-        f"[watch_flow] subgenre={subgenre_id}",
+        f"[watch_flow] media={media_type} subgenre={subgenre_id}",
     )
     stats = result.get("stats", {}) or {}
     await database.log_message(
         user.id,
         "outgoing",
-        f"[watch_flow] {subgenre_id} → "
+        f"[watch_flow] {media_type}/{subgenre_id} → "
         f"{stats.get('returned', 0)} forslag (af {stats.get('unwatched', 0)} usete)",
     )
 
-    # Opdater beskeden med resultater
     try:
-        # Markdown kan fejle ved specielle tegn — escape underscores i URL'er
         safe_text = escape_markdown(message_text)
         await query.edit_message_text(
             text=safe_text,
@@ -616,6 +841,496 @@ async def _execute_subgenre_search(
             )
         except Exception as e2:
             logger.error("_execute_subgenre_search fallback fejl: %s", e2)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FEEDBACK FLOW (v0.14.0) — NY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_feedback_category_keyboard() -> InlineKeyboardMarkup:
+    """
+    Trin 1: Vælg feedback-kategori.
+
+    Layout: 2x2 grid med 4 kategorier + Afbryd nederst.
+    Callback-data: 'fb_type:<type_id>' eller 'fb_cancel'
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+
+    # 2x2 grid (idea+bug, question+praise)
+    type_ids = list_feedback_type_ids()
+    for i in range(0, len(type_ids), 2):
+        row = []
+        for tid in type_ids[i:i+2]:
+            ft = get_feedback_type(tid)
+            if ft:
+                row.append(InlineKeyboardButton(
+                    ft["label"],
+                    callback_data=f"fb_type:{tid}",
+                ))
+        if row:
+            rows.append(row)
+
+    rows.append([
+        InlineKeyboardButton("❌ Afbryd", callback_data="fb_cancel"),
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_feedback_compose_keyboard() -> InlineKeyboardMarkup:
+    """
+    Trin 2: Mens brugeren skriver — '✅ Send' og '❌ Afbryd' knapper.
+    """
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Send", callback_data="fb_submit")],
+        [InlineKeyboardButton("❌ Afbryd", callback_data="fb_cancel")],
+    ])
+
+
+def _get_feedback_draft(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """
+    Hent draft-data fra context.user_data — opretter tom hvis mangler.
+
+    Struktur:
+      {
+        "feedback_type": "bug",
+        "message_parts": ["første del", "anden del"],
+        "screenshot_file_ids": ["AgACAg...", ...],
+        "compose_message_id": 12345,  # message_id af 'Skriv din feedback' beskeden
+      }
+    """
+    draft = context.user_data.get("feedback_draft")
+    if draft is None:
+        draft = {
+            "feedback_type":         None,
+            "message_parts":         [],
+            "screenshot_file_ids":   [],
+            "compose_message_id":    None,
+        }
+        context.user_data["feedback_draft"] = draft
+    return draft
+
+
+def _clear_feedback_draft(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Nulstil draft-data efter Send eller Afbryd."""
+    context.user_data.pop("feedback_draft", None)
+
+
+async def handle_feedback_trigger(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Bruger trykkede '💬 Feedback'-knappen i bundmenuen.
+
+    Vis kategori-knapperne. Hvis bruger ikke er Plex-onboarded,
+    sendes de gennem onboarding først (samme guard som watch flow).
+    """
+    if not await _guard(update):
+        return
+
+    user = update.effective_user
+    await database.log_message(user.id, "incoming", FEEDBACK_TRIGGER)
+
+    if await _needs_plex_setup(update):
+        return
+
+    # Nulstil eventuel tidligere draft
+    _clear_feedback_draft(context)
+
+    await update.message.reply_text(
+        "💬 *Hvad har du på hjerte?*\n\n"
+        "Vælg en kategori 👇",
+        parse_mode="Markdown",
+        reply_markup=_build_feedback_category_keyboard(),
+    )
+    logger.info("Feedback flow startet for telegram_id=%s", user.id)
+
+
+async def handle_feedback_type_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Bruger valgte feedback-kategori → vis 'Skriv din besked' prompt.
+
+    Sætter onboarding_state='awaiting_feedback' og gemmer feedback_type
+    i draft. Næste tekst-besked fra brugeren tolkes som feedback-indhold.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    if not await _guard(update):
+        return
+
+    user = query.from_user
+    type_id = query.data.split(":", 1)[1]
+
+    if not validate_feedback_type(type_id):
+        await query.answer("Ukendt kategori", show_alert=True)
+        return
+
+    ft = get_feedback_type(type_id)
+
+    # Gem feedback_type i draft
+    draft = _get_feedback_draft(context)
+    draft["feedback_type"] = type_id
+    draft["message_parts"] = []
+    draft["screenshot_file_ids"] = []
+
+    # Sæt onboarding-state så handle_text router videre tekst til feedback-input
+    await database.set_onboarding_state(user.id, FEEDBACK_STATE)
+
+    prompt = (
+        f"{ft['label']}\n\n"
+        f"📝 *Skriv din feedback nu*\n\n"
+        f"Du kan:\n"
+        f"  • Skrive en eller flere tekstbeskeder\n"
+        f"  • Sende billeder/screenshots (så mange du vil)\n"
+        f"  • Trykke *✅ Send* når du er færdig\n\n"
+        f"_Eller tryk ❌ Afbryd hvis du fortrød._"
+    )
+
+    try:
+        sent = await query.edit_message_text(
+            text=prompt,
+            parse_mode="Markdown",
+            reply_markup=_build_feedback_compose_keyboard(),
+        )
+        # Gem message_id så vi kan opdatere "Send"-knappen senere hvis nødvendigt
+        if sent:
+            draft["compose_message_id"] = sent.message_id
+    except Exception as e:
+        logger.warning("handle_feedback_type_callback edit fejl: %s", e)
+
+    logger.info(
+        "Feedback flow: telegram_id=%s valgte type='%s'",
+        user.id, type_id,
+    )
+
+
+async def _handle_feedback_text_input(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
+) -> None:
+    """
+    Bruger har skrevet tekst mens onboarding_state='awaiting_feedback'.
+
+    Tilføj teksten til draft.message_parts. Bekræft kort at det er modtaget.
+    """
+    user = update.effective_user
+    draft = _get_feedback_draft(context)
+
+    # Combiner alle parts senere — bare append nu
+    draft["message_parts"].append(text.strip())
+
+    total_chars = sum(len(p) for p in draft["message_parts"])
+    if total_chars > FEEDBACK_MAX_LENGTH:
+        await update.message.reply_text(
+            f"⚠️ Din besked er nu længere end {FEEDBACK_MAX_LENGTH} tegn — "
+            f"jeg tager kun de første. Tryk *✅ Send* hvis du er færdig.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Diskret bekræftelse — ingen larmende besked
+    parts_count   = len(draft["message_parts"])
+    photos_count  = len(draft["screenshot_file_ids"])
+
+    bits = []
+    if parts_count == 1:
+        bits.append("1 tekstbesked")
+    elif parts_count > 1:
+        bits.append(f"{parts_count} tekstbeskeder")
+
+    if photos_count == 1:
+        bits.append("1 screenshot")
+    elif photos_count > 1:
+        bits.append(f"{photos_count} screenshots")
+
+    summary = " + ".join(bits) if bits else "intet endnu"
+
+    await update.message.reply_text(
+        f"📥 _Modtaget — du har sendt {summary}._\n\n"
+        f"Tryk *✅ Send* når du er færdig, eller skriv mere.",
+        parse_mode="Markdown",
+        reply_markup=_build_feedback_compose_keyboard(),
+    )
+
+
+async def handle_feedback_photo(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Bruger sendte et foto — gem file_id hvis i feedback-flow.
+
+    Telegram sender flere størrelser; vi gemmer den største (sidste i listen).
+    """
+    if not await _guard(update):
+        return
+
+    user = update.effective_user
+
+    # Tjek om bruger er i feedback-state
+    state = await database.get_onboarding_state(user.id)
+    if state != FEEDBACK_STATE:
+        # Bruger er ikke i feedback-flow — ignorer fotoet
+        # (vi har pt. ikke andre photo-flows i Buddy)
+        logger.debug(
+            "handle_feedback_photo: telegram_id=%s sendte foto uden at være i feedback-flow",
+            user.id,
+        )
+        return
+
+    if not update.message or not update.message.photo:
+        return
+
+    # Hent største foto-størrelse (sidste element)
+    largest = update.message.photo[-1]
+    file_id = largest.file_id
+
+    draft = _get_feedback_draft(context)
+    draft["screenshot_file_ids"].append(file_id)
+
+    # Hvis brugeren også sendte caption, tilføj det til message_parts
+    caption = update.message.caption
+    if caption and caption.strip():
+        draft["message_parts"].append(caption.strip())
+
+    photos_count = len(draft["screenshot_file_ids"])
+    parts_count  = len(draft["message_parts"])
+
+    photo_word = "screenshot" if photos_count == 1 else "screenshots"
+
+    msg = f"📷 _Screenshot modtaget ({photos_count} i alt)._"
+    if parts_count > 0:
+        msg += "\n\nTryk *✅ Send* når du er færdig."
+
+    await update.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        reply_markup=_build_feedback_compose_keyboard(),
+    )
+
+    logger.info(
+        "Feedback flow: telegram_id=%s tilføjede foto (#%d)",
+        user.id, photos_count,
+    )
+
+
+async def handle_feedback_submit_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Bruger trykkede '✅ Send' — gem feedback i DB og notificér admin.
+    """
+    query = update.callback_query
+
+    if not await _guard(update):
+        return
+
+    user = query.from_user
+    draft = _get_feedback_draft(context)
+
+    # Validér draft
+    feedback_type = draft.get("feedback_type")
+    if not feedback_type or not validate_feedback_type(feedback_type):
+        await query.answer("Hov, der mangler en kategori — start forfra.", show_alert=True)
+        await _abort_feedback_flow(query, context, user.id)
+        return
+
+    message_parts = draft.get("message_parts", [])
+    file_ids      = draft.get("screenshot_file_ids", [])
+
+    # Kombinér tekstbeskeder
+    full_message = "\n\n".join(p for p in message_parts if p.strip())
+
+    # Brugeren skal have skrevet noget — eller sendt mindst ét screenshot
+    if not full_message and not file_ids:
+        await query.answer(
+            "Du har ikke skrevet eller sendt noget endnu — skriv din feedback først.",
+            show_alert=True,
+        )
+        return
+
+    # Trim til max-længde
+    if len(full_message) > FEEDBACK_MAX_LENGTH:
+        full_message = full_message[:FEEDBACK_MAX_LENGTH] + "..."
+
+    # Hvis kun screenshots og ingen tekst, brug placeholder
+    if not full_message:
+        full_message = "(Ingen tekstbesked — kun screenshot(s))"
+
+    await query.answer("Sender din feedback... 🚀")
+
+    # Gem i DB
+    try:
+        feedback_id = await database.submit_feedback(
+            telegram_id=user.id,
+            feedback_type=feedback_type,
+            message=full_message,
+            screenshot_file_ids=file_ids,
+            telegram_username=user.username,
+            telegram_name=user.first_name,
+        )
+    except Exception as e:
+        logger.error("submit_feedback fejl for telegram_id=%s: %s", user.id, e)
+        try:
+            await query.edit_message_text(
+                f"❌ Hov, der gik noget galt: `{e}`\n\nPrøv igen lidt senere.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        await _abort_feedback_flow(query, context, user.id, skip_db=True)
+        return
+
+    # Tak til brugeren
+    thanks_text = format_user_thanks(feedback_type, feedback_id)
+    try:
+        await query.edit_message_text(
+            text=thanks_text,
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning("feedback submit edit fejl: %s", e)
+
+    # Notificér admin (best-effort — fail vises ikke til bruger)
+    try:
+        feedback_row = await database.get_feedback(feedback_id)
+        if feedback_row:
+            await notify_admin_about_feedback(context, feedback_row)
+    except Exception as e:
+        logger.error("notify_admin_about_feedback fejl: %s", e)
+
+    # Cleanup
+    _clear_feedback_draft(context)
+    await database.set_onboarding_state(user.id, None)
+
+    await database.log_message(
+        user.id,
+        "outgoing",
+        f"[feedback] type={feedback_type} id=#{feedback_id} screenshots={len(file_ids)}",
+    )
+    logger.info(
+        "Feedback submitted: id=%d type=%s telegram_id=%s screenshots=%d",
+        feedback_id, feedback_type, user.id, len(file_ids),
+    )
+
+
+async def handle_feedback_cancel_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Bruger trykkede '❌ Afbryd' — luk flow og slet draft."""
+    query = update.callback_query
+    await query.answer("Afbrudt 👍")
+
+    user = query.from_user
+
+    try:
+        await query.edit_message_text(
+            "Ingen feedback sendt. Tryk på 💬 Feedback igen når du har lyst. 👍"
+        )
+    except Exception as e:
+        logger.warning("handle_feedback_cancel_callback edit fejl: %s", e)
+
+    _clear_feedback_draft(context)
+    await database.set_onboarding_state(user.id, None)
+
+    logger.info("Feedback flow afbrudt af telegram_id=%s", user.id)
+
+
+async def _abort_feedback_flow(
+    query, context: ContextTypes.DEFAULT_TYPE, telegram_id: int,
+    skip_db: bool = False,
+) -> None:
+    """Hjælper til oprydning ved fejl."""
+    _clear_feedback_draft(context)
+    if not skip_db:
+        try:
+            await database.set_onboarding_state(telegram_id, None)
+        except Exception as e:
+            logger.warning("_abort_feedback_flow DB fejl: %s", e)
+
+
+async def notify_admin_about_feedback(
+    context: ContextTypes.DEFAULT_TYPE, feedback: dict,
+) -> None:
+    """
+    Send notifikation til admin via Buddy-bot direkte.
+
+    Sender først tekst-beskeden, derefter screenshots som media-group hvis
+    der er nogen vedhæftet. Admin-bot kan ikke se Buddys file_ids direkte —
+    men vi kan re-sende dem fordi det er samme bot-token.
+
+    NB: Admin-botten har sin egen kanal hvor den lister alt feedback.
+    DENNE notifikation er bare en "hej, der er noget nyt" via Buddy-chat.
+    """
+    if not feedback:
+        return
+
+    admin_id = config.ADMIN_TELEGRAM_ID
+    notification_text = format_admin_notification(feedback)
+    file_ids = feedback.get("screenshot_file_ids", []) or []
+
+    # Send tekst-besked
+    try:
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=notification_text,
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        # Fallback uden Markdown hvis der er parsing-fejl
+        logger.warning("notify_admin_about_feedback Markdown fejl: %s", e)
+        try:
+            plain = notification_text.replace("*", "").replace("_", "").replace("`", "")
+            plain = plain.replace("\\#", "#").replace("\\(", "(").replace("\\)", ")")
+            plain = plain.replace("\\-", "-")
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=plain,
+            )
+        except Exception as e2:
+            logger.error("notify_admin_about_feedback fallback fejl: %s", e2)
+            return
+
+    # Send screenshots hvis nogen
+    if file_ids:
+        try:
+            if len(file_ids) == 1:
+                await context.bot.send_photo(
+                    chat_id=admin_id,
+                    photo=file_ids[0],
+                    caption=f"📷 Screenshot fra feedback #{feedback.get('id', '?')}",
+                )
+            else:
+                # Send som media group (max 10 per group)
+                media_group = [
+                    InputMediaPhoto(media=fid)
+                    for fid in file_ids[:10]
+                ]
+                # Caption på første medie
+                if media_group:
+                    media_group[0] = InputMediaPhoto(
+                        media=file_ids[0],
+                        caption=f"📷 Screenshots fra feedback #{feedback.get('id', '?')}",
+                    )
+                await context.bot.send_media_group(
+                    chat_id=admin_id,
+                    media=media_group,
+                )
+
+                # Hvis der er flere end 10, send resten i ny gruppe
+                if len(file_ids) > 10:
+                    extra_group = [
+                        InputMediaPhoto(media=fid)
+                        for fid in file_ids[10:20]
+                    ]
+                    if extra_group:
+                        await context.bot.send_media_group(
+                            chat_id=admin_id,
+                            media=extra_group,
+                        )
+        except Exception as e:
+            logger.error("notify_admin_about_feedback photo-send fejl: %s", e)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1681,18 +2396,31 @@ async def _cmd_top_keywords_dump(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# /test_v2 — admin DEBUG-kommando (uændret fra v0.10.8)
+# /test_v2 — admin DEBUG-kommando
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _format_subgenre_list() -> str:
+    """List ALLE subgenrer fra både film og TV katalog."""
     lines = [
         "📋 *Alle subgenre-IDs*",
         "═══════════════════════",
         "",
         "_Brug `/test_v2 <subgenre_id>` for at teste én._",
         "",
+        "🎬 *FILM-SUBGENRER*",
+        "─────────────",
     ]
-    for cat in get_all_categories():
+    for cat in get_all_categories(media_type="movie"):
+        lines.append(f"*{cat['label']}*")
+        for sub in cat["subgenres"]:
+            lines.append(f"  • `{sub['id']}` — {sub['label']}")
+        lines.append("")
+
+    lines.extend([
+        "📺 *TV-SUBGENRER*",
+        "─────────────",
+    ])
+    for cat in get_all_categories(media_type="tv"):
         lines.append(f"*{cat['label']}*")
         for sub in cat["subgenres"]:
             lines.append(f"  • `{sub['id']}` — {sub['label']}")
@@ -1778,7 +2506,7 @@ async def cmd_test_v2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "`/test_v2 <subgenre_id>` — test specifik\n\n"
             "*Eksempler:*\n"
             "`/test_v2 horror_slasher`\n"
-            "`/test_v2 comedy_romcom`\n"
+            "`/test_v2 tv_period_drama`\n"
             "`/test_v2 special_revenge`",
             parse_mode="Markdown",
         )
@@ -1799,7 +2527,7 @@ async def cmd_test_v2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     subgenre_id = args[0].lower().strip()
 
     if not validate_subgenre_id(subgenre_id):
-        all_ids = list_subgenre_ids()
+        all_ids = list_subgenre_ids(media_type="all")
         suggestions = [sid for sid in all_ids if subgenre_id in sid or sid.startswith(subgenre_id[:4])][:5]
         suggestion_text = ""
         if suggestions:
@@ -1856,22 +2584,10 @@ async def cmd_test_v2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# /audit_tv_subgenres — Admin-kommando til at audite TV subgenre-dækning
-# (NY v0.12.0 — forberedelse til Etape C TV-flow implementation)
+# /audit_tv_subgenres — uændret
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_audit_tv_subgenres(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Test alle 36 subgenrer mod tmdb_metadata for media_type='tv'.
-
-    Returnerer rapport med:
-      - Stærke subgenrer (>20 serier)
-      - Svage subgenrer (1-20 serier)
-      - Tomme subgenrer (0 serier)
-      - Anbefaling om subgenrer skal skjules eller udvides
-
-    Bruges som forberedelse til at bygge TV Watch Flow.
-    """
     user = update.effective_user
     if user is None or user.id != config.ADMIN_TELEGRAM_ID:
         return
@@ -1879,38 +2595,33 @@ async def cmd_audit_tv_subgenres(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.chat.send_action("typing")
     loading = await update.message.reply_text(
         "🔍 *Auditer TV Subgenres*\n\n"
-        "Tester alle 36 subgenrer mod TV-data...",
+        "Tester alle subgenrer mod TV-data...",
         parse_mode="Markdown",
     )
 
-    # Test alle subgenrer parallelt
-    sub_ids = list_subgenre_ids()
+    sub_ids = list_subgenre_ids(media_type="all")
 
     counts = await asyncio.gather(*[
         database.count_titles_by_subgenre(sub_id, media_type="tv")
         for sub_id in sub_ids
     ])
 
-    # Build resultat-liste sorteret efter antal
     results = [
         (sub_id, count, get_subgenre(sub_id))
         for sub_id, count in zip(sub_ids, counts)
     ]
     results.sort(key=lambda x: x[1], reverse=True)
 
-    # Kategoriser
     strong = [r for r in results if r[1] > 20]
     medium = [r for r in results if 1 <= r[1] <= 20]
     empty  = [r for r in results if r[1] == 0]
 
-    # Hent total antal serier i database
     try:
         status = await database.get_metadata_status()
         total_tv = status["by_media_type"]["tv"]["fetched"]
     except Exception:
         total_tv = 0
 
-    # Format rapport
     lines = [
         "📊 *TV Subgenre Coverage*",
         "═══════════════════════",
@@ -1945,7 +2656,6 @@ async def cmd_audit_tv_subgenres(update: Update, context: ContextTypes.DEFAULT_T
             lines.append(f"  • {label}")
         lines.append("")
 
-    # Anbefaling
     lines.append("💡 *ANBEFALING:*")
     if len(empty) > 0:
         lines.append(f"  • Skjul {len(empty)} tomme subgenrer for TV-mode")
@@ -1958,7 +2668,6 @@ async def cmd_audit_tv_subgenres(update: Update, context: ContextTypes.DEFAULT_T
 
     report = "\n".join(lines)
 
-    # Telegram begrænser beskeder til 4096 tegn — split hvis nødvendigt
     try:
         await loading.delete()
     except Exception:
@@ -1967,7 +2676,6 @@ async def cmd_audit_tv_subgenres(update: Update, context: ContextTypes.DEFAULT_T
     if len(report) <= 3500:
         await update.message.reply_text(report, parse_mode="Markdown")
     else:
-        # Split ved tom linje før 3500 chars
         split_at = report.rfind("\n\n", 0, 3500)
         if split_at == -1:
             split_at = 3500
@@ -1992,7 +2700,7 @@ def escape_markdown(text: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Guards (uændret)
+# Guards
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _guard(update: Update) -> bool:
@@ -2046,22 +2754,14 @@ async def _handle_plex_input(update: Update, raw_input: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Command handlers (uændret)
+# Command handlers
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── BRUGERGUIDE URL ───────────────────────────────────────────────────────────
-# Hostet på GitHub Pages. Opdater denne hvis du flytter guiden til andet repo.
 BRUGERGUIDE_URL = "https://johnsmith66666.github.io/buddy-guide/"
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Velkomst-handler for /start.
-
-    v0.12.2: Kort velkomstbesked med klikbart link til brugerguiden.
-    Tilbagevendende brugere ser den korte version, mens første-gangs-brugere
-    routes via _needs_plex_setup() til Plex-onboarding først.
-    """
+    """Velkomst-handler for /start."""
     if not await _guard(update):
         return
     user = update.effective_user
@@ -2070,19 +2770,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _needs_plex_setup(update):
         return
 
-    # Telegram Markdown link-format: [tekst](url)
     reply = (
         f"👋 Hej {user.first_name}!\n\n"
         "Jeg er din personlige medie-assistent for Plex. "
         "Tryk på 🍿 *Hvad skal jeg se?* for at finde noget at se, "
         "eller bare skriv til mig som til en ven.\n\n"
+        "Har du en idé eller fundet en bug? Tryk på 💬 *Feedback*-knappen.\n\n"
         f"📖 [Brugerguide]({BRUGERGUIDE_URL})"
     )
     await update.message.reply_text(
         reply,
         parse_mode="Markdown",
         reply_markup=_build_main_reply_keyboard(),
-        disable_web_page_preview=True,  # undgå stort preview-kort
+        disable_web_page_preview=True,
     )
     await database.log_message(user.id, "outgoing", reply)
 
@@ -2123,31 +2823,12 @@ async def handle_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
     await execute_order(query, token, plex_username)
 
 
-
 async def handle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle ❌ Annuller knap pa infokort og soegeresultater.
-
-    UX (v0.11.1): Sletter hele beskeden (foto + caption + knapper) og viser
-    en kort 'Annulleret' toast i toppen af Telegram. Tidligere version
-    redigerede kun caption'en, hvilket efterlod plakaten staende uden
-    handlingsmuligheder — det forvirrede brugere og rodede chat-historik.
-
-    Toast vs. ny besked: Toast er Telegram-native UX (forsvinder selv efter
-    ~3 sek), holder chat-historikken ren, og giver tydelig feedback om at
-    handlingen lykkedes.
-    """
     query = update.callback_query
-
-    # Vis toast i toppen af Telegram (forsvinder selv)
     await query.answer(text="Annulleret 👍", show_alert=False)
-
-    # Ryd op i pending_requests (samme som foer)
     token = query.data.split(":", 1)[1]
     if token != "none":
         await database.get_pending_request(token)
-
-    # Slet hele beskeden — foto, caption og knapper
     try:
         await query.message.delete()
     except Exception as e:
@@ -2174,20 +2855,10 @@ async def handle_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# /info_movie_<id> og /info_tv_<id> handler (v0.12.1 — fix #1 double-fetch)
+# /info_movie_<id> og /info_tv_<id> handler (uændret)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Bruger trykkede paa et /info_movie_<id> eller /info_tv_<id> link.
-
-    v0.12.1 (fix #1): Skip det indledende get_media_details kald.
-    show_confirmation henter alligevel detaljer selv, saa det dobbelte
-    kald spildte 150-200ms per infokort + halvt saa mange TMDB-kald.
-    Vi bruger 'Slaar op...' som placeholder-titel — show_confirmation
-    overskriver den med rigtige detaljer fra TMDB (samme moenster som
-    INFO_SIGNAL flowet i _process_ai_reply).
-    """
     if not await _guard(update):
         return
     logger.info("HANDLER MODTOG: %s", update.message.text)
@@ -2210,9 +2881,6 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         reply_markup=ReplyKeyboardRemove(),
     )
 
-    # v0.12.1: Spring den dobbelte get_media_details over.
-    # show_confirmation henter alligevel detaljer fra TMDB — vi gemmer
-    # bare en placeholder-titel der overskrives senere.
     import secrets as _sec
     token = _sec.token_hex(8)
     await database.save_pending_request(token, user_id, {
@@ -2231,7 +2899,7 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Message handler (uændret)
+# Message handler
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2239,19 +2907,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     user = update.effective_user
     text = (update.message.text or "").strip()
+
+    # Bundknap-triggers (skal håndteres FØR onboarding-state checks)
     if text == WATCH_FLOW_TRIGGER:
         await handle_watch_flow_trigger(update, context)
         return
+    if text == FEEDBACK_TRIGGER:
+        await handle_feedback_trigger(update, context)
+        return
+
     await database.log_message(user.id, "incoming", text)
+
     onboarding_state = await database.get_onboarding_state(user.id)
+
+    # v0.14.0: Hvis bruger er i feedback-input fasen, route teksten der
+    if onboarding_state == FEEDBACK_STATE:
+        await _handle_feedback_text_input(update, context, text)
+        return
+
     if onboarding_state == "awaiting_plex":
         await _handle_plex_input(update, text)
         return
+
     if await _needs_plex_setup(update):
         return
+
     if check_session_timeout(user.id):
         await cmd_start(update, context)
         return
+
     await update.message.chat.send_action("typing")
     plex_username = await database.get_plex_username(user.id)
     persona_id    = await database.get_persona(user.id)
@@ -2397,7 +3081,7 @@ async def _start_webhook_server() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Global error handler (uændret)
+# Global error handler
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2425,6 +3109,7 @@ async def on_startup(application: Application) -> None:
     await database.setup_db()
     await database.setup_pending_requests()
     await database.setup_tmdb_metadata_table()
+    await database.setup_feedback_table()  # v0.14.0
     await _start_webhook_server()
     if not config.WEBHOOK_SECRET:
         logger.warning(
@@ -2432,11 +3117,11 @@ async def on_startup(application: Application) -> None:
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — v0.12.0-beta | "
-        "subgenre-watch-flow: JA | tmdb-metadata-cache: JA | "
-        "find-unwatched-v2: JA | test-v2-cmd: JA | "
-        "audit-tv-subgenres: JA | "
-        "top-keywords-dump: JA | gammel-watch-moods: SLETTET"
+        "VERSION CHECK — v0.14.0-beta | "
+        "feedback-system: JA | media-aware-watch-flow: JA | "
+        "tmdb-metadata-cache: JA | find-unwatched-v2: JA | "
+        "test-v2-cmd: JA | audit-tv-subgenres: JA | "
+        "top-keywords-dump: JA"
     )
 
 
@@ -2461,7 +3146,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start",           cmd_start))
     app.add_handler(CommandHandler("skift_plex",      cmd_skift_plex))
 
-    # Engangs admin-kommandoer (slettes når subgenre-projektet er færdigt)
+    # Engangs admin-kommandoer
     app.add_handler(CommandHandler("genres",          cmd_genres))
     app.add_handler(CommandHandler("dump_genres",     cmd_dump_genres))
     app.add_handler(CommandHandler("test_metadata",   cmd_test_metadata))
@@ -2475,13 +3160,14 @@ def main() -> None:
     # Etape 2 debug-kommando
     app.add_handler(CommandHandler("test_v2",         cmd_test_v2))
 
-    # Etape C forberedelse — TV subgenre audit (NY v0.12.0)
+    # TV subgenre audit
     app.add_handler(CommandHandler("audit_tv_subgenres", cmd_audit_tv_subgenres))
 
     # Admin approval
     app.add_handler(CallbackQueryHandler(handle_approve_callback, pattern=r"^approve_user:\d+$"))
 
-    # ── NYT Watch Flow (Etape 3 — v0.11.0) ──────────────────────────────────
+    # ── Watch Flow (Session 2 — v0.13.0) ────────────────────────────────────
+    app.add_handler(CallbackQueryHandler(handle_subgenre_media_callback,    pattern=r"^sg_media:"))
     app.add_handler(CallbackQueryHandler(handle_subgenre_category_callback, pattern=r"^sg_cat:"))
     app.add_handler(CallbackQueryHandler(handle_subgenre_pick_callback,     pattern=r"^sg_pick:"))
     app.add_handler(CallbackQueryHandler(handle_subgenre_random_callback,   pattern=r"^sg_random:"))
@@ -2489,6 +3175,11 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_subgenre_next_callback,     pattern=r"^sg_next:"))
     app.add_handler(CallbackQueryHandler(handle_subgenre_back_callback,     pattern=r"^sg_back:"))
     app.add_handler(CallbackQueryHandler(handle_subgenre_cancel_callback,   pattern=r"^sg_cancel$"))
+
+    # ── Feedback Flow (NYT v0.14.0) ─────────────────────────────────────────
+    app.add_handler(CallbackQueryHandler(handle_feedback_type_callback,    pattern=r"^fb_type:"))
+    app.add_handler(CallbackQueryHandler(handle_feedback_submit_callback,  pattern=r"^fb_submit$"))
+    app.add_handler(CallbackQueryHandler(handle_feedback_cancel_callback,  pattern=r"^fb_cancel$"))
 
     # Bestillingsflow
     app.add_handler(CallbackQueryHandler(handle_pick_callback,      pattern=r"^pick:"))
@@ -2502,6 +3193,10 @@ def main() -> None:
         (filters.COMMAND | filters.TEXT) & filters.Regex(r"^/info_?(movie|tv)_?(\d+)$"),
         handle_info_link,
     ))
+
+    # ── Photo handler (NYT v0.14.0) ─────────────────────────────────────────
+    # Photos håndteres af feedback-flow når bruger er i 'awaiting_feedback' state.
+    app.add_handler(MessageHandler(filters.PHOTO, handle_feedback_photo))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(handle_error)
