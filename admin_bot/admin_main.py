@@ -69,9 +69,12 @@ async def on_startup(application: Application) -> None:
     await db.setup_db()
     logger.info("Buddy Admin bot started in '%s' environment.", ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — admin-bot v0.1.0 | "
+        "VERSION CHECK — admin-bot v0.2.1 | "
         "feedback-management: JA | reply-via-buddy: JA | "
-        "list/view/reply/resolve/seen/stats: JA"
+        "list/view/reply/resolve/seen/stats: JA | "
+        "bulk-actions: JA | deep-link: JA | "
+        "admin-display-name: '%s'"
+        % (os.getenv("ADMIN_DISPLAY_NAME") or "admin")
     )
     logger.info("Admin user: telegram_id=%s", ADMIN_TELEGRAM_ID)
 

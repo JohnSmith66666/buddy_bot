@@ -1,12 +1,11 @@
 """
-admin_bot/feedback_service.py - Shared feedback constants and formatting helpers.
+services/feedback_service.py - Shared feedback constants and formatting helpers.
 
-⚠️  IMPORTANT: This file is a COPY of services/feedback_service.py from the
-    parent directory. Railway's Root Directory setting (= 'admin_bot') means
-    admin-bot can only see files inside admin_bot/, not parent files.
-
-    KEEP IN SYNC: If you change services/feedback_service.py, you MUST also
-    update this copy. Both files should always be byte-identical.
+CHANGES (v0.3.1 — Polish: configurable admin display name):
+  - FORBEDRET: format_user_received_reply() tager nu 'admin_display_name'
+    parameter (default 'admin'). Tidligere var "Jesper" hardcoded.
+    Admin-bot læser env-var ADMIN_DISPLAY_NAME og videresender det.
+    Det betyder admin-navnet nu kan konfigureres uden code-deploy.
 
 CHANGES (v0.3.0 — Batch B nye flows):
   - NY: format_feedback_preview(draft) → str
@@ -284,17 +283,33 @@ def format_user_received_reply(
     feedback_type: str,
     original_message: str,
     admin_reply: str,
+    admin_display_name: str = "admin",
 ) -> str:
     """
     Besked brugeren modtager når admin har svaret på deres feedback.
 
-    v0.3.0: Footer nævner nu '💬 Svar tilbage'-knappen som tilføjes i main.py.
+    v0.3.1 — Polish session:
+      - Tilføjet 'admin_display_name' parameter (default 'admin').
+        Tidligere var "Jesper" hardcoded — nu kan navnet konfigureres
+        via env-var ADMIN_DISPLAY_NAME som læses i admin-bot.
+
+    v0.3.0:
+      - Footer nævner nu '💬 Svar tilbage'-knappen som tilføjes i main.py.
 
     Sendes via Buddy main-bot (admin-bot kender brugerens telegram_id og
     bruger BUDDY_BOT_TOKEN til at sende beskeden via Buddy).
 
     Format minder om en email-tråd: brugeren ser deres oprindelige besked
     citeret, derefter admins svar tydeligt markeret.
+
+    Args:
+      feedback_id:        ID på den originale feedback
+      feedback_type:      'idea' | 'bug' | 'question' | 'praise'
+      original_message:   Bruger's oprindelige besked
+      admin_reply:        Admin's svar
+      admin_display_name: Navn der vises i 'Svar fra X' overskrift.
+                          Default 'admin'. Sættes typisk til admin's
+                          fornavn via ADMIN_DISPLAY_NAME env-var.
     """
     ft = get_feedback_type(feedback_type)
     type_label = ft["label"] if ft else "Feedback"
@@ -305,6 +320,7 @@ def format_user_received_reply(
 
     safe_quote = escape_md(quote)
     safe_reply = escape_md(admin_reply.strip())
+    safe_admin = escape_md(admin_display_name.strip()) or "admin"
 
     return (
         f"💬 *Du har fået svar på din feedback*\n"
@@ -312,7 +328,7 @@ def format_user_received_reply(
         f"📝 *Din oprindelige besked:*\n"
         f"_{safe_quote}_\n\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"✉️ *Svar fra Jesper:*\n\n"
+        f"✉️ *Svar fra {safe_admin}:*\n\n"
         f"{safe_reply}\n\n"
         f"━━━━━━━━━━━━━━━\n"
         f"_Vil du svare tilbage? Tryk på knappen herunder._"
