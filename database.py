@@ -1,23 +1,28 @@
 """
 database.py - PostgreSQL connection pool, table management,
 user whitelist, Plex username storage, onboarding state, interaktionshistorik,
-pending requests OG TMDB metadata-cache.
+pending requests, TMDB metadata-cache OG feedback-system.
 
-CHANGES vs previous version (v0.13.0 — media-aware subgenre lookup):
-  - NY: find_titles_by_subgenre(subgenre_id, media_type, limit) → list[dict]
-    Generaliseret version af find_films_by_subgenre der virker for både
-    'movie' og 'tv'. Bruger samme GIN-index, smart-blanding og hybrid
-    keyword + genre logik. Tager media_type fra subgenre auto-detect
-    hvis ikke specificeret eksplicit.
+CHANGES vs previous version (v0.14.0 — feedback system):
+  - NY: feedback tabel + indekser til opsamling af bruger-feedback.
+    Tabellen gemmer kategoriseret feedback (idea/bug/question/praise),
+    Telegram screenshot file_ids som JSONB array, og admin-svar med
+    timestamp. Status-felt sporer livscyklus: new → seen → replied → resolved.
+  - NY: setup_feedback_table() kaldt fra setup_db() ved opstart.
+  - NY: submit_feedback() — bruges af Buddy til at gemme ny feedback.
+  - NY: list_feedback(status_filter, type_filter, limit) — admin-bot listing.
+  - NY: get_feedback(feedback_id) — fuld detalje + screenshot file_ids.
+  - NY: update_feedback_status(id, status) — admin markerer som
+    seen/replied/resolved.
+  - NY: add_admin_reply(id, reply_text) — gemmer admin-svar atomisk
+    sammen med status='replied'.
+  - NY: count_feedback_by_status() — bruges til at bygge stats hvis ønsket.
+  - DELT TABEL: Buddy SKRIVER til feedback, admin-bot LÆSER + opdaterer.
+    Begge bots peger på samme MAIN-database (admin lytter ikke til dev).
 
-  - BAGUDKOMPATIBILITET: find_films_by_subgenre(subgenre_id, limit) bevares
-    som tynd wrapper der kalder find_titles_by_subgenre(media_type='movie').
-    Eksisterende v2_service kode brækker ikke.
-
-  - count_titles_by_subgenre(subgenre_id, media_type) er uændret fra v0.12.0
-    men har nu også media_type auto-detect via subgenre_service.
-
-UNCHANGED (v0.12.0 — audit helper):
+UNCHANGED (v0.13.0 — media-aware subgenre lookup):
+  - find_titles_by_subgenre(subgenre_id, media_type, limit) → list[dict]
+  - find_films_by_subgenre legacy wrapper bevares.
   - count_titles_by_subgenre(subgenre_id, media_type) → int
 
 UNCHANGED (v0.11.0 — P0/P1 performance pakke):
@@ -125,6 +130,45 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_keywords
 _CREATE_TMDB_GENRES_GIN = """
 CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_genres
     ON tmdb_metadata USING GIN (tmdb_genres);
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Schema — Feedback (NY i v0.14.0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_CREATE_FEEDBACK_TABLE = """
+CREATE TABLE IF NOT EXISTS feedback (
+    id               SERIAL PRIMARY KEY,
+    telegram_id      BIGINT      NOT NULL,
+    telegram_username TEXT,
+    telegram_name    TEXT,
+    feedback_type    TEXT        NOT NULL
+                     CHECK (feedback_type IN ('idea', 'bug', 'question', 'praise')),
+    message          TEXT        NOT NULL,
+    screenshot_file_ids JSONB    NOT NULL DEFAULT '[]'::jsonb,
+    status           TEXT        NOT NULL DEFAULT 'new'
+                     CHECK (status IN ('new', 'seen', 'replied', 'resolved')),
+    admin_reply      TEXT,
+    admin_replied_at TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+_CREATE_FEEDBACK_STATUS_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_feedback_status
+    ON feedback (status, created_at DESC);
+"""
+
+_CREATE_FEEDBACK_TYPE_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_feedback_type
+    ON feedback (feedback_type, created_at DESC);
+"""
+
+_CREATE_FEEDBACK_USER_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_feedback_telegram_id
+    ON feedback (telegram_id, created_at DESC);
 """
 
 
@@ -901,3 +945,283 @@ async def count_titles_by_subgenre(
         logger.error("count_titles_by_subgenre SQL-fejl for '%s'/%s: %s",
                      subgenre_id, media_type, e)
         return 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Feedback system (NY i v0.14.0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def setup_feedback_table() -> None:
+    """
+    Opret feedback tabellen + indekser. Idempotent.
+
+    Tabellen deles mellem Buddy (skriver via submit_feedback) og admin-bot
+    (læser via list_feedback/get_feedback, opdaterer via update_feedback_status
+    og add_admin_reply). Begge bots peger på samme MAIN-database.
+    """
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(_CREATE_FEEDBACK_TABLE)
+        await conn.execute(_CREATE_FEEDBACK_STATUS_INDEX)
+        await conn.execute(_CREATE_FEEDBACK_TYPE_INDEX)
+        await conn.execute(_CREATE_FEEDBACK_USER_INDEX)
+    logger.info("feedback table + indexes ready.")
+
+
+async def submit_feedback(
+    telegram_id: int,
+    feedback_type: str,
+    message: str,
+    screenshot_file_ids: list[str] | None = None,
+    telegram_username: str | None = None,
+    telegram_name: str | None = None,
+) -> int:
+    """
+    Gem en ny feedback-record. Returnerer feedback-ID til notifikation.
+
+    Args:
+      telegram_id:         Telegram bruger-ID
+      feedback_type:       'idea' | 'bug' | 'question' | 'praise'
+      message:             Brugerens tekst-besked
+      screenshot_file_ids: Liste af Telegram file_ids (kan være tom)
+      telegram_username:   Brugerens @username (kan være None)
+      telegram_name:       Brugerens first_name (kan være None)
+
+    Returns:
+      ID på den nye feedback-record (bruges af admin-notifikation).
+    """
+    if feedback_type not in ("idea", "bug", "question", "praise"):
+        raise ValueError(f"Ugyldig feedback_type: '{feedback_type}'")
+
+    file_ids = screenshot_file_ids or []
+
+    async with _pool_ref().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO feedback (
+                telegram_id, telegram_username, telegram_name,
+                feedback_type, message, screenshot_file_ids
+            )
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+            RETURNING id
+            """,
+            telegram_id,
+            telegram_username,
+            telegram_name,
+            feedback_type,
+            message,
+            json.dumps(file_ids),
+        )
+
+    feedback_id = row["id"] if row else 0
+    logger.info(
+        "submit_feedback: id=%d type=%s telegram_id=%s screenshots=%d",
+        feedback_id, feedback_type, telegram_id, len(file_ids),
+    )
+    return feedback_id
+
+
+async def list_feedback(
+    status_filter: str | None = None,
+    type_filter: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Liste feedback-records sorteret efter nyeste først.
+
+    Args:
+      status_filter: 'new' | 'seen' | 'replied' | 'resolved' | 'active'
+                     (active = new + seen + replied, dvs. ikke resolved)
+                     None = alle
+      type_filter:   'idea' | 'bug' | 'question' | 'praise'
+                     None = alle
+      limit:         Max antal records (default 20)
+
+    Returns:
+      Liste af dicts med alle felter. screenshot_file_ids parses til list.
+    """
+    where_parts: list[str] = []
+    params: list = []
+    param_idx = 1
+
+    if status_filter == "active":
+        where_parts.append("status IN ('new', 'seen', 'replied')")
+    elif status_filter in ("new", "seen", "replied", "resolved"):
+        where_parts.append(f"status = ${param_idx}")
+        params.append(status_filter)
+        param_idx += 1
+
+    if type_filter in ("idea", "bug", "question", "praise"):
+        where_parts.append(f"feedback_type = ${param_idx}")
+        params.append(type_filter)
+        param_idx += 1
+
+    where_clause = ""
+    if where_parts:
+        where_clause = "WHERE " + " AND ".join(where_parts)
+
+    params.append(limit)
+    sql = f"""
+        SELECT id, telegram_id, telegram_username, telegram_name,
+               feedback_type, message, screenshot_file_ids,
+               status, admin_reply, admin_replied_at,
+               created_at, updated_at
+        FROM feedback
+        {where_clause}
+        ORDER BY created_at DESC
+        LIMIT ${param_idx}
+    """
+
+    async with _pool_ref().acquire() as conn:
+        rows = await conn.fetch(sql, *params)
+
+    result = []
+    for row in rows:
+        d = dict(row)
+        try:
+            d["screenshot_file_ids"] = (
+                json.loads(d["screenshot_file_ids"])
+                if isinstance(d["screenshot_file_ids"], str)
+                else (d["screenshot_file_ids"] or [])
+            )
+        except Exception:
+            d["screenshot_file_ids"] = []
+        result.append(d)
+
+    return result
+
+
+async def get_feedback(feedback_id: int) -> dict | None:
+    """
+    Hent én feedback-record med fuld detalje.
+
+    Returns:
+      Dict med alle felter, eller None hvis ID ikke findes.
+      screenshot_file_ids parses til list.
+    """
+    async with _pool_ref().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, telegram_id, telegram_username, telegram_name,
+                   feedback_type, message, screenshot_file_ids,
+                   status, admin_reply, admin_replied_at,
+                   created_at, updated_at
+            FROM feedback
+            WHERE id = $1
+            """,
+            feedback_id,
+        )
+
+    if not row:
+        return None
+
+    d = dict(row)
+    try:
+        d["screenshot_file_ids"] = (
+            json.loads(d["screenshot_file_ids"])
+            if isinstance(d["screenshot_file_ids"], str)
+            else (d["screenshot_file_ids"] or [])
+        )
+    except Exception:
+        d["screenshot_file_ids"] = []
+    return d
+
+
+async def update_feedback_status(feedback_id: int, status: str) -> bool:
+    """
+    Opdater status på en feedback-record.
+
+    Args:
+      feedback_id: ID på record
+      status:      'new' | 'seen' | 'replied' | 'resolved'
+
+    Returns:
+      True hvis record blev opdateret, False hvis ID ikke findes.
+    """
+    if status not in ("new", "seen", "replied", "resolved"):
+        raise ValueError(f"Ugyldig status: '{status}'")
+
+    async with _pool_ref().acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE feedback
+            SET status     = $2,
+                updated_at = NOW()
+            WHERE id = $1
+            """,
+            feedback_id, status,
+        )
+
+    # asyncpg returnerer "UPDATE 1" eller "UPDATE 0"
+    updated = result.endswith(" 1")
+    if updated:
+        logger.info("update_feedback_status: id=%d → '%s'", feedback_id, status)
+    return updated
+
+
+async def add_admin_reply(feedback_id: int, reply_text: str) -> bool:
+    """
+    Gem admin-svar og marker feedback som 'replied'.
+
+    Atomisk operation: opdaterer admin_reply, admin_replied_at og status
+    i én transaction.
+
+    Args:
+      feedback_id: ID på record
+      reply_text:  Admins svar-tekst
+
+    Returns:
+      True hvis record blev opdateret, False hvis ID ikke findes.
+    """
+    async with _pool_ref().acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE feedback
+            SET admin_reply      = $2,
+                admin_replied_at = NOW(),
+                status           = 'replied',
+                updated_at       = NOW()
+            WHERE id = $1
+            """,
+            feedback_id, reply_text,
+        )
+
+    updated = result.endswith(" 1")
+    if updated:
+        logger.info("add_admin_reply: id=%d (%d chars)", feedback_id, len(reply_text))
+    return updated
+
+
+async def count_feedback_by_status() -> dict:
+    """
+    Tæl feedback-records grupperet efter status og type.
+
+    Bruges til admin-bot statistik (Phase 2).
+
+    Returns:
+      {
+        "total": 42,
+        "by_status": {"new": 5, "seen": 3, "replied": 10, "resolved": 24},
+        "by_type":   {"idea": 15, "bug": 20, "question": 5, "praise": 2},
+      }
+    """
+    async with _pool_ref().acquire() as conn:
+        status_rows = await conn.fetch(
+            "SELECT status, COUNT(*) AS cnt FROM feedback GROUP BY status"
+        )
+        type_rows = await conn.fetch(
+            "SELECT feedback_type, COUNT(*) AS cnt FROM feedback GROUP BY feedback_type"
+        )
+
+    by_status = {"new": 0, "seen": 0, "replied": 0, "resolved": 0}
+    for r in status_rows:
+        by_status[r["status"]] = r["cnt"]
+
+    by_type = {"idea": 0, "bug": 0, "question": 0, "praise": 0}
+    for r in type_rows:
+        by_type[r["feedback_type"]] = r["cnt"]
+
+    return {
+        "total":     sum(by_status.values()),
+        "by_status": by_status,
+        "by_type":   by_type,
+    }
