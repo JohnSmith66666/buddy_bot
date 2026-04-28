@@ -1,14 +1,18 @@
 """
 main.py - Buddy bot entry point.
 
-CHANGES (v0.16.4 — UX polish for mobil-skaerm):
+CHANGES (v0.16.4 — UX polish for mobil-skaerm + info-link bugfix):
   - Loading-besked reduceret fra "🤖 Beregner svar med lynets hast..." til
     kun emoji 🔍 — fylder ~30px paa mobil i stedet for ~80px.
   - Genindfoert send_action("typing") fra v0.16.3 — det gav brugerne
     fornemmelse af at "noget sker" som de specifikt efterspurgte.
   - Reply keyboard (🍿 + 💬 knapper) bevares — fjernes IKKE midlertidigt.
-  - Begge aendringer er KUN i AI-chat-flowet (handle_text).
-  - Watch flow, feedback flow, info-links m.fl. er uaendret.
+  - Aendringer i AI-chat (handle_text) OG info-link (handle_info_link).
+  - BUGFIX: handle_info_link fjernede tidligere tastaturet via
+    ReplyKeyboardRemove() naar bruger trykkede paa /info_movie_<id>,
+    men gendannede det aldrig. Knapper forsvandt efter info-kort.
+    Nu fjernes ReplyKeyboardRemove() — tastaturet forbliver synligt.
+  - Watch flow, feedback flow m.fl. er uaendret.
 
 CHANGES (v0.16.3 — Performance polish, AI hot path):
   - PERFORMANCE: handle_text() laver nu plex_username + persona_id i PARALLEL
@@ -3561,11 +3565,13 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     logger.info("Bruger trykkede paa info-link: type=%s, id=%s", media_type, tmdb_id)
     user_id       = update.effective_user.id
     plex_username = await database.get_plex_username(user_id)
+    # v0.16.4 FIX: Tidligere fjernede ReplyKeyboardRemove() tastaturet (knapper)
+    # naar bruger trykkede paa /info_movie_<id> link — og det blev aldrig
+    # genoprettet. Resultat: knapper forsvandt efter info-kort.
+    # Loesning: Drop ReplyKeyboardRemove + brug samme minimale emoji-loader
+    # som AI-chat (handle_text). Tastaturet forbliver synligt.
     await update.message.chat.send_action("typing")
-    loading_msg = await update.message.reply_text(
-        "🤖 Beregner svar med lynets hast... næsten...",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    loading_msg = await update.message.reply_text("🔍")
 
     import secrets as _sec
     token = _sec.token_hex(8)
@@ -3837,7 +3843,8 @@ async def on_startup(application: Application) -> None:
         "/cancel-cmd: JA | admin-inline-buttons: JA | reply-back-button: JA | "
         "admin-notif-via-admin-bot: %s | "
         "polish-fixes: A,B,C,D | parallel-db-hot-path: JA | "
-        "typing-action: JA (genindfoert) | minimal-loading: JA"
+        "typing-action: JA (genindfoert) | minimal-loading: JA | "
+        "info-link-keyboard-fix: JA"
         % ("JA" if ADMIN_BOT_TOKEN else "NEJ (fallback til Buddy)")
     )
     if not ADMIN_BOT_USERNAME:
