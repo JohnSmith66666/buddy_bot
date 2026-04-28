@@ -1,6 +1,19 @@
 """
 main.py - Buddy bot entry point.
 
+CHANGES (v0.16.1 — Notifikationer flyttet til Admin-bot):
+  - NY: notify_admin_about_feedback() bruger nu ADMIN_BOT_TOKEN (hvis sat)
+    til at sende admin-notifikationen. Det betyder admin modtager beskeden
+    i sin Buddy_admin-chat — ikke i Buddy_beta-chatten.
+    Det matcher den klare rolleopdeling:
+      • Buddy = bruger-vendt, ren oplevelse uden admin-noise
+      • Admin = systembeskeder, notifikationer, admin-tools
+  - SIKKER FALLBACK: Hvis ADMIN_BOT_TOKEN env-var IKKE er sat, falder vi
+    tilbage til at sende notifikation via Buddy main (gammel adfærd).
+    Ingen notifikationer går tabt under migration.
+  - VIGTIGT: Screenshots sendes STADIG via Buddy main bot fordi file_ids
+    er fra Buddy main's bot-domæne — admin-bot kan ikke sende dem direkte.
+
 CHANGES (v0.16.0 — Batch B nye flows):
   - NY: Auto-timeout på feedback-state. Hvis bruger har været i
     'awaiting_feedback' state i over 30 minutter uden at sende eller
@@ -196,6 +209,14 @@ FEEDBACK_STATE_TIMEOUT_SECONDS = 30 * 60  # 30 minutter
 # Sættes via env-var ADMIN_BOT_USERNAME (uden @-prefix).
 import os as _os
 ADMIN_BOT_USERNAME: str = (_os.getenv("ADMIN_BOT_USERNAME") or "").strip().lstrip("@")
+
+# v0.16.1 — Admin-bot's token bruges til at sende notifikationer FRA admin-bot's
+# kanal (i stedet for Buddy main-kanalen). Dermed adskilles roller:
+#   • Buddy = bruger-vendt, ren oplevelse uden admin-noise
+#   • Admin = systembeskeder, notifikationer, admin-tools
+# Hvis env-varen ikke er sat, falder vi tilbage til at sende notifikationen
+# via Buddy main (gammel adfærd).
+ADMIN_BOT_TOKEN: str = (_os.getenv("ADMIN_BOT_TOKEN") or "").strip()
 
 
 def _media_label(media_type: str) -> str:
@@ -1735,14 +1756,24 @@ async def notify_admin_about_feedback(
     is_first_time: bool = False,
 ) -> None:
     """
-    Send notifikation til admin via Buddy-bot direkte.
+    Send notifikation til admin om ny feedback.
+
+    v0.16.1: Notifikationen sendes nu via ADMIN-bot's token (ikke Buddy main).
+    Det betyder admin modtager beskeden i sin Buddy_admin-chat — ikke i
+    Buddy_beta-chatten. Det matcher rolleopdelingen:
+      • Buddy = bruger-vendt, ren oplevelse
+      • Admin = systembeskeder, notifikationer, admin-tools
+
+    Hvis ADMIN_BOT_TOKEN env-var ikke er sat, falder vi tilbage til at sende
+    notifikation via Buddy main (gammel adfærd) — så ingen notifikationer
+    går tabt under migration.
 
     Sender først tekst-beskeden, derefter screenshots som media-group hvis
-    der er nogen vedhæftet. Admin-bot kan ikke se Buddys file_ids direkte —
-    men vi kan re-sende dem fordi det er samme bot-token.
+    der er nogen vedhæftet.
 
-    NB: Admin-botten har sin egen kanal hvor den lister alt feedback.
-    DENNE notifikation er bare en "hej, der er noget nyt" via Buddy-chat.
+    NB: Screenshot file_ids stammer fra Buddy main bot. Admin-bot kan IKKE
+    sende dem direkte — vi bruger derfor Buddy main's bot til screenshots
+    (samme metode som tidligere).
 
     v0.15.0: Tager nu 'is_first_time' parameter — videresendes til
     format_admin_notification() der så tilføjer "🆕 NY TESTER" badge.
@@ -1764,9 +1795,26 @@ async def notify_admin_about_feedback(
 
     file_ids = feedback.get("screenshot_file_ids", []) or []
 
+    # v0.16.1: Vælg hvilken bot der skal sende notifikationen.
+    # Hvis ADMIN_BOT_TOKEN er sat → brug admin-bot client (notifikationen
+    # popper op i Buddy_admin-chatten, ikke Buddy main).
+    # Ellers → fallback til Buddy main bot (gammel adfærd).
+    notification_bot = context.bot  # default: Buddy main
+    notification_via = "buddy_main"
+    if ADMIN_BOT_TOKEN:
+        try:
+            from telegram import Bot as _AdminBot
+            notification_bot = _AdminBot(token=ADMIN_BOT_TOKEN)
+            notification_via = "admin_bot"
+        except Exception as e:
+            logger.warning(
+                "Kunne ikke initialisere admin-bot client (%s) — falder tilbage til Buddy main",
+                e,
+            )
+
     # Send tekst-besked
     try:
-        await context.bot.send_message(
+        await notification_bot.send_message(
             chat_id=admin_id,
             text=notification_text,
             parse_mode="Markdown",
@@ -1779,20 +1827,32 @@ async def notify_admin_about_feedback(
             plain = notification_text.replace("*", "").replace("_", "").replace("`", "")
             plain = plain.replace("\\#", "#").replace("\\(", "(").replace("\\)", ")")
             plain = plain.replace("\\-", "-")
-            await context.bot.send_message(
+            await notification_bot.send_message(
                 chat_id=admin_id,
                 text=plain,
                 reply_markup=notification_keyboard,
             )
         except Exception as e2:
-            logger.error("notify_admin_about_feedback fallback fejl: %s", e2)
+            logger.error(
+                "notify_admin_about_feedback fallback fejl (via=%s): %s",
+                notification_via, e2,
+            )
             return
 
-    # Send screenshots hvis nogen
+    logger.info(
+        "Admin-notifikation sendt for feedback #%d (via=%s, screenshots=%d)",
+        fb_id, notification_via, len(file_ids),
+    )
+
+    # Send screenshots hvis nogen.
+    # VIGTIGT: file_ids er fra Buddy main's bot-domæne. Admin-bot kan IKKE
+    # sende dem direkte. Vi bruger derfor ALTID Buddy main's bot til
+    # screenshots — uanset hvor tekst-notifikationen blev sendt fra.
     if file_ids:
+        photo_bot = context.bot  # altid Buddy main (file_ids er fra Buddy)
         try:
             if len(file_ids) == 1:
-                await context.bot.send_photo(
+                await photo_bot.send_photo(
                     chat_id=admin_id,
                     photo=file_ids[0],
                     caption=f"📷 Screenshot fra feedback #{feedback.get('id', '?')}",
@@ -1809,7 +1869,7 @@ async def notify_admin_about_feedback(
                         media=file_ids[0],
                         caption=f"📷 Screenshots fra feedback #{feedback.get('id', '?')}",
                     )
-                await context.bot.send_media_group(
+                await photo_bot.send_media_group(
                     chat_id=admin_id,
                     media=media_group,
                 )
@@ -1821,7 +1881,7 @@ async def notify_admin_about_feedback(
                         for fid in file_ids[10:20]
                     ]
                     if extra_group:
-                        await context.bot.send_media_group(
+                        await photo_bot.send_media_group(
                             chat_id=admin_id,
                             media=extra_group,
                         )
@@ -3676,18 +3736,27 @@ async def on_startup(application: Application) -> None:
         )
     logger.info("Buddy started in '%s' environment.", config.ENVIRONMENT)
     logger.info(
-        "VERSION CHECK — v0.16.0-beta | "
+        "VERSION CHECK — v0.16.1-beta | "
         "feedback-system: JA (v3 inline-buttons) | media-aware-watch-flow: JA | "
         "tmdb-metadata-cache: JA | find-unwatched-v2: JA | "
         "test-v2-cmd: JA | audit-tv-subgenres: JA | "
         "top-keywords-dump: JA | first-time-tester-detect: JA | "
         "loading-spinner: JA | preview-step: JA | auto-timeout: JA | "
-        "/cancel-cmd: JA | admin-inline-buttons: JA | reply-back-button: JA"
+        "/cancel-cmd: JA | admin-inline-buttons: JA | reply-back-button: JA | "
+        "admin-notif-via-admin-bot: %s"
+        % ("JA" if ADMIN_BOT_TOKEN else "NEJ (fallback til Buddy)")
     )
     if not ADMIN_BOT_USERNAME:
         logger.warning(
             "ADMIN_BOT_USERNAME env-var er ikke sat — admin-notifikations-knappen "
             "'💬 Svar i admin-bot' vil falde tilbage til et tekst-hint."
+        )
+    if not ADMIN_BOT_TOKEN:
+        logger.warning(
+            "ADMIN_BOT_TOKEN env-var er ikke sat — admin-notifikationer sendes "
+            "stadig via Buddy main (i stedet for admin-bot). "
+            "Tilføj ADMIN_BOT_TOKEN til buddy-main service for at flytte "
+            "notifikationerne til admin-bot's chat."
         )
 
 
