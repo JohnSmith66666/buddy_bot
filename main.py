@@ -7,11 +7,16 @@ CHANGES (v0.16.4 — UX polish for mobil-skaerm + info-link bugfix):
   - Genindfoert send_action("typing") fra v0.16.3 — det gav brugerne
     fornemmelse af at "noget sker" som de specifikt efterspurgte.
   - Reply keyboard (🍿 + 💬 knapper) bevares — fjernes IKKE midlertidigt.
-  - Aendringer i AI-chat (handle_text) OG info-link (handle_info_link).
+  - Aendringen ramte 3 user-facing flows:
+    1. handle_text (AI-chat)
+    2. handle_info_link (info-kort fra /info_movie_<id> links)
+    3. _execute_subgenre_search (watch flow subgenre-knapper)
   - BUGFIX: handle_info_link fjernede tidligere tastaturet via
     ReplyKeyboardRemove() naar bruger trykkede paa /info_movie_<id>,
     men gendannede det aldrig. Knapper forsvandt efter info-kort.
     Nu fjernes ReplyKeyboardRemove() — tastaturet forbliver synligt.
+  - Admin-kommandoer (cmd_genres, cmd_dump_genres osv.) er IKKE rørt —
+    de har eksplicit info-tekst ("Dette kan tage 30-60 sekunder").
   - Watch flow, feedback flow m.fl. er uaendret.
 
 CHANGES (v0.16.3 — Performance polish, AI hot path):
@@ -902,7 +907,7 @@ async def _execute_subgenre_search(
 
     try:
         await query.edit_message_text(
-            f"{sub_label}\n\n🤖 Beregner svar med lynets hast... næsten...",
+            f"{sub_label}\n\n🔍",
             parse_mode="Markdown",
         )
     except Exception:
