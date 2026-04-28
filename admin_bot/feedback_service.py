@@ -1,6 +1,18 @@
 """
 services/feedback_service.py - Shared feedback constants and formatting helpers.
 
+CHANGES (v0.3.0 — Batch B nye flows):
+  - NY: format_feedback_preview(draft) → str
+    Bygger preview-besked vist når bruger trykker '✅ Send' (option Y).
+    Viser kategori, tekst (trimmet hvis lang), antal screenshots og en
+    klar 'send-eller-rediger' opfordring. Bruges af main.py i ny preview-trin.
+  - FORBEDRET: format_user_received_reply() inkluderer nu en sidste linje
+    der nævner '💬 Svar tilbage'-knappen. Knappen selv tilføjes i main.py
+    som InlineKeyboardMarkup.
+  - FORBEDRET: format_admin_notification() har en ny optional 'compact'
+    parameter. Hvis True bruges en kortere format uden de 3 hint-linjer
+    nederst (de er erstattet af inline-knapper i main.py).
+
 CHANGES (v0.2.0 — Batch A polering):
   - FORBEDRET: escape_md() er nu fuldt robust mod alle Telegram MarkdownV1
     special-tegn (_, *, `, [). Tidligere kunne brugere skrive *test* eller
@@ -269,6 +281,8 @@ def format_user_received_reply(
     """
     Besked brugeren modtager når admin har svaret på deres feedback.
 
+    v0.3.0: Footer nævner nu '💬 Svar tilbage'-knappen som tilføjes i main.py.
+
     Sendes via Buddy main-bot (admin-bot kender brugerens telegram_id og
     bruger BUDDY_BOT_TOKEN til at sende beskeden via Buddy).
 
@@ -294,8 +308,7 @@ def format_user_received_reply(
         f"✉️ *Svar fra Jesper:*\n\n"
         f"{safe_reply}\n\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"_Vil du svare tilbage? Tryk på 💬 Feedback-knappen igen og lav "
-        f"en ny indberetning — referér gerne til \\#{feedback_id}._"
+        f"_Vil du svare tilbage? Tryk på knappen herunder._"
     )
 
 
@@ -306,10 +319,15 @@ def format_user_received_reply(
 def format_admin_notification(
     feedback: dict,
     is_first_time: bool = False,
+    compact: bool = False,
 ) -> str:
     """
     Formatér ny-feedback notifikation til admin.
 
+    v0.3.0:
+      - Tilføjet 'compact' parameter. Hvis True, fjernes de 3 hint-linjer
+        nederst (`/view`, `/reply`, `/resolve`). Bruges sammen med inline-
+        knapper i main.py så hintsne ikke er nødvendige.
     v0.2.0:
       - Tilføjet 'is_first_time' parameter.
         Hvis True, vises "🆕 NY TESTER" tag øverst.
@@ -319,6 +337,8 @@ def format_admin_notification(
       feedback:      Dict fra database.get_feedback() eller submit_feedback().
       is_first_time: True hvis denne bruger sender feedback for første gang.
                      Tilføjer "🆕 NY TESTER" tag øverst i notifikationen.
+      compact:       True for kortere format uden hint-kommandoer (bruges
+                     med inline-knapper).
 
     Returns:
       Markdown-formatteret tekst klar til at sende til admin.
@@ -360,12 +380,76 @@ def format_admin_notification(
         lines.append("")
         lines.append(f"📷 *{count} {screenshots_word} vedhæftet*")
 
+    # Hint-kommandoer udelades hvis compact=True (knapper bruges i stedet)
+    if not compact:
+        lines.extend([
+            "",
+            "━━━━━━━━━━━━━━━",
+            f"📋 `/view {fb_id}` — se fuld detalje",
+            f"💬 `/reply {fb_id} <besked>` — svar bruger",
+            f"✅ `/resolve {fb_id}` — markér som løst",
+        ])
+
+    return "\n".join(lines)
+
+
+def format_feedback_preview(
+    feedback_type: str,
+    message_parts: list[str],
+    screenshot_count: int,
+) -> str:
+    """
+    Formatér preview-besked vist når bruger trykker '✅ Send'.
+
+    v0.3.0 — NY: Bruges af main.py i preview-trinnet (Option Y).
+    Brugeren ser sin samlede feedback før den faktisk sendes.
+
+    Args:
+      feedback_type:    'idea' | 'bug' | 'question' | 'praise'
+      message_parts:    Liste af tekstbeskeder brugeren har skrevet
+      screenshot_count: Antal screenshots vedhæftet
+
+    Returns:
+      Markdown-formatteret preview-besked. Kombinerer alle message_parts
+      til én besked, trimmet til ~600 tegn for læsbarhed.
+    """
+    ft = get_feedback_type(feedback_type)
+    type_label = ft["label"] if ft else "Feedback"
+
+    # Kombinér tekstbeskeder
+    combined = "\n\n".join(p.strip() for p in message_parts if p.strip())
+
+    # Trim hvis meget lang (preview, ikke endeligt)
+    if len(combined) > 600:
+        combined_preview = combined[:597] + "..."
+    else:
+        combined_preview = combined
+
+    safe_combined = escape_md(combined_preview)
+
+    lines = [
+        "📋 *Bekræft din feedback*",
+        "━━━━━━━━━━━━━━━",
+        "",
+        f"*Kategori:* {type_label}",
+        "",
+        "*Din besked:*",
+    ]
+
+    if combined:
+        lines.append(f"_{safe_combined}_")
+    else:
+        lines.append("_\\(Ingen tekstbesked — kun screenshots\\)_")
+
+    if screenshot_count > 0:
+        word = "screenshot" if screenshot_count == 1 else "screenshots"
+        lines.append("")
+        lines.append(f"📷 *{screenshot_count} {word} vedhæftet*")
+
     lines.extend([
         "",
         "━━━━━━━━━━━━━━━",
-        f"📋 `/view {fb_id}` — se fuld detalje",
-        f"💬 `/reply {fb_id} <besked>` — svar bruger",
-        f"✅ `/resolve {fb_id}` — markér som løst",
+        "Er du sikker på du vil sende?",
     ])
 
     return "\n".join(lines)

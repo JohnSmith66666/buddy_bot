@@ -1,6 +1,12 @@
 """
 admin_bot/admin_database.py - Slim database module for the Buddy Admin bot.
 
+CHANGES (v0.2.0 — Batch B bulk-operations):
+  - NY: parse_id_range(spec) — kopi af logikken fra Buddys database.py
+    fordi admin-bot er isoleret fra parent's services-mappe.
+  - NY: update_feedback_status_bulk(ids, status) — atomisk bulk-update.
+    Bruges af /seen 1-20 og /resolve 5,7,9.
+
 CHANGES (v0.1.0 — initial):
   - Genbruger asyncpg connection pool pattern fra Buddys database.py.
   - Eksponerer KUN feedback-funktioner (admin-bot har ikke brug for fx
@@ -310,3 +316,95 @@ async def get_user_by_telegram_id(telegram_id: int) -> dict | None:
             telegram_id,
         )
     return dict(row) if row else None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Batch B (v0.2.0) — Bulk operations + helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def parse_id_range(spec: str) -> list[int]:
+    """
+    Parse en bruger-specificeret ID-range/list til konkrete IDs.
+
+    KOPI af logik fra Buddys database.py (admin-bot er isoleret).
+
+    Accepterer:
+      - Enkelt ID:   "5"           → [5]
+      - Range:       "1-5"         → [1, 2, 3, 4, 5]
+      - Liste:       "5,7,9"       → [5, 7, 9]
+      - Kombineret:  "1,3-5,8"     → [1, 3, 4, 5, 8]
+    """
+    if not spec or not spec.strip():
+        return []
+
+    ids: set[int] = set()
+
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+
+        if "-" in part:
+            try:
+                start_str, end_str = part.split("-", 1)
+                start = int(start_str.strip())
+                end   = int(end_str.strip())
+                if start > end:
+                    start, end = end, start
+                if end - start > 1000:
+                    continue
+                ids.update(range(start, end + 1))
+            except (ValueError, IndexError):
+                continue
+        else:
+            try:
+                ids.add(int(part))
+            except ValueError:
+                continue
+
+    valid_ids = sorted(i for i in ids if i > 0)
+    return valid_ids
+
+
+async def update_feedback_status_bulk(
+    feedback_ids: list[int],
+    status: str,
+) -> int:
+    """
+    Opdater status for FLERE feedback-records på én gang.
+
+    Returns:
+      Antal records der faktisk blev opdateret.
+    """
+    if status not in ("new", "seen", "replied", "resolved"):
+        raise ValueError(f"Ugyldig status: '{status}'")
+
+    if not feedback_ids:
+        return 0
+
+    async with _pool_ref().acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE feedback
+            SET status     = $2,
+                updated_at = NOW()
+            WHERE id = ANY($1::int[])
+            """,
+            feedback_ids, status,
+        )
+
+    parts = result.split()
+    if len(parts) >= 2 and parts[0] == "UPDATE":
+        try:
+            count = int(parts[1])
+        except ValueError:
+            count = 0
+    else:
+        count = 0
+
+    if count > 0:
+        logger.info(
+            "update_feedback_status_bulk: %d records → '%s' (requested: %d)",
+            count, status, len(feedback_ids),
+        )
+    return count
