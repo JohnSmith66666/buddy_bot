@@ -754,40 +754,44 @@ async def update_tmdb_metadata(
         )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Subgenre lookup — _plex_genre_to_tmdb mapping
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# Subgenre lookup — Plex/TMDB genre mapping
+# ═════════════════════════════════════════════════════════════════════════════
 
-# Mapper Plex-genrer til TMDB-genrer (bruges til at filtrere subgenre-resultater)
-# Plex bruger lidt andre navne end TMDB; mapper sikrer at fx Plex-genre "Sci-Fi"
-# matcher TMDB-genre "Science Fiction".
-_PLEX_TO_TMDB_GENRES = {
+# Mapping fra dansk Plex-genre til engelske TMDB-genrer.
+# v0.15.1 (FIX): Genoprettet danske mapping efter regression i tidligere
+# session. Plex-server SKYNET bruger danske genre-navne (Komedie, Gyser,
+# Kriminalitet, etc.) men tmdb_metadata.tmdb_genres indeholder engelske
+# værdier fra TMDB API. Uden denne mapping ville filteret matche 0 hits
+# for danske subgenrer som crime_mafia (Kriminalitet → Crime).
+_PLEX_TO_TMDB_GENRE = {
+    "Komedie":         ["Comedy"],
+    "Gyser":           ["Horror"],
+    "Kriminalitet":    ["Crime"],
+    "Familie":         ["Family"],
+    "Romantik":        ["Romance"],
+    "Krig":            ["War", "War & Politics"],
+    "Mysterium":       ["Mystery"],
+    "Musik":           ["Music"],
+    "Historie":        ["History"],
     "Action":          ["Action"],
-    "Adventure":       ["Adventure"],
-    "Animation":       ["Animation"],
-    "Comedy":          ["Comedy"],
-    "Crime":           ["Crime"],
-    "Documentary":     ["Documentary"],
     "Drama":           ["Drama"],
-    "Family":          ["Family"],
-    "Fantasy":         ["Fantasy"],
-    "Foreign":         [],  # ikke en TMDB-genre
-    "History":         ["History"],
-    "Horror":          ["Horror"],
-    "Music":           ["Music"],
-    "Mystery":         ["Mystery"],
-    "Romance":         ["Romance"],
-    "Sci-Fi":          ["Science Fiction", "Sci-Fi & Fantasy"],
-    "Science Fiction": ["Science Fiction", "Sci-Fi & Fantasy"],
     "Thriller":        ["Thriller"],
-    "War":             ["War", "War & Politics"],
+    "Adventure":       ["Adventure"],
+    "Fantasy":         ["Fantasy"],
+    "Sci-fi":          ["Science Fiction", "Sci-Fi & Fantasy"],
+    "Science Fiction": ["Science Fiction", "Sci-Fi & Fantasy"],
+    "Animation":       ["Animation"],
+    "Documentary":     ["Documentary"],
     "Western":         ["Western"],
+    "Biography":       ["Drama"],
+    "Musical":         ["Music"],
 }
 
 
 def _plex_genre_to_tmdb(plex_genre: str) -> list[str]:
-    """Returnér liste af TMDB-genrer der matcher en Plex-genre."""
-    return _PLEX_TO_TMDB_GENRES.get(plex_genre, [plex_genre])
+    """Konverter et Plex-genre-navn til en liste af tilsvarende TMDB-genrer."""
+    return _PLEX_TO_TMDB_GENRE.get(plex_genre, [plex_genre]))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
