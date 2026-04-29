@@ -3987,19 +3987,10 @@ def main() -> None:
         handle_info_link,
     ))
 
-    # ── Photo handler (NYT v0.14.0) ─────────────────────────────────────────
-    # Photos håndteres af feedback-flow når bruger er i 'awaiting_feedback' state.
+    # ── Photo handler ─────────────────────────────
     app.add_handler(MessageHandler(filters.PHOTO, handle_feedback_photo))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    # ── Buddy 2.0 feature handlers ──────────────────────────────────────────
-    FeatureRegistry.register_all_handlers(app)
-
-    # ── Buddy 2.0 main menu handlers (registreres separat pga. enabled=False) ─
-    register_main_menu_handlers(app)
-
-    # ── Reply-keyboard text handlers (🏠 Hjem + 💬 Feedback) ────────────────
+    # ── Reply-keyboard text handlers (FØR handle_text!) ──
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Regex(rf"^{HOME_BUTTON_LABEL}$"),
         handle_home_button,
@@ -4008,14 +3999,20 @@ def main() -> None:
         filters.TEXT & filters.Regex(rf"^{FEEDBACK_BUTTON_LABEL}$"),
         handle_feedback_button,
     ))
-    
+
+    # ── General text handler ──
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # ── Buddy 2.0 setup ──
+    setup_buddy_2(app)
+
     app.add_error_handler(handle_error)
 
     logger.info("Starting polling …")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
-    )
+    )    
 
 
 if __name__ == "__main__":
