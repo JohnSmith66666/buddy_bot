@@ -198,6 +198,8 @@ from services.subgenre_service import (
 )
 from services.v2_service import find_unwatched_v2
 from services.webhook_service import handle_radarr_webhook, handle_sonarr_webhook
+from features import FeatureRegistry
+import features.watchlist  # noqa: F401 — trigger @FeatureRegistry.register
 
 logging.basicConfig(
     level=logging.INFO,
@@ -3949,6 +3951,10 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO, handle_feedback_photo))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # ── Buddy 2.0 feature handlers ──────────────────────────────────────────
+    FeatureRegistry.register_all_handlers(app)
+    
     app.add_error_handler(handle_error)
 
     logger.info("Starting polling …")
