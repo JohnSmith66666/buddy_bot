@@ -791,7 +791,7 @@ _PLEX_TO_TMDB_GENRE = {
 
 def _plex_genre_to_tmdb(plex_genre: str) -> list[str]:
     """Konverter et Plex-genre-navn til en liste af tilsvarende TMDB-genrer."""
-    return _PLEX_TO_TMDB_GENRE.get(plex_genre, [plex_genre]))
+    return _PLEX_TO_TMDB_GENRE.get(plex_genre, [plex_genre])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
