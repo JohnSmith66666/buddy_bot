@@ -4,6 +4,13 @@ features/watchlist/messages.py - Danske tekst-templates for watchlist UI.
 Holder al Markdown-formaterede tekst-strenge ét sted så det er nemt at
 opdatere copy uden at rode i handler-logik.
 
+CHANGES (v0.2.0 — vis ratings i listen):
+  - FIX: format_watchlist_item() viser nu rating med ⭐ emoji
+    (samme stil som watch flow's _format_results_message i main.py).
+  - Tidligere: rating blev gemt i DB men aldrig vist i UI.
+  - Format: "🎬 *Titel* (År) ⭐ 8.7"
+  - Hvis rating mangler, udelades den graceful (intet "⭐ N/A").
+
 CHANGES (v0.1.0 — initial):
   - format_watchlist_header() — overskrift med titel-count
   - format_watchlist_item() — én linje per titel
@@ -66,21 +73,39 @@ def format_watchlist_item(item: dict) -> str:
     Args:
       item: dict med {tmdb_id, media_type, title, year, rating}
 
-    Eksempel output:
+    Eksempel output (med rating):
       🎬 *The Matrix* (1999) ⭐ 8.7
          /info_movie_603
+
+    Eksempel output (uden rating):
+      🎬 *The Matrix* (1999)
+         /info_movie_603
+
+    v0.2.0: Tilføjet rating-visning med ⭐ emoji (matcher watch flow stil).
     """
     media_emoji = "🎬" if item.get("media_type") == "movie" else "📺"
     title       = item.get("title") or f"#{item.get('tmdb_id', '?')}"
     year        = item.get("year")
+    rating      = item.get("rating")
     tmdb_id     = item.get("tmdb_id")
     media_type  = item.get("media_type", "movie")
 
     year_str = f" ({year})" if year else ""
 
+    # v0.2.0: vis rating hvis tilgængelig (samme stil som watch flow)
+    # Cast til float defensivt — rating kan være Decimal fra PostgreSQL NUMERIC
+    rating_str = ""
+    if rating is not None:
+        try:
+            rating_float = float(rating)
+            if 0.0 < rating_float <= 10.0:
+                rating_str = f" ⭐ {rating_float:.1f}"
+        except (ValueError, TypeError):
+            pass  # Hvis rating ikke kan castes, vis ingen stjerne
+
     info_link = f"   /info_{media_type}_{tmdb_id}" if tmdb_id else ""
 
-    return f"{media_emoji} *{_escape_md(title)}*{year_str}\n{info_link}"
+    return f"{media_emoji} *{_escape_md(title)}*{year_str}{rating_str}\n{info_link}"
 
 
 def _escape_md(text: str) -> str:
