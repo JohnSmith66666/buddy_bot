@@ -2567,12 +2567,14 @@ async def cmd_seed_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
     if status:
+        # FIX v0.16.5: Læs fra by_status efter database.py v0.15.0 ændring
+        by_status = status["by_status"]
         summary += (
             f"\n📊 *Aktuel status:*\n"
-            f"  • Pending: *{status['pending']}*\n"
-            f"  • Fetched: *{status['fetched']}*\n"
-            f"  • Error: *{status['error']}*\n"
-            f"  • Not found: *{status['not_found']}*\n"
+            f"  • Pending: *{by_status['pending']}*\n"
+            f"  • Fetched: *{by_status['fetched']}*\n"
+            f"  • Error: *{by_status['error']}*\n"
+            f"  • Not found: *{by_status['not_found']}*\n"
             f"  • Total: *{status['total']}*\n"
         )
 
@@ -2693,18 +2695,20 @@ async def cmd_fetch_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE)
         msg += f"  💾 DB-write errors: *{write_errors}*\n"
 
     if status:
-        pct = (status["fetched"] / status["total"] * 100) if status["total"] else 0
+        # FIX v0.16.5: Læs fra by_status efter database.py v0.15.0 ændring
+        by_status = status["by_status"]
+        pct = (by_status["fetched"] / status["total"] * 100) if status["total"] else 0
         msg += (
             f"\n📊 *Total status:*\n"
-            f"  • Fetched: *{status['fetched']}* / *{status['total']}* ({pct:.1f}%)\n"
-            f"  • Pending: *{status['pending']}*\n"
-            f"  • Error:   *{status['error']}*\n"
-            f"  • Not found: *{status['not_found']}*\n"
+            f"  • Fetched: *{by_status['fetched']}* / *{status['total']}* ({pct:.1f}%)\n"
+            f"  • Pending: *{by_status['pending']}*\n"
+            f"  • Error:   *{by_status['error']}*\n"
+            f"  • Not found: *{by_status['not_found']}*\n"
         )
-        if status["pending"] > 0:
-            batches_left = (status["pending"] + batch_size - 1) // batch_size
+        if by_status["pending"] > 0:
+            batches_left = (by_status["pending"] + batch_size - 1) // batch_size
             msg += f"\n🚀 *Næste skridt:* `/fetch_metadata` ({batches_left} batches tilbage)"
-        elif status["error"] > 0 and not include_errors:
+        elif by_status["error"] > 0 and not include_errors:
             msg += f"\n🔁 *Retry errors:* `/fetch_metadata retry`"
         else:
             msg += "\n🎉 *Alle records er færdigbehandlet!*"
@@ -2720,11 +2724,9 @@ async def cmd_metadata_status(update: Update, context: ContextTypes.DEFAULT_TYPE
     """
     /metadata_status — vis aktuelt antal records pr. status og media_type.
 
-    v0.16.5: Fixed KeyError. database.get_metadata_status() returnerer
-    {by_media_type: {...}, by_status: {...}, total: int} — ikke
-    {fetched, pending, error, not_found, total} flat.
-    Vi læser nu korrekt fra status['by_status'] og beregner pr. media-type
-    'total' som sum af alle statuses.
+    v0.16.5: Fixed KeyError. database.get_metadata_status() returnerer nu
+    {by_media_type: {...}, by_status: {...}, total: int} efter Buddy 2.0
+    Sprint 1's database.py v0.15.0 opdatering — ikke flat keys.
     """
     user = update.effective_user
     if user is None or user.id != config.ADMIN_TELEGRAM_ID:
@@ -2746,7 +2748,7 @@ async def cmd_metadata_status(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # FIX: Læs fra by_status (ikke flat keys på status-dict)
+    # FIX v0.16.5: Læs fra by_status og beregn totals fra by_media_type
     by_status = status["by_status"]
     by_media  = status["by_media_type"]
 
@@ -2834,15 +2836,14 @@ async def _cmd_top_keywords_chat(
     Vis top N keywords i chat (kort format).
 
     v0.16.5: Fixed Markdown-fejl. Tidligere brugte vi underscore-italic
-    der konflikterede med media_type-værdien hvis den var None ('alle').
-    Nu bruger vi parentes-format uden italic for at undgå parser-fejl.
+    der konflikterede med parenteser/værdier i strengen.
     """
     await update.message.chat.send_action("typing")
     media_label = media_type or "alle"
     loading = await update.message.reply_text(
         f"🔬 *Top Keywords*\n\n"
         f"Analyserer database...\n"
-        f"\\(media\\_type: {media_label}, limit: {limit}\\)",
+        f"(media\\_type: {media_label}, limit: {limit})",
         parse_mode="Markdown",
     )
 
@@ -2961,7 +2962,8 @@ async def _cmd_top_keywords_dump(
         elif media_type == "tv":
             total_items = status["by_media_type"]["tv"]["fetched"]
         else:
-            total_items = status["fetched"]
+            # FIX v0.16.5: Læs fra by_status efter database.py v0.15.0 ændring
+            total_items = status["by_status"]["fetched"]
     except Exception:
         total_items = 0
 
