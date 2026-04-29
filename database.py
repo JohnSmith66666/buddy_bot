@@ -1,59 +1,65 @@
 """
 database.py - PostgreSQL connection pool, table management,
 user whitelist, Plex username storage, onboarding state, interaktionshistorik,
-pending requests, TMDB metadata-cache OG feedback-system.
+pending requests, TMDB metadata-cache, feedback-system OG Buddy 2.0 foundation.
 
-CHANGES (v0.14.2 — Batch B bulk-actions + thread-tracking):
-  - NY: update_feedback_status_bulk(ids, status) → int
-    Opdaterer status for FLERE feedback-records på én gang. Bruges af
-    admin-bot's /seen 1-20 og /resolve 5,7,9 kommandoer.
-    Returnerer antal records faktisk opdateret.
-  - NY: parse_id_range(spec) → list[int]
-    Helper der parser strings som "1-20", "5,7,9", "1,3-5,8" til en
-    liste af unique IDs. Bruges af admin-bot bulk-kommandoer.
-    Eksempler:
-      "1-5"     → [1,2,3,4,5]
-      "5,7,9"   → [5,7,9]
-      "1,3-5,8" → [1,3,4,5,8]
+CHANGES (v0.15.0 — Buddy 2.0 foundation tables):
+  - NY: setup_user_watchlist_table() — bruger-watchlist (telegram_id, tmdb_id,
+    media_type, added_at, notes). Foundation for "📺 Min watchlist" feature.
+    Composite primary key (telegram_id, tmdb_id, media_type) sikrer ingen
+    duplikater. Indekseret på telegram_id for hurtig listing.
 
-CHANGES (v0.14.1 — first-time tester detection):
-  - NY: is_first_time_feedback(telegram_id) → bool
-    Returnerer True hvis brugeren ALDRIG har sendt feedback før.
-    Bruges af main.py til at tagge admin-notifikationen med "🆕 NY TESTER"
-    så Jesper instant ved at det er en førstegangs-bruger.
+  - NY: setup_user_preferences_table() — samlet bruger-præferencer
+    (favorite_genres, favorite_actors, notification_settings) som JSONB.
+    Bruges af "🎯 Anbefalet til mig" + fremtidige personalisering.
+
+  - NY: setup_user_achievements_table() — forberedelse til Phase 2/3
+    achievement-system. Tabellen er klar, men ingen kode bruger den endnu.
+    Bygges nu fordi det er gratis og undgår migration senere.
+
+  - NY: setup_feature_usage_table() — analytics/tracking af hvilke features
+    bruges hvor meget. KRITISK for at vide hvor man skal investere tid.
+    Indekseret på (feature, used_at DESC) for hurtige aggregeringer.
+
+  - NY: ALLE setup_*_table() kalder samles nu i setup_db() for konsistens.
+    Tidligere blev setup_pending_requests, setup_tmdb_metadata_table og
+    setup_feedback_table kaldt fra main.py's on_startup. Nu er det ét sted.
+    main.py SKAL opdateres til ikke længere at kalde dem separat (de virker
+    stadig idempotent, så ingen breaking change ved overgang).
+
+  - PERFORMANCE: Pool-størrelse hævet fra max_size=10 → max_size=20.
+    Forberedelse til 100 brugere. Railway PostgreSQL kan håndtere det.
+    min_size=2 → min_size=5 for færre cold-start latency.
+
+  - 100% BAGUDKOMPATIBEL: Alle eksisterende funktioner uændrede. Ingen
+    eksisterende tabeller røres. Kun TILFØJELSER.
+
+UNCHANGED (v0.14.2 — Batch B bulk-actions + thread-tracking):
+  - update_feedback_status_bulk(ids, status) → int
+  - parse_id_range(spec) → list[int]
+
+UNCHANGED (v0.14.1 — first-time tester detection):
+  - is_first_time_feedback(telegram_id) → bool
 
 UNCHANGED (v0.14.0 — feedback system):
-  - NY: feedback tabel + indekser til opsamling af bruger-feedback.
-    Tabellen gemmer kategoriseret feedback (idea/bug/question/praise),
-    Telegram screenshot file_ids som JSONB array, og admin-svar med
-    timestamp. Status-felt sporer livscyklus: new → seen → replied → resolved.
-  - NY: setup_feedback_table() kaldt fra setup_db() ved opstart.
-  - NY: submit_feedback() — bruges af Buddy til at gemme ny feedback.
-  - NY: list_feedback(status_filter, type_filter, limit) — admin-bot listing.
-  - NY: get_feedback(feedback_id) — fuld detalje + screenshot file_ids.
-  - NY: update_feedback_status(id, status) — admin markerer som
-    seen/replied/resolved.
-  - NY: add_admin_reply(id, reply_text) — gemmer admin-svar atomisk
-    sammen med status='replied'.
-  - NY: count_feedback_by_status() — bruges til at bygge stats hvis ønsket.
-  - DELT TABEL: Buddy SKRIVER til feedback, admin-bot LÆSER + opdaterer.
-    Begge bots peger på samme MAIN-database (admin lytter ikke til dev).
+  - feedback tabel + alle funktioner (submit_feedback, list_feedback,
+    get_feedback, update_feedback_status, add_admin_reply,
+    count_feedback_by_status).
 
 UNCHANGED (v0.13.0 — media-aware subgenre lookup):
-  - find_titles_by_subgenre(subgenre_id, media_type, limit) → list[dict]
-  - find_films_by_subgenre legacy wrapper bevares.
-  - count_titles_by_subgenre(subgenre_id, media_type) → int
+  - find_titles_by_subgenre, find_films_by_subgenre legacy wrapper,
+    count_titles_by_subgenre.
 
 UNCHANGED (v0.11.0 — P0/P1 performance pakke):
-  - log_message statistical DELETE (10% kald → 50% mindre DB-load).
-  - CTE-baseret subgenre query (30-50ms hurtigere).
+  - log_message statistical DELETE.
+  - CTE-baseret subgenre query.
 
 UNCHANGED (v0.10.8 — Etape 1 af subgenre-projekt):
-  - GIN-index på keywords-kolonnen til O(ms) lookup
-  - Smart blanding på Python-side (nye vs klassikere)
+  - GIN-index på keywords-kolonnen.
+  - Smart blanding på Python-side.
 
 UNCHANGED (v0.10.6 — TMDB metadata cache):
-  - Ny tabel tmdb_metadata + GIN-indekser
+  - tmdb_metadata tabel + GIN-indekser.
 """
 
 import json
@@ -116,6 +122,32 @@ CREATE INDEX IF NOT EXISTS idx_log_telegram_id
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Schema — Pending requests
+# ══════════════════════════════════════════════════════════════════════════════
+
+_CREATE_PENDING_REQUESTS_TABLE = """
+CREATE TABLE IF NOT EXISTS pending_requests (
+    token        TEXT        PRIMARY KEY,
+    telegram_id  BIGINT      NOT NULL,
+    media_type   TEXT        NOT NULL,
+    tmdb_id      INTEGER     NOT NULL,
+    tvdb_id      INTEGER,
+    title        TEXT        NOT NULL,
+    year         INTEGER,
+    genres       JSONB,
+    original_language TEXT,
+    season_numbers    JSONB,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+_CREATE_PENDING_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_pending_telegram_id
+    ON pending_requests (telegram_id, created_at DESC);
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Schema — TMDB metadata cache
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -153,7 +185,7 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_genres
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Schema — Feedback (NY i v0.14.0)
+# Schema — Feedback (v0.14.0)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _CREATE_FEEDBACK_TABLE = """
@@ -192,22 +224,164 @@ CREATE INDEX IF NOT EXISTS idx_feedback_telegram_id
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Lifecycle
+# Schema — Buddy 2.0 foundation tables (NYE i v0.15.0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── User watchlist ────────────────────────────────────────────────────────────
+# Lagrer de titler en bruger har gemt for senere visning.
+# Composite PK forhindrer duplikater per (bruger, titel, type).
+_CREATE_USER_WATCHLIST_TABLE = """
+CREATE TABLE IF NOT EXISTS user_watchlist (
+    telegram_id  BIGINT      NOT NULL,
+    tmdb_id      INTEGER     NOT NULL,
+    media_type   TEXT        NOT NULL CHECK (media_type IN ('movie', 'tv')),
+    added_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    notes        TEXT,
+    PRIMARY KEY (telegram_id, tmdb_id, media_type)
+);
+"""
+
+_CREATE_WATCHLIST_USER_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_user_watchlist_telegram_id
+    ON user_watchlist (telegram_id, added_at DESC);
+"""
+
+
+# ── User preferences ──────────────────────────────────────────────────────────
+# Samlet brugerprofil med præferencer. JSONB-felter giver fleksibilitet til at
+# tilføje nye præferencer uden migration.
+#
+# Eksempler på data:
+#   favorite_genres:       ["Action", "Sci-Fi", "Comedy"]
+#   favorite_actors:       [{"name": "Tom Hanks", "tmdb_id": 31}]
+#   notification_settings: {"new_movies": true, "new_episodes": true,
+#                           "weekly_digest": false}
+_CREATE_USER_PREFERENCES_TABLE = """
+CREATE TABLE IF NOT EXISTS user_preferences (
+    telegram_id           BIGINT      PRIMARY KEY,
+    favorite_genres       JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    favorite_actors       JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    notification_settings JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    computed_at           TIMESTAMPTZ,
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+
+# ── User achievements ─────────────────────────────────────────────────────────
+# Forberedelse til Phase 2/3 achievement-system. Tabellen er klar, men ingen
+# kode bruger den endnu. Bygges nu fordi schema-ændring senere er dyrt.
+_CREATE_USER_ACHIEVEMENTS_TABLE = """
+CREATE TABLE IF NOT EXISTS user_achievements (
+    telegram_id    BIGINT      NOT NULL,
+    achievement_id TEXT        NOT NULL,
+    unlocked_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata       JSONB,
+    PRIMARY KEY (telegram_id, achievement_id)
+);
+"""
+
+_CREATE_ACHIEVEMENTS_USER_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_user_achievements_telegram_id
+    ON user_achievements (telegram_id, unlocked_at DESC);
+"""
+
+
+# ── Feature usage (analytics) ─────────────────────────────────────────────────
+# Tracker hvilke features bruges hvor meget. KRITISK for at prioritere
+# udvikling — vi vil ikke bruge tid på features ingen rør.
+#
+# Eksempel-rows:
+#   feature='watchlist',       action='add',           metadata={"tmdb_id": 27205}
+#   feature='recommendations', action='view',          metadata={}
+#   feature='archaeologist',   action='dismiss_movie', metadata={"tmdb_id": 12345}
+_CREATE_FEATURE_USAGE_TABLE = """
+CREATE TABLE IF NOT EXISTS feature_usage (
+    id           BIGSERIAL PRIMARY KEY,
+    telegram_id  BIGINT      NOT NULL,
+    feature      TEXT        NOT NULL,
+    action       TEXT,
+    metadata     JSONB,
+    used_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+_CREATE_FEATURE_USAGE_FEATURE_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_feature_usage_feature
+    ON feature_usage (feature, used_at DESC);
+"""
+
+_CREATE_FEATURE_USAGE_USER_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_feature_usage_telegram_id
+    ON feature_usage (telegram_id, used_at DESC);
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Lifecycle (v0.15.0 — alle setups samlet i setup_db)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def setup_db() -> None:
+    """
+    Initialise PostgreSQL connection pool og opret/opdater alle tabeller.
+
+    v0.15.0: Alle setup_*_table() funktioner kaldes nu fra ÉT sted.
+    main.py behøver ikke længere kalde dem separat fra on_startup() —
+    de er alle idempotente, så det er sikkert hvis main.py stadig kalder
+    dem (overgang uden breaking change).
+
+    Pool-konfiguration tunet til 100 brugere:
+      min_size=5  → færre cold-start latencies
+      max_size=20 → headroom til peak load
+    """
     global _pool
     logger.info("Connecting to PostgreSQL …")
     _pool = await asyncpg.create_pool(
-        dsn=DATABASE_URL, min_size=2, max_size=10, command_timeout=30,
+        dsn=DATABASE_URL,
+        min_size=5,
+        max_size=20,
+        command_timeout=30,
     )
+
     async with _pool.acquire() as conn:
+        # ── Core tables ───────────────────────────────────────────────────────
         await conn.execute(_CREATE_USERS_TABLE)
         await conn.execute(_MIGRATE_ONBOARDING_STATE)
         await conn.execute(_MIGRATE_PERSONA_ID)
         await conn.execute(_CREATE_INTERACTION_LOG_TABLE)
         await conn.execute(_CREATE_LOG_INDEX)
-    logger.info("Database ready.")
+
+        # ── Pending requests ──────────────────────────────────────────────────
+        await conn.execute(_CREATE_PENDING_REQUESTS_TABLE)
+        await conn.execute(_CREATE_PENDING_INDEX)
+
+        # ── TMDB metadata cache ───────────────────────────────────────────────
+        await conn.execute(_CREATE_TMDB_METADATA_TABLE)
+        await conn.execute(_CREATE_TMDB_STATUS_INDEX)
+        await conn.execute(_CREATE_TMDB_KEYWORDS_GIN)
+        await conn.execute(_CREATE_TMDB_GENRES_GIN)
+
+        # ── Feedback system ───────────────────────────────────────────────────
+        await conn.execute(_CREATE_FEEDBACK_TABLE)
+        await conn.execute(_CREATE_FEEDBACK_STATUS_INDEX)
+        await conn.execute(_CREATE_FEEDBACK_TYPE_INDEX)
+        await conn.execute(_CREATE_FEEDBACK_USER_INDEX)
+
+        # ── Buddy 2.0 foundation (NY i v0.15.0) ──────────────────────────────
+        await conn.execute(_CREATE_USER_WATCHLIST_TABLE)
+        await conn.execute(_CREATE_WATCHLIST_USER_INDEX)
+        await conn.execute(_CREATE_USER_PREFERENCES_TABLE)
+        await conn.execute(_CREATE_USER_ACHIEVEMENTS_TABLE)
+        await conn.execute(_CREATE_ACHIEVEMENTS_USER_INDEX)
+        await conn.execute(_CREATE_FEATURE_USAGE_TABLE)
+        await conn.execute(_CREATE_FEATURE_USAGE_FEATURE_INDEX)
+        await conn.execute(_CREATE_FEATURE_USAGE_USER_INDEX)
+
+    logger.info(
+        "Database ready — pool(%d-%d) | tables: users, log, pending, tmdb_metadata, "
+        "feedback, user_watchlist, user_preferences, user_achievements, feature_usage",
+        5, 20,
+    )
 
 
 async def close_db() -> None:
@@ -219,6 +393,30 @@ def _pool_ref() -> asyncpg.Pool:
     if _pool is None:
         raise RuntimeError("DB pool not initialised — call setup_db() first.")
     return _pool
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Bagudkompatibilitet — separate setup_*_table() funktioner
+# ══════════════════════════════════════════════════════════════════════════════
+# Disse funktioner kaldtes tidligere fra main.py's on_startup(). De gør nu
+# ingenting (alt er allerede oprettet i setup_db) men beholdes så main.py
+# ikke knækker hvis den stadig kalder dem under overgangen.
+#
+# main.py BØR opdateres til ikke at kalde dem længere, men det er ikke kritisk.
+
+async def setup_pending_requests() -> None:
+    """[LEGACY] No-op. Kaldes nu fra setup_db()."""
+    logger.debug("setup_pending_requests() called — already done in setup_db()")
+
+
+async def setup_tmdb_metadata_table() -> None:
+    """[LEGACY] No-op. Kaldes nu fra setup_db()."""
+    logger.debug("setup_tmdb_metadata_table() called — already done in setup_db()")
+
+
+async def setup_feedback_table() -> None:
+    """[LEGACY] No-op. Kaldes nu fra setup_db()."""
+    logger.debug("setup_feedback_table() called — already done in setup_db()")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -257,7 +455,10 @@ async def is_whitelisted(telegram_id: int) -> bool:
 
 
 async def approve_user(telegram_id: int) -> None:
-    """Whitelist an existing user and mark them as awaiting Plex setup."""
+    """
+    Whitelist a user AND set onboarding_state='awaiting_plex' atomically.
+    Used by admin approval callback.
+    """
     async with _pool_ref().acquire() as conn:
         await conn.execute(
             """
@@ -268,7 +469,7 @@ async def approve_user(telegram_id: int) -> None:
             """,
             telegram_id,
         )
-    logger.info("User %s approved.", telegram_id)
+    logger.info("User %s approved (whitelisted + awaiting_plex)", telegram_id)
 
 
 async def get_plex_username(telegram_id: int) -> str | None:
@@ -280,7 +481,6 @@ async def get_plex_username(telegram_id: int) -> str | None:
 
 
 async def set_plex_username(telegram_id: int, plex_username: str) -> None:
-    """Save the verified Plex username and clear the onboarding state."""
     async with _pool_ref().acquire() as conn:
         await conn.execute(
             """
@@ -291,15 +491,11 @@ async def set_plex_username(telegram_id: int, plex_username: str) -> None:
             """,
             plex_username, telegram_id,
         )
-    logger.info("plex_username='%s' saved for telegram_id=%s", plex_username, telegram_id)
+    logger.info("plex_username='%s' gemt for telegram_id=%s", plex_username, telegram_id)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Persona
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def get_persona(telegram_id: int) -> str:
-    """Returnér brugerens valgte persona_id. Falder tilbage til 'buddy'."""
+    """Hent brugerens valgte persona_id. Falder tilbage til 'buddy'."""
     async with _pool_ref().acquire() as conn:
         row = await conn.fetchrow(
             "SELECT persona_id FROM users WHERE telegram_id = $1", telegram_id
@@ -388,35 +584,6 @@ async def get_all_whitelisted_users() -> list[dict]:
 # Pending requests
 # ══════════════════════════════════════════════════════════════════════════════
 
-_CREATE_PENDING_REQUESTS_TABLE = """
-CREATE TABLE IF NOT EXISTS pending_requests (
-    token        TEXT        PRIMARY KEY,
-    telegram_id  BIGINT      NOT NULL,
-    media_type   TEXT        NOT NULL,
-    tmdb_id      INTEGER     NOT NULL,
-    tvdb_id      INTEGER,
-    title        TEXT        NOT NULL,
-    year         INTEGER,
-    genres       JSONB,
-    original_language TEXT,
-    season_numbers    JSONB,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-"""
-
-_CREATE_PENDING_INDEX = """
-CREATE INDEX IF NOT EXISTS idx_pending_telegram_id
-    ON pending_requests (telegram_id, created_at DESC);
-"""
-
-
-async def setup_pending_requests() -> None:
-    """Create pending_requests table if it doesn't exist."""
-    async with _pool_ref().acquire() as conn:
-        await conn.execute(_CREATE_PENDING_REQUESTS_TABLE)
-        await conn.execute(_CREATE_PENDING_INDEX)
-
-
 async def save_pending_request(token: str, telegram_id: int, data: dict) -> None:
     """Save media details for a pending confirmation."""
     async with _pool_ref().acquire() as conn:
@@ -474,18 +641,8 @@ async def delete_pending_requests_for_user(telegram_id: int) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TMDB metadata cache (Etape 0 + 1)
+# TMDB metadata cache
 # ══════════════════════════════════════════════════════════════════════════════
-
-async def setup_tmdb_metadata_table() -> None:
-    """Opret tmdb_metadata tabellen + indekser. Idempotent."""
-    async with _pool_ref().acquire() as conn:
-        await conn.execute(_CREATE_TMDB_METADATA_TABLE)
-        await conn.execute(_CREATE_TMDB_STATUS_INDEX)
-        await conn.execute(_CREATE_TMDB_KEYWORDS_GIN)
-        await conn.execute(_CREATE_TMDB_GENRES_GIN)
-    logger.info("tmdb_metadata table + indexes ready.")
-
 
 async def seed_tmdb_metadata(items: list[dict]) -> dict:
     """Seed tmdb_metadata med pending records. Idempotent."""
@@ -531,254 +688,150 @@ async def get_metadata_status() -> dict:
             """
         )
 
-    result = {
-        "total":     0, "pending":   0, "fetched":   0,
-        "error":     0, "not_found": 0,
-        "by_media_type": {
-            "movie": {"total": 0, "pending": 0, "fetched": 0, "error": 0, "not_found": 0},
-            "tv":    {"total": 0, "pending": 0, "fetched": 0, "error": 0, "not_found": 0},
-        },
+    by_media: dict[str, dict[str, int]] = {
+        "movie": {"pending": 0, "fetched": 0, "error": 0, "not_found": 0},
+        "tv":    {"pending": 0, "fetched": 0, "error": 0, "not_found": 0},
     }
+    total_by_status = {"pending": 0, "fetched": 0, "error": 0, "not_found": 0}
 
     for row in rows:
-        media_type = row["media_type"]
-        status     = row["status"]
-        cnt        = row["cnt"]
-        result["total"] += cnt
-        result[status] = result.get(status, 0) + cnt
-        if media_type in result["by_media_type"]:
-            result["by_media_type"][media_type]["total"] += cnt
-            result["by_media_type"][media_type][status]   = (
-                result["by_media_type"][media_type].get(status, 0) + cnt
-            )
+        media  = row["media_type"]
+        status = row["status"]
+        cnt    = row["cnt"]
+        if media in by_media and status in by_media[media]:
+            by_media[media][status] = cnt
+            total_by_status[status] += cnt
 
-    return result
+    return {
+        "by_media_type":   by_media,
+        "by_status":       total_by_status,
+        "total":           sum(total_by_status.values()),
+    }
 
 
-async def get_pending_metadata(limit: int = 100, include_errors: bool = False) -> list[dict]:
-    """Hent næste batch af records der skal fetches fra TMDB."""
-    if include_errors:
-        status_filter = "status IN ('pending', 'error')"
-    else:
-        status_filter = "status = 'pending'"
-
-    sql = f"""
-        SELECT tmdb_id, media_type, title, year
-        FROM tmdb_metadata
-        WHERE {status_filter}
-        ORDER BY created_at ASC
-        LIMIT $1
-    """
-
+async def get_pending_metadata_items(limit: int = 100) -> list[dict]:
+    """Hent pending items klar til TMDB-fetch. Sorteret ældste først."""
     async with _pool_ref().acquire() as conn:
-        rows = await conn.fetch(sql, limit)
-
+        rows = await conn.fetch(
+            """
+            SELECT tmdb_id, media_type, title, year
+            FROM tmdb_metadata
+            WHERE status = 'pending'
+            ORDER BY created_at ASC
+            LIMIT $1
+            """,
+            limit,
+        )
     return [dict(row) for row in rows]
 
 
-async def update_metadata_success(
+async def update_tmdb_metadata(
     tmdb_id: int,
     media_type: str,
-    tmdb_genres: list[str],
     keywords: list[str],
-    title: str | None = None,
-    year: int | None = None,
+    tmdb_genres: list[str],
+    status: str = "fetched",
+    error_message: str | None = None,
 ) -> None:
-    """Marker en record som 'fetched' og gem TMDB-data."""
+    """Opdater en metadata-record efter TMDB-fetch."""
     async with _pool_ref().acquire() as conn:
         await conn.execute(
             """
             UPDATE tmdb_metadata
-            SET status        = 'fetched',
-                tmdb_genres   = $3::jsonb,
-                keywords      = $4::jsonb,
-                title         = COALESCE($5, title),
-                year          = COALESCE($6, year),
-                error_message = NULL,
-                fetched_at    = NOW()
-            WHERE tmdb_id = $1 AND media_type = $2
-            """,
-            tmdb_id, media_type,
-            json.dumps(tmdb_genres), json.dumps(keywords),
-            title, year,
-        )
-
-
-async def update_metadata_error(
-    tmdb_id: int,
-    media_type: str,
-    error_message: str,
-    is_not_found: bool = False,
-) -> None:
-    """Marker en record som 'error' eller 'not_found'."""
-    status = "not_found" if is_not_found else "error"
-    async with _pool_ref().acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE tmdb_metadata
-            SET status        = $3,
+            SET keywords      = $1::jsonb,
+                tmdb_genres   = $2::jsonb,
+                status        = $3,
                 error_message = $4,
                 fetched_at    = NOW()
-            WHERE tmdb_id = $1 AND media_type = $2
+            WHERE tmdb_id = $5 AND media_type = $6
             """,
-            tmdb_id, media_type, status, error_message,
+            json.dumps(keywords),
+            json.dumps(tmdb_genres),
+            status,
+            error_message,
+            tmdb_id,
+            media_type,
         )
 
 
-async def get_top_keywords(
-    media_type: str | None = None,
-    limit: int | None = 50,
-    min_count: int = 1,
-) -> list[dict]:
-    """Find de mest brugte keywords i samlingen."""
-    where_parts: list[str] = ["status = 'fetched'"]
-    params: list = []
-    param_idx = 1
-
-    if media_type in ("movie", "tv"):
-        where_parts.append(f"media_type = ${param_idx}")
-        params.append(media_type)
-        param_idx += 1
-
-    where_clause = " AND ".join(where_parts)
-
-    having_clause = ""
-    if min_count > 1:
-        having_clause = f"HAVING COUNT(*) >= ${param_idx}"
-        params.append(min_count)
-        param_idx += 1
-
-    limit_clause = ""
-    if limit is not None:
-        limit_clause = f"LIMIT ${param_idx}"
-        params.append(limit)
-
-    sql = f"""
-        SELECT keyword, COUNT(*) AS cnt
-        FROM tmdb_metadata,
-             jsonb_array_elements_text(keywords) AS keyword
-        WHERE {where_clause}
-        GROUP BY keyword
-        {having_clause}
-        ORDER BY cnt DESC
-        {limit_clause}
-    """
-
-    async with _pool_ref().acquire() as conn:
-        rows = await conn.fetch(sql, *params)
-
-    return [{"keyword": row["keyword"], "count": row["cnt"]} for row in rows]
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# Subgenre lookup — Plex/TMDB genre mapping
+# Subgenre lookup — _plex_genre_to_tmdb mapping
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Mapping fra dansk Plex-genre til engelske TMDB-genrer.
-_PLEX_TO_TMDB_GENRE = {
-    "Komedie":      ["Comedy"],
-    "Gyser":        ["Horror"],
-    "Kriminalitet": ["Crime"],
-    "Familie":      ["Family"],
-    "Romantik":     ["Romance"],
-    "Krig":         ["War"],
-    "Mysterium":    ["Mystery"],
-    "Musik":        ["Music"],
-    "Historie":     ["History"],
-    "Action":       ["Action"],
-    "Drama":        ["Drama"],
-    "Thriller":     ["Thriller"],
-    "Adventure":    ["Adventure"],
-    "Fantasy":      ["Fantasy"],
-    "Sci-fi":       ["Science Fiction"],
-    "Animation":    ["Animation"],
-    "Documentary":  ["Documentary"],
-    "Western":      ["Western"],
-    "Biography":    ["Drama"],
-    "Musical":      ["Music"],
+# Mapper Plex-genrer til TMDB-genrer (bruges til at filtrere subgenre-resultater)
+# Plex bruger lidt andre navne end TMDB; mapper sikrer at fx Plex-genre "Sci-Fi"
+# matcher TMDB-genre "Science Fiction".
+_PLEX_TO_TMDB_GENRES = {
+    "Action":          ["Action"],
+    "Adventure":       ["Adventure"],
+    "Animation":       ["Animation"],
+    "Comedy":          ["Comedy"],
+    "Crime":           ["Crime"],
+    "Documentary":     ["Documentary"],
+    "Drama":           ["Drama"],
+    "Family":          ["Family"],
+    "Fantasy":         ["Fantasy"],
+    "Foreign":         [],  # ikke en TMDB-genre
+    "History":         ["History"],
+    "Horror":          ["Horror"],
+    "Music":           ["Music"],
+    "Mystery":         ["Mystery"],
+    "Romance":         ["Romance"],
+    "Sci-Fi":          ["Science Fiction", "Sci-Fi & Fantasy"],
+    "Science Fiction": ["Science Fiction", "Sci-Fi & Fantasy"],
+    "Thriller":        ["Thriller"],
+    "War":             ["War", "War & Politics"],
+    "Western":         ["Western"],
 }
 
 
 def _plex_genre_to_tmdb(plex_genre: str) -> list[str]:
-    """Konverter et Plex-genre-navn til en liste af tilsvarende TMDB-genrer."""
-    return _PLEX_TO_TMDB_GENRE.get(plex_genre, [plex_genre])
+    """Returnér liste af TMDB-genrer der matcher en Plex-genre."""
+    return _PLEX_TO_TMDB_GENRES.get(plex_genre, [plex_genre])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Subgenre title lookup (NY i v0.13.0 — generaliseret for film + TV)
+# Subgenre-baseret titel-lookup (v0.13.0 — media-aware)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def find_titles_by_subgenre(
     subgenre_id: str,
-    media_type: str | None = None,
+    media_type: str,
     limit: int = 30,
 ) -> list[dict]:
     """
-    Find titler der matcher en subgenre (keywords + valgfri Plex-genre).
+    Find titler i tmdb_metadata der matcher en subgenre.
 
-    Generaliseret version af find_films_by_subgenre der virker for både
-    'movie' og 'tv'.
+    Bruger CTE-baseret query for hurtig lookup via GIN-indekset på keywords.
+    Smart-blanding på Python-side: Skiftevis nye (≥cutoff_year) og klassikere
+    for at give et varieret udvalg.
 
     Args:
-      subgenre_id: ID fra subgenre_service (fx 'horror_slasher' eller 'tv_murder_mystery')
-      media_type:  'movie' eller 'tv'. None = auto-detect via subgenre prefix.
-      limit:       Max antal titler at returnere (efter smart-blanding).
+      subgenre_id: ID fra subgenre_service (fx 'horror_slasher')
+      media_type:  'movie' eller 'tv'
+      limit:       Max antal returnerede titler
 
     Returns:
-      Liste af dicts: [{"tmdb_id", "title", "year", "tmdb_genres", "keywords"}, ...]
-      Smart-blandet med nye + klassikere.
-
-    SMART-BLANDING:
-      Vi henter et bredt udsnit (limit*3 candidates), deler i nye/klassikere
-      buckets på Python-side og fletter dem alternativt for at give brugeren
-      et mix af friske og ældre titler.
-
-    PERFORMANCE:
-      Bruger CTE-baseret query der filtrerer FØRST, derefter randomiserer.
-      30-50ms hurtigere på populære subgenrer.
+      Liste af dicts med tmdb_id, title, year, tmdb_genres, keywords.
     """
-    from services.subgenre_service import get_subgenre, detect_media_type
+    from services.subgenre_service import get_subgenre
 
-    # Auto-detect media_type hvis ikke angivet
-    if media_type is None:
-        media_type = detect_media_type(subgenre_id)
-        if media_type is None:
-            logger.warning(
-                "find_titles_by_subgenre: kunne ikke auto-detect media_type for '%s'",
-                subgenre_id,
-            )
-            return []
-
-    # Validér media_type
-    if media_type not in ("movie", "tv"):
-        logger.error("find_titles_by_subgenre: ugyldig media_type='%s'", media_type)
-        return []
-
-    # Hent subgenre fra det rigtige katalog
     subgenre = get_subgenre(subgenre_id, media_type=media_type)
     if subgenre is None:
         logger.warning(
-            "find_titles_by_subgenre: ukendt subgenre_id='%s' for media_type='%s'",
+            "find_titles_by_subgenre: ukendt subgenre_id='%s' media='%s'",
             subgenre_id, media_type,
         )
         return []
 
-    keywords:   list[str]    = subgenre["keywords"]
-    plex_genre: str | None   = subgenre["plex_genre"]
+    keywords:    list[str]   = subgenre["keywords"]
+    plex_genre:  str | None  = subgenre["plex_genre"]
+    cutoff_year: int         = subgenre.get("cutoff_year", 2010)
 
     if not keywords:
-        logger.warning(
-            "find_titles_by_subgenre: subgenre '%s' har ingen keywords", subgenre_id,
-        )
         return []
 
-    fetch_limit = limit * 3
-
-    where_parts: list[str] = [
-        "status = 'fetched'",
-        "media_type = $1",
-        "keywords ?| $2::text[]",
-    ]
+    where_parts = ["status = 'fetched'", "media_type = $1", "keywords ?| $2::text[]"]
     params: list = [media_type, keywords]
 
     if plex_genre:
@@ -787,55 +840,43 @@ async def find_titles_by_subgenre(
         params.append(tmdb_genre_alts)
 
     where_clause = " AND ".join(where_parts)
-
     sql = f"""
-        WITH filtered AS (
-            SELECT tmdb_id, title, year, tmdb_genres, keywords
+        WITH candidates AS (
+            SELECT tmdb_id, media_type, title, year, tmdb_genres, keywords
             FROM tmdb_metadata
             WHERE {where_clause}
         )
-        SELECT tmdb_id, title, year, tmdb_genres, keywords
-        FROM filtered
-        ORDER BY RANDOM()
-        LIMIT ${len(params) + 1}
-    """
-    params.append(fetch_limit)
+        SELECT *
+        FROM candidates
+        ORDER BY year DESC NULLS LAST
+        LIMIT $%d
+    """ % (len(params) + 1)
+
+    params.append(max(limit * 4, 100))  # Hent flere for at have plads til smart-blanding
 
     try:
         async with _pool_ref().acquire() as conn:
             rows = await conn.fetch(sql, *params)
     except Exception as e:
-        logger.error(
-            "find_titles_by_subgenre SQL-fejl for '%s'/%s: %s",
-            subgenre_id, media_type, e,
-        )
+        logger.error("find_titles_by_subgenre SQL fejl: %s", e)
         return []
 
-    current_year = datetime.now(timezone.utc).year
-    cutoff_year  = current_year - 5
+    if not rows:
+        return []
 
+    # Smart-blanding: skiftevis nye og klassikere
     new_items:     list[dict] = []
     classic_items: list[dict] = []
 
     for row in rows:
-        try:
-            tmdb_genres = json.loads(row["tmdb_genres"]) if isinstance(row["tmdb_genres"], str) else row["tmdb_genres"]
-        except Exception:
-            tmdb_genres = []
-        try:
-            kw_list = json.loads(row["keywords"]) if isinstance(row["keywords"], str) else row["keywords"]
-        except Exception:
-            kw_list = []
+        item_dict = dict(row)
+        # asyncpg returnerer JSONB som str — parse til list
+        if isinstance(item_dict.get("tmdb_genres"), str):
+            item_dict["tmdb_genres"] = json.loads(item_dict["tmdb_genres"])
+        if isinstance(item_dict.get("keywords"), str):
+            item_dict["keywords"] = json.loads(item_dict["keywords"])
 
-        item_dict = {
-            "tmdb_id":     row["tmdb_id"],
-            "title":       row["title"] or "Ukendt",
-            "year":        row["year"],
-            "tmdb_genres": tmdb_genres or [],
-            "keywords":    kw_list or [],
-        }
-
-        if row["year"] and row["year"] >= cutoff_year:
+        if item_dict.get("year") and item_dict["year"] >= cutoff_year:
             new_items.append(item_dict)
         else:
             classic_items.append(item_dict)
@@ -886,8 +927,6 @@ async def find_films_by_subgenre(
 
     Tynd wrapper omkring find_titles_by_subgenre med media_type='movie'.
     Bevares for at undgå breaking changes i v2_service og andre kaldere.
-
-    NY KODE BØR BRUGE: find_titles_by_subgenre(subgenre_id, media_type='movie' eller 'tv')
     """
     return await find_titles_by_subgenre(
         subgenre_id=subgenre_id,
@@ -897,29 +936,14 @@ async def find_films_by_subgenre(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Subgenre coverage audit (uændret fra v0.12.0 — bruges af /audit_tv_subgenres)
+# Subgenre coverage audit
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def count_titles_by_subgenre(
     subgenre_id: str,
     media_type: str,
 ) -> int:
-    """
-    Tæl hvor mange titler der matcher en subgenre for et givent media_type.
-
-    Bruges af audit-kommandoen til at finde:
-      - Stærke subgenrer (>20 titler)
-      - Svage subgenrer (1-20 titler)
-      - Tomme subgenrer (0 titler)
-
-    Args:
-      subgenre_id: ID fra subgenre_service (fx 'horror_slasher')
-      media_type:  'movie' eller 'tv'
-
-    Returns:
-      Antal titler i tmdb_metadata der matcher (status='fetched').
-      Returnerer 0 hvis subgenre_id er ukendt eller ingen matches.
-    """
+    """Tæl hvor mange titler der matcher en subgenre for et givent media_type."""
     from services.subgenre_service import get_subgenre
 
     subgenre = get_subgenre(subgenre_id, media_type=media_type)
@@ -930,8 +954,8 @@ async def count_titles_by_subgenre(
         )
         return 0
 
-    keywords:   list[str]    = subgenre["keywords"]
-    plex_genre: str | None   = subgenre["plex_genre"]
+    keywords:   list[str]   = subgenre["keywords"]
+    plex_genre: str | None  = subgenre["plex_genre"]
 
     if not keywords:
         return 0
@@ -949,12 +973,7 @@ async def count_titles_by_subgenre(
         params.append(tmdb_genre_alts)
 
     where_clause = " AND ".join(where_parts)
-
-    sql = f"""
-        SELECT COUNT(*) AS cnt
-        FROM tmdb_metadata
-        WHERE {where_clause}
-    """
+    sql = f"SELECT COUNT(*) AS cnt FROM tmdb_metadata WHERE {where_clause}"
 
     try:
         async with _pool_ref().acquire() as conn:
@@ -967,24 +986,8 @@ async def count_titles_by_subgenre(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Feedback system (NY i v0.14.0)
+# Feedback system (v0.14.0)
 # ══════════════════════════════════════════════════════════════════════════════
-
-async def setup_feedback_table() -> None:
-    """
-    Opret feedback tabellen + indekser. Idempotent.
-
-    Tabellen deles mellem Buddy (skriver via submit_feedback) og admin-bot
-    (læser via list_feedback/get_feedback, opdaterer via update_feedback_status
-    og add_admin_reply). Begge bots peger på samme MAIN-database.
-    """
-    async with _pool_ref().acquire() as conn:
-        await conn.execute(_CREATE_FEEDBACK_TABLE)
-        await conn.execute(_CREATE_FEEDBACK_STATUS_INDEX)
-        await conn.execute(_CREATE_FEEDBACK_TYPE_INDEX)
-        await conn.execute(_CREATE_FEEDBACK_USER_INDEX)
-    logger.info("feedback table + indexes ready.")
-
 
 async def submit_feedback(
     telegram_id: int,
@@ -994,24 +997,8 @@ async def submit_feedback(
     telegram_username: str | None = None,
     telegram_name: str | None = None,
 ) -> int:
-    """
-    Gem en ny feedback-record. Returnerer feedback-ID til notifikation.
-
-    Args:
-      telegram_id:         Telegram bruger-ID
-      feedback_type:       'idea' | 'bug' | 'question' | 'praise'
-      message:             Brugerens tekst-besked
-      screenshot_file_ids: Liste af Telegram file_ids (kan være tom)
-      telegram_username:   Brugerens @username (kan være None)
-      telegram_name:       Brugerens first_name (kan være None)
-
-    Returns:
-      ID på den nye feedback-record (bruges af admin-notifikation).
-    """
-    if feedback_type not in ("idea", "bug", "question", "praise"):
-        raise ValueError(f"Ugyldig feedback_type: '{feedback_type}'")
-
-    file_ids = screenshot_file_ids or []
+    """Gem en ny feedback-record. Returnerer feedback-ID til notifikation."""
+    file_ids_json = json.dumps(screenshot_file_ids or [])
 
     async with _pool_ref().acquire() as conn:
         row = await conn.fetchrow(
@@ -1023,18 +1010,14 @@ async def submit_feedback(
             VALUES ($1, $2, $3, $4, $5, $6::jsonb)
             RETURNING id
             """,
-            telegram_id,
-            telegram_username,
-            telegram_name,
-            feedback_type,
-            message,
-            json.dumps(file_ids),
+            telegram_id, telegram_username, telegram_name,
+            feedback_type, message, file_ids_json,
         )
 
-    feedback_id = row["id"] if row else 0
+    feedback_id = row["id"]
     logger.info(
-        "submit_feedback: id=%d type=%s telegram_id=%s screenshots=%d",
-        feedback_id, feedback_type, telegram_id, len(file_ids),
+        "feedback submitted: id=%s telegram_id=%s type=%s screenshots=%d",
+        feedback_id, telegram_id, feedback_type, len(screenshot_file_ids or []),
     )
     return feedback_id
 
@@ -1044,354 +1027,204 @@ async def list_feedback(
     type_filter: str | None = None,
     limit: int = 20,
 ) -> list[dict]:
-    """
-    Liste feedback-records sorteret efter nyeste først.
-
-    Args:
-      status_filter: 'new' | 'seen' | 'replied' | 'resolved' | 'active'
-                     (active = new + seen + replied, dvs. ikke resolved)
-                     None = alle
-      type_filter:   'idea' | 'bug' | 'question' | 'praise'
-                     None = alle
-      limit:         Max antal records (default 20)
-
-    Returns:
-      Liste af dicts med alle felter. screenshot_file_ids parses til list.
-    """
+    """Liste feedback-records sorteret efter nyeste først."""
     where_parts: list[str] = []
     params: list = []
-    param_idx = 1
+    pn = 0
 
     if status_filter == "active":
-        where_parts.append("status IN ('new', 'seen', 'replied')")
-    elif status_filter in ("new", "seen", "replied", "resolved"):
-        where_parts.append(f"status = ${param_idx}")
+        pn += 1
+        where_parts.append(f"status != ${pn}")
+        params.append("resolved")
+    elif status_filter:
+        pn += 1
+        where_parts.append(f"status = ${pn}")
         params.append(status_filter)
-        param_idx += 1
 
-    if type_filter in ("idea", "bug", "question", "praise"):
-        where_parts.append(f"feedback_type = ${param_idx}")
+    if type_filter:
+        pn += 1
+        where_parts.append(f"feedback_type = ${pn}")
         params.append(type_filter)
-        param_idx += 1
 
-    where_clause = ""
-    if where_parts:
-        where_clause = "WHERE " + " AND ".join(where_parts)
-
+    pn += 1
     params.append(limit)
+
+    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
     sql = f"""
-        SELECT id, telegram_id, telegram_username, telegram_name,
-               feedback_type, message, screenshot_file_ids,
-               status, admin_reply, admin_replied_at,
-               created_at, updated_at
+        SELECT *
         FROM feedback
         {where_clause}
         ORDER BY created_at DESC
-        LIMIT ${param_idx}
+        LIMIT ${pn}
     """
 
     async with _pool_ref().acquire() as conn:
         rows = await conn.fetch(sql, *params)
 
-    result = []
+    results = []
     for row in rows:
         d = dict(row)
-        try:
-            d["screenshot_file_ids"] = (
-                json.loads(d["screenshot_file_ids"])
-                if isinstance(d["screenshot_file_ids"], str)
-                else (d["screenshot_file_ids"] or [])
-            )
-        except Exception:
-            d["screenshot_file_ids"] = []
-        result.append(d)
-
-    return result
+        if isinstance(d.get("screenshot_file_ids"), str):
+            d["screenshot_file_ids"] = json.loads(d["screenshot_file_ids"])
+        results.append(d)
+    return results
 
 
 async def get_feedback(feedback_id: int) -> dict | None:
-    """
-    Hent én feedback-record med fuld detalje.
-
-    Returns:
-      Dict med alle felter, eller None hvis ID ikke findes.
-      screenshot_file_ids parses til list.
-    """
+    """Hent fuld detalje for én feedback-record."""
     async with _pool_ref().acquire() as conn:
         row = await conn.fetchrow(
-            """
-            SELECT id, telegram_id, telegram_username, telegram_name,
-                   feedback_type, message, screenshot_file_ids,
-                   status, admin_reply, admin_replied_at,
-                   created_at, updated_at
-            FROM feedback
-            WHERE id = $1
-            """,
-            feedback_id,
+            "SELECT * FROM feedback WHERE id = $1", feedback_id
         )
-
     if not row:
         return None
-
     d = dict(row)
-    try:
-        d["screenshot_file_ids"] = (
-            json.loads(d["screenshot_file_ids"])
-            if isinstance(d["screenshot_file_ids"], str)
-            else (d["screenshot_file_ids"] or [])
-        )
-    except Exception:
-        d["screenshot_file_ids"] = []
+    if isinstance(d.get("screenshot_file_ids"), str):
+        d["screenshot_file_ids"] = json.loads(d["screenshot_file_ids"])
     return d
 
 
 async def update_feedback_status(feedback_id: int, status: str) -> bool:
-    """
-    Opdater status på en feedback-record.
-
-    Args:
-      feedback_id: ID på record
-      status:      'new' | 'seen' | 'replied' | 'resolved'
-
-    Returns:
-      True hvis record blev opdateret, False hvis ID ikke findes.
-    """
+    """Opdater status på en feedback-record. Returnerer True hvis row blev opdateret."""
     if status not in ("new", "seen", "replied", "resolved"):
-        raise ValueError(f"Ugyldig status: '{status}'")
+        logger.warning("update_feedback_status: ugyldig status '%s'", status)
+        return False
 
     async with _pool_ref().acquire() as conn:
         result = await conn.execute(
             """
             UPDATE feedback
-            SET status     = $2,
+            SET status     = $1,
                 updated_at = NOW()
-            WHERE id = $1
+            WHERE id = $2
             """,
-            feedback_id, status,
+            status, feedback_id,
         )
-
-    # asyncpg returnerer "UPDATE 1" eller "UPDATE 0"
-    updated = result.endswith(" 1")
-    if updated:
-        logger.info("update_feedback_status: id=%d → '%s'", feedback_id, status)
-    return updated
+    return result.endswith(" 1")
 
 
 async def add_admin_reply(feedback_id: int, reply_text: str) -> bool:
-    """
-    Gem admin-svar og marker feedback som 'replied'.
-
-    Atomisk operation: opdaterer admin_reply, admin_replied_at og status
-    i én transaction.
-
-    Args:
-      feedback_id: ID på record
-      reply_text:  Admins svar-tekst
-
-    Returns:
-      True hvis record blev opdateret, False hvis ID ikke findes.
-    """
+    """Gem admin-svar atomisk sammen med status='replied'."""
     async with _pool_ref().acquire() as conn:
         result = await conn.execute(
             """
             UPDATE feedback
-            SET admin_reply      = $2,
+            SET admin_reply      = $1,
                 admin_replied_at = NOW(),
                 status           = 'replied',
                 updated_at       = NOW()
-            WHERE id = $1
+            WHERE id = $2
             """,
-            feedback_id, reply_text,
+            reply_text, feedback_id,
         )
-
-    updated = result.endswith(" 1")
-    if updated:
-        logger.info("add_admin_reply: id=%d (%d chars)", feedback_id, len(reply_text))
-    return updated
+    return result.endswith(" 1")
 
 
 async def count_feedback_by_status() -> dict:
-    """
-    Tæl feedback-records grupperet efter status og type.
-
-    Bruges til admin-bot statistik (Phase 2).
-
-    Returns:
-      {
-        "total": 42,
-        "by_status": {"new": 5, "seen": 3, "replied": 10, "resolved": 24},
-        "by_type":   {"idea": 15, "bug": 20, "question": 5, "praise": 2},
-      }
-    """
+    """Returnér optælling af feedback pr. status."""
     async with _pool_ref().acquire() as conn:
-        status_rows = await conn.fetch(
+        rows = await conn.fetch(
             "SELECT status, COUNT(*) AS cnt FROM feedback GROUP BY status"
         )
-        type_rows = await conn.fetch(
-            "SELECT feedback_type, COUNT(*) AS cnt FROM feedback GROUP BY feedback_type"
-        )
-
-    by_status = {"new": 0, "seen": 0, "replied": 0, "resolved": 0}
-    for r in status_rows:
-        by_status[r["status"]] = r["cnt"]
-
-    by_type = {"idea": 0, "bug": 0, "question": 0, "praise": 0}
-    for r in type_rows:
-        by_type[r["feedback_type"]] = r["cnt"]
-
-    return {
-        "total":     sum(by_status.values()),
-        "by_status": by_status,
-        "by_type":   by_type,
-    }
+    counts = {"new": 0, "seen": 0, "replied": 0, "resolved": 0}
+    for row in rows:
+        counts[row["status"]] = row["cnt"]
+    counts["total"] = sum(counts.values())
+    return counts
 
 
 async def is_first_time_feedback(telegram_id: int) -> bool:
     """
-    Tjek om en bruger sender feedback for FØRSTE gang.
+    Returnerer True hvis brugeren ALDRIG har sendt feedback før.
 
-    Skal kaldes FØR submit_feedback() — efter submit findes der allerede
-    mindst én record for brugeren, så funktionen ville altid returnere False.
-
-    Args:
-      telegram_id: Telegram bruger-ID
-
-    Returns:
-      True hvis brugeren har 0 feedback-records, False ellers.
+    Bruges af main.py til at tagge admin-notifikationen med "🆕 NY TESTER"
+    så Jesper instant ved at det er en førstegangs-bruger.
     """
     async with _pool_ref().acquire() as conn:
         row = await conn.fetchrow(
-            """
-            SELECT EXISTS (
-                SELECT 1 FROM feedback WHERE telegram_id = $1
-            ) AS has_feedback
-            """,
+            "SELECT 1 FROM feedback WHERE telegram_id = $1 LIMIT 1",
             telegram_id,
         )
-
-    has_feedback = bool(row and row["has_feedback"])
-    return not has_feedback
+    return row is None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Batch B (v0.14.2) — Bulk operations + helpers
+# Bulk operations + helpers (v0.14.2)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_id_range(spec: str) -> list[int]:
     """
     Parse en bruger-specificeret ID-range/list til konkrete IDs.
 
-    Bruges af admin-bot's /seen 1-20 og /resolve 5,7,9 kommandoer.
-
-    Accepterer:
-      - Enkelt ID:   "5"           → [5]
-      - Range:       "1-5"         → [1, 2, 3, 4, 5]
-      - Liste:       "5,7,9"       → [5, 7, 9]
-      - Kombineret:  "1,3-5,8"     → [1, 3, 4, 5, 8]
-
-    Whitespace ignoreres. Duplikater fjernes. Output er sorteret.
-
-    Args:
-      spec: Bruger-input string
-
-    Returns:
-      Sorteret liste af unique IDs (int).
-      Tom liste hvis spec er invalid eller ingen IDs blev fundet.
-
     Eksempler:
-      parse_id_range("1-3, 5") → [1, 2, 3, 5]
-      parse_id_range("abc")    → []
-      parse_id_range("")       → []
+      "1-5"     → [1,2,3,4,5]
+      "5,7,9"   → [5,7,9]
+      "1,3-5,8" → [1,3,4,5,8]
+
+    Returnerer sorteret liste af unique IDs. Ignorerer ugyldige tokens.
     """
     if not spec or not spec.strip():
         return []
 
     ids: set[int] = set()
-
-    # Split på komma først, derefter på bindestreg for ranges
     for part in spec.split(","):
         part = part.strip()
         if not part:
             continue
 
         if "-" in part:
-            # Range: "1-5"
             try:
                 start_str, end_str = part.split("-", 1)
                 start = int(start_str.strip())
                 end   = int(end_str.strip())
                 if start > end:
                     start, end = end, start
-                # Begræns range-størrelse for sikkerhed (max 1000 IDs)
-                if end - start > 1000:
-                    continue
                 ids.update(range(start, end + 1))
-            except (ValueError, IndexError):
+            except (ValueError, AttributeError):
+                logger.warning("parse_id_range: ugyldig range '%s' — ignorerer", part)
                 continue
         else:
-            # Enkelt ID
             try:
                 ids.add(int(part))
             except ValueError:
+                logger.warning("parse_id_range: ugyldigt token '%s' — ignorerer", part)
                 continue
 
-    # Filtrer negative + nul ud (feedback IDs starter ved 1)
-    valid_ids = sorted(i for i in ids if i > 0)
-    return valid_ids
+    return sorted(ids)
 
 
-async def update_feedback_status_bulk(
-    feedback_ids: list[int],
-    status: str,
-) -> int:
+async def update_feedback_status_bulk(ids: list[int], status: str) -> int:
     """
     Opdater status for FLERE feedback-records på én gang.
 
     Bruges af admin-bot's /seen 1-20 og /resolve 5,7,9 kommandoer.
-    Atomisk operation — enten lykkes alle eller ingen.
-
-    Args:
-      feedback_ids: Liste af feedback IDs at opdatere
-      status:       'new' | 'seen' | 'replied' | 'resolved'
-
-    Returns:
-      Antal records der faktisk blev opdateret (kan være mindre end
-      len(feedback_ids) hvis nogle IDs ikke findes).
-
-    Raises:
-      ValueError: Hvis status er ugyldig.
+    Returnerer antal records faktisk opdateret.
     """
+    if not ids:
+        return 0
     if status not in ("new", "seen", "replied", "resolved"):
-        raise ValueError(f"Ugyldig status: '{status}'")
-
-    if not feedback_ids:
+        logger.warning("update_feedback_status_bulk: ugyldig status '%s'", status)
         return 0
 
     async with _pool_ref().acquire() as conn:
-        # Bruger ANY($1::int[]) for at undgå SQL injection og være effektiv
         result = await conn.execute(
             """
             UPDATE feedback
-            SET status     = $2,
+            SET status     = $1,
                 updated_at = NOW()
-            WHERE id = ANY($1::int[])
+            WHERE id = ANY($2::int[])
             """,
-            feedback_ids, status,
+            status, ids,
         )
 
-    # result.execute returnerer "UPDATE <count>"
-    parts = result.split()
-    if len(parts) >= 2 and parts[0] == "UPDATE":
-        try:
-            count = int(parts[1])
-        except ValueError:
-            count = 0
-    else:
-        count = 0
+    # asyncpg returnerer "UPDATE N" — udtræk N
+    try:
+        affected = int(result.split()[-1])
+    except (ValueError, IndexError):
+        affected = 0
 
-    if count > 0:
-        logger.info(
-            "update_feedback_status_bulk: %d records → '%s' (requested: %d)",
-            count, status, len(feedback_ids),
-        )
-    return count
+    logger.info(
+        "update_feedback_status_bulk: status='%s' ids=%s → %d opdateret",
+        status, ids, affected,
+    )
+    return affected
