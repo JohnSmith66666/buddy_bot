@@ -1,29 +1,21 @@
 """
 features/watch/__init__.py - Watch flow feature for Buddy 2.0.
 
-DENNE FEATURE ER IKKE EN STUB — den eksisterende watch flow virker allerede.
-Vi laver bare en TYND ADAPTER der lader hovedmenuens 🍿-knap åbne det
-eksisterende watch flow.
+Tynd ADAPTER der lader hovedmenuens 🍿-knap åbne det eksisterende watch flow
+i main.py.
 
-DESIGN-VALG:
-  - Vi flytter IKKE den eksisterende watch flow kode ind i features/.
-    Den ligger stadig i main.py og virker som den plejer.
-  - Vi laver en lille adapter der oversætter "menu:watch" callback til
-    et kald til den eksisterende handle_watch_flow_trigger() funktion
-    via en ny helper.
-  - Når vi engang refaktorerer watch flow ind i features/ (måske aldrig?),
-    er det en intern ændring uden side-effects.
+CHANGES (v0.2.0 — fix for "knappen virker ikke"):
+  - FIX: Tidligere version sendte falsk tekst-besked og forventede at
+    handle_text fangede den. Det virker IKKE — Telegram ignorerer
+    bot-beskeder i MessageHandlers.
+  - LØSNING: Importér TRIN2_HEADER + _build_media_keyboard fra main.py
+    (lazy import inde i handler for at undgå circular import).
+  - Når brugeren trykker 🍿, sletter vi menu-beskeden og sender
+    Trin 2 (media-valg) som ny besked — eksakt samme oplevelse som
+    den gamle reply-keyboard knap.
 
-HVORFOR IKKE FLYTTE WATCH FLOW NU?
-  - Det er ~500 linjer kode der virker perfekt
-  - Den bruger eksisterende keyboards og callbacks (sg_*, etc.)
-  - Risiko/værdi-ratio for refaktorering er ikke god lige nu
-  - "Don't fix what ain't broken"
-
-CHANGES (v0.1.0 — initial):
-  - WatchFeature klasse oprettet og registreret.
-  - Adapter-handler dispatcher til eksisterende watch flow logik.
-  - status=READY (ingen 🔧 emoji — den virker!).
+CHANGES (v0.1.0 — initial, deprecated):
+  - Tidligere implementation der ikke virkede.
 """
 
 import logging
@@ -38,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Adapter-handler — oversætter inline-knap til eksisterende watch flow
+# Adapter-handler
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _handle_watch_menu(
@@ -48,45 +40,50 @@ async def _handle_watch_menu(
     """
     Brugeren trykkede '🍿 Hvad skal jeg se?' i hovedmenu.
 
-    Dispatcher til den eksisterende watch flow ved at simulere et kald
-    til handle_watch_flow_trigger() — vi kan ikke importere den direkte
-    for at undgå circular imports, så vi bruger en lille trick: opret en
-    ny besked der starter watch flow ovenpå.
+    Sletter menu-beskeden og åbner Trin 2 (media-valg) som ny besked.
+    Resten af watch-flow (kategorier, subgenrer, resultater) håndteres
+    af de eksisterende sg_* callbacks i main.py.
     """
     query = update.callback_query
     await query.answer()
 
     user = update.effective_user
+    chat = query.message.chat
 
-    # Track at brugeren startede watch flow fra hovedmenuen
+    # Track analytics
     user_data_service.log_feature_usage(
         telegram_id=user.id,
         feature="watch",
         action="menu_open",
     )
 
-    # Den eksisterende watch flow forventer et fresh-message med specifik tekst.
-    # Vi sletter den nuværende menu-besked og lader main.py's text-handler
-    # håndtere det videre flow ved at sende "🍿 Hvad skal jeg se?" tilbage.
-    #
-    # ALTERNATIV (renere men kræver refaktor): Importer handle_watch_flow_trigger
-    # direkte og kald den. Det kræver vi laver en mindre refactor i main.py.
-    #
-    # Vi vælger den simple løsning: vis en besked der peger brugeren videre.
+    # Lazy import for at undgå circular dependency med main.py
     try:
-        # Slet menu-beskeden
+        from main import TRIN2_HEADER, _build_media_keyboard
+    except ImportError as e:
+        logger.error("Kunne ikke importere watch-flow fra main: %s", e)
+        try:
+            await query.edit_message_text(
+                "❌ Watch-flow ikke tilgængelig. Prøv den gamle 🍿 knap nederst."
+            )
+        except Exception:
+            pass
+        return
+
+    # Slet hovedmenu-beskeden
+    try:
         await query.message.delete()
     except Exception as e:
         logger.warning("watch menu — kunne ikke slette menu-besked: %s", e)
 
-    # Send watch-flow trigger som ny besked.
-    # Eksisterende main.py text-handler håndterer "🍿 Hvad skal jeg se?" tekst.
-    from features.main_menu.keyboards import build_persistent_reply_keyboard
-
-    await query.message.chat.send_message(
-        text="🍿 Hvad skal jeg se?",
-        reply_markup=build_persistent_reply_keyboard(),
+    # Send Trin 2 (media-valg) — eksisterende sg_* handlers tager over derfra
+    await chat.send_message(
+        TRIN2_HEADER,
+        parse_mode="Markdown",
+        reply_markup=_build_media_keyboard(),
     )
+
+    logger.info("Watch flow startet via hovedmenu for telegram_id=%s", user.id)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -95,17 +92,15 @@ async def _handle_watch_menu(
 
 @FeatureRegistry.register
 class WatchFeature(Feature):
-    """
-    🍿 Hvad skal jeg se? — adgang til det eksisterende watch flow.
-    """
+    """🍿 Hvad skal jeg se? — adgang til det eksisterende watch flow."""
 
     id            = "watch"
     label         = "🍿 Hvad skal jeg se?"
     enabled       = True
     requires_plex = True
-    menu_order    = 10  # Først i menuen
+    menu_order    = 10
     category      = FeatureCategory.DISCOVER
-    status        = FeatureStatus.READY  # Den virker — ingen 🔧
+    status        = FeatureStatus.READY
 
     description = (
         "Find noget at se baseret på din humør og bibliotekets undergenrer. "
@@ -119,4 +114,4 @@ class WatchFeature(Feature):
             pattern=r"^menu:watch$",
         ))
 
-        logger.debug("WatchFeature handlers registreret (adapter v0.1.0)")
+        logger.debug("WatchFeature handlers registreret (adapter v0.2.0)")
