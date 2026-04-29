@@ -198,16 +198,16 @@ from services.subgenre_service import (
 )
 from services.v2_service import find_unwatched_v2
 from services.webhook_service import handle_radarr_webhook, handle_sonarr_webhook
-from features import FeatureRegistry
-import features.main_menu  # noqa: F401
-import features.watch      # noqa: F401
-import features.watchlist  # noqa: F401
-from features.main_menu import register_main_menu_handlers, show_main_menu
+
+# ── Buddy 2.0 imports ────
+from features.setup import setup_buddy_2
+from features.main_menu import show_main_menu, register_main_menu_handlers
 from features.main_menu.keyboards import (
     FEEDBACK_BUTTON_LABEL,
     HOME_BUTTON_LABEL,
     build_persistent_reply_keyboard,
 )
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -3990,13 +3990,6 @@ def main() -> None:
     # ── Photo handler (NYT v0.14.0) ─────────────────────────────────────────
     # Photos håndteres af feedback-flow når bruger er i 'awaiting_feedback' state.
     app.add_handler(MessageHandler(filters.PHOTO, handle_feedback_photo))
-
-    1. PHOTO handler (eksisterende)
-    2. NEW: Home button handler (regex-match)
-    3. NEW: Feedback button handler (regex-match)
-    4. handle_text (general TEXT handler — fanger ALT andet)
-    5. FeatureRegistry.register_all_handlers
-    6. register_main_menu_handlers
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
