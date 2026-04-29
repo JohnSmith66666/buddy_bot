@@ -2717,6 +2717,15 @@ async def cmd_fetch_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def cmd_metadata_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /metadata_status — vis aktuelt antal records pr. status og media_type.
+
+    v0.16.5: Fixed KeyError. database.get_metadata_status() returnerer
+    {by_media_type: {...}, by_status: {...}, total: int} — ikke
+    {fetched, pending, error, not_found, total} flat.
+    Vi læser nu korrekt fra status['by_status'] og beregner pr. media-type
+    'total' som sum af alle statuses.
+    """
     user = update.effective_user
     if user is None or user.id != config.ADMIN_TELEGRAM_ID:
         return
@@ -2737,37 +2746,46 @@ async def cmd_metadata_status(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    pct_total = (status["fetched"] / status["total"] * 100) if status["total"] else 0
-    movie     = status["by_media_type"]["movie"]
-    tv        = status["by_media_type"]["tv"]
+    # FIX: Læs fra by_status (ikke flat keys på status-dict)
+    by_status = status["by_status"]
+    by_media  = status["by_media_type"]
 
-    movie_pct = (movie["fetched"] / movie["total"] * 100) if movie["total"] else 0
-    tv_pct    = (tv["fetched"]    / tv["total"]    * 100) if tv["total"]    else 0
+    pct_total = (by_status["fetched"] / status["total"] * 100) if status["total"] else 0
+
+    movie       = by_media["movie"]
+    movie_total = movie["pending"] + movie["fetched"] + movie["error"] + movie["not_found"]
+    movie_pct   = (movie["fetched"] / movie_total * 100) if movie_total else 0
+
+    tv       = by_media["tv"]
+    tv_total = tv["pending"] + tv["fetched"] + tv["error"] + tv["not_found"]
+    tv_pct   = (tv["fetched"] / tv_total * 100) if tv_total else 0
 
     msg = (
         f"📊 *Metadata Status*\n"
         f"═══════════════════════\n\n"
-        f"🌍 *Total:* {status['fetched']:,} / {status['total']:,} ({pct_total:.1f}%)\n"
-        f"  • Pending: *{status['pending']:,}*\n"
-        f"  • Fetched: *{status['fetched']:,}*\n"
-        f"  • Error: *{status['error']:,}*\n"
-        f"  • Not found: *{status['not_found']:,}*\n\n"
-        f"🎬 *Film:* {movie['fetched']:,} / {movie['total']:,} ({movie_pct:.1f}%)\n"
+        f"🌍 *Total:* {by_status['fetched']:,} / {status['total']:,} ({pct_total:.1f}%)\n"
+        f"  • Pending: *{by_status['pending']:,}*\n"
+        f"  • Fetched: *{by_status['fetched']:,}*\n"
+        f"  • Error: *{by_status['error']:,}*\n"
+        f"  • Not found: *{by_status['not_found']:,}*\n\n"
+        f"🎬 *Film:* {movie['fetched']:,} / {movie_total:,} ({movie_pct:.1f}%)\n"
         f"  • Pending: {movie['pending']:,}\n"
         f"  • Error: {movie['error']:,}\n"
         f"  • Not found: {movie['not_found']:,}\n\n"
-        f"📺 *Serier:* {tv['fetched']:,} / {tv['total']:,} ({tv_pct:.1f}%)\n"
+        f"📺 *Serier:* {tv['fetched']:,} / {tv_total:,} ({tv_pct:.1f}%)\n"
         f"  • Pending: {tv['pending']:,}\n"
         f"  • Error: {tv['error']:,}\n"
         f"  • Not found: {tv['not_found']:,}\n"
     )
 
-    if status["pending"] > 0:
+    if by_status["pending"] > 0:
         msg += f"\n🚀 *Næste:* `/fetch_metadata`"
-    elif status["error"] > 0:
+    elif by_status["error"] > 0:
         msg += f"\n🔁 *Retry errors:* `/fetch_metadata retry`"
     else:
-        msg += f"\n🎉 *Alle records er færdige!* Prøv `/top_keywords movie 50`"
+        msg += f"\n🎉 *Alle records er færdige!*"
+
+    msg += f"\n\n💡 Prøv `/top_keywords movie 50`"
 
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -2812,11 +2830,19 @@ async def _cmd_top_keywords_chat(
     media_type: str | None,
     limit: int,
 ) -> None:
+    """
+    Vis top N keywords i chat (kort format).
+
+    v0.16.5: Fixed Markdown-fejl. Tidligere brugte vi underscore-italic
+    der konflikterede med media_type-værdien hvis den var None ('alle').
+    Nu bruger vi parentes-format uden italic for at undgå parser-fejl.
+    """
     await update.message.chat.send_action("typing")
+    media_label = media_type or "alle"
     loading = await update.message.reply_text(
         f"🔬 *Top Keywords*\n\n"
         f"Analyserer database...\n"
-        f"_(media_type: {media_type or 'alle'}, limit: {limit})_",
+        f"\\(media\\_type: {media_label}, limit: {limit}\\)",
         parse_mode="Markdown",
     )
 

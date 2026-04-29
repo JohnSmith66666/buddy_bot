@@ -142,7 +142,11 @@ SUBGENRES_MOVIE: dict[str, dict] = {
     "crime_mafia": {
         "label":      "🕴️ Betonsko & Hestehoveder",
         "plex_genre": "Kriminalitet",
-        "keywords":   ["gangster", "police"],
+        # v0.3.4: Udvidet keywords. Tidligere ["gangster", "police"] var
+        # for snæver — TMDB tagger klassiske mafia-film med 'mafia' eller
+        # 'organized crime', sjældent 'gangster'. 'police' var også for bredt
+        # (rammede ALLE krimi-film). Nu fokuseret på mafia-specifikke keywords.
+        "keywords":   ["mafia", "organized crime", "gangster", "mob", "yakuza"],
     },
 
     # ──── 5. LASERE & FOLIEHATTE-SKUFFEN ──────────────────────────────────────
