@@ -12,6 +12,15 @@ Match Plex 1:1 (auto-fjern):
   Hvis bruger fjerner en titel i Plex-appen, fjernes den også fra vores DB
   ved næste sync. Plex er kilde til sandhed.
 
+CHANGES (v0.2.0 — fix manglende titler):
+  - FIX: Gemmer nu cached_title, cached_year, cached_rating direkte i DB
+    ved sync. Tidligere var titlerne kun i tmdb_metadata cachen — som ikke
+    indeholder titler brugeren ikke har på Plex.
+  - get_watchlist_with_metadata() bruger nu primært cached_title fra DB,
+    med fallback til tmdb_metadata for gamle records uden cached titel.
+  - Næste sync efter denne deployment vil populate cached_* for alle
+    eksisterende records.
+
 CHANGES (v0.1.0 — initial):
   - sync_user_watchlist() hovedfunktion med diff-logik.
   - is_sync_needed() tjek mod 5 min cache.
@@ -130,7 +139,6 @@ async def is_sync_needed(telegram_id: int) -> bool:
     if last_synced is None:
         return True
 
-    # asyncpg returnerer timezone-aware datetime
     age = datetime.now(timezone.utc) - last_synced
     return age > timedelta(minutes=SYNC_CACHE_TTL_MINUTES)
 
@@ -147,38 +155,31 @@ async def sync_user_watchlist(
     """
     Synkroniser brugerens Plex Discover watchlist med vores DB.
 
+    v0.2.0: Gemmer nu også cached_title, cached_year, cached_rating fra Plex
+    direkte i DB så watchlist-visningen altid har titler tilgængelige.
+
     Args:
       telegram_id:   Brugerens Telegram ID
       plex_username: Plex-brugernavn (None = admin)
       force:         Hvis True, sync uanset cache-alder
 
     Returns:
-      dict med stats:
-        {
-          "synced": True/False,         # Om sync faktisk kørte
-          "source": "plex"/"cache",     # Hvor data kom fra
-          "added": int,                 # Nye items tilføjet til DB
-          "removed": int,               # Items fjernet fra DB
-          "total": int,                 # Total items i DB efter sync
-          "error": str | None,          # Fejl-besked hvis fejlet
-        }
+      dict med stats (synced, source, added, removed, total, error)
     """
     await _ensure_source_column_exists()
 
     # Tjek om sync er nødvendig
     if not force and not await is_sync_needed(telegram_id):
-        # Vis cached data direkte
         cached = await user_data_service.get_watchlist(telegram_id)
         return {
-            "synced": False,
-            "source": "cache",
-            "added":  0,
+            "synced":  False,
+            "source":  "cache",
+            "added":   0,
             "removed": 0,
-            "total":  len(cached),
-            "error":  None,
+            "total":   len(cached),
+            "error":   None,
         }
 
-    # Sync er nødvendig — hent fra Plex
     logger.info(
         "Watchlist sync starter for telegram_id=%s (plex=%s)",
         telegram_id, plex_username,
@@ -197,11 +198,12 @@ async def sync_user_watchlist(
             "error":   f"Kunne ikke kontakte Plex: {e}",
         }
 
-    # Lav set med (tmdb_id, media_type) tupler for Plex-data
-    plex_set = {
-        (item["tmdb_id"], item["media_type"])
+    # Byg lookup-dict fra Plex med (tmdb_id, media_type) → fuld info
+    plex_lookup = {
+        (item["tmdb_id"], item["media_type"]): item
         for item in plex_items
     }
+    plex_set = set(plex_lookup.keys())
 
     # Hent nuværende DB-state
     current_db_items = await user_data_service.get_watchlist(telegram_id)
@@ -213,27 +215,51 @@ async def sync_user_watchlist(
     # Diff
     to_add    = plex_set - db_set
     to_remove = db_set - plex_set
+    to_update = plex_set & db_set  # Eksisterende — opdatér cached_* hvis NULL
 
     added_count = 0
     removed_count = 0
+    updated_count = 0
 
-    # Tilføj nye items
-    for tmdb_id, media_type in to_add:
+    # Tilføj NYE items med fuld metadata fra Plex
+    for key in to_add:
+        plex_item = plex_lookup[key]
         try:
             success = await user_data_service.add_to_watchlist(
                 telegram_id=telegram_id,
-                tmdb_id=tmdb_id,
-                media_type=media_type,
+                tmdb_id=plex_item["tmdb_id"],
+                media_type=plex_item["media_type"],
+                cached_title=plex_item.get("title"),
+                cached_year=plex_item.get("year"),
+                cached_rating=plex_item.get("rating"),
             )
             if success:
                 added_count += 1
-                # Marker source som 'synced' (default fra DDL)
-                # Hvis 📌 knap-koden allerede har sat 'manual', overskriver
-                # vi ikke det her — kun nye records får 'synced'.
         except Exception as e:
             logger.warning(
                 "sync add fejl for tmdb_id=%s media=%s: %s",
-                tmdb_id, media_type, e,
+                plex_item["tmdb_id"], plex_item["media_type"], e,
+            )
+
+    # OPDATÉR EKSISTERENDE items med cached_* hvis de mangler
+    # (vigtigt for ALLE eksisterende rows fra v0.1.0 der ikke havde cached_*)
+    for key in to_update:
+        plex_item = plex_lookup[key]
+        try:
+            # add_to_watchlist håndterer ON CONFLICT UPDATE for cached_* felter
+            await user_data_service.add_to_watchlist(
+                telegram_id=telegram_id,
+                tmdb_id=plex_item["tmdb_id"],
+                media_type=plex_item["media_type"],
+                cached_title=plex_item.get("title"),
+                cached_year=plex_item.get("year"),
+                cached_rating=plex_item.get("rating"),
+            )
+            updated_count += 1
+        except Exception as e:
+            logger.warning(
+                "sync update fejl for tmdb_id=%s media=%s: %s",
+                plex_item["tmdb_id"], plex_item["media_type"], e,
             )
 
     # Fjern items der ikke længere er i Plex (auto-fjern strategi)
@@ -258,8 +284,8 @@ async def sync_user_watchlist(
     total = await user_data_service.count_watchlist(telegram_id)
 
     logger.info(
-        "Watchlist sync færdig for telegram_id=%s: +%d, -%d, total=%d",
-        telegram_id, added_count, removed_count, total,
+        "Watchlist sync færdig for telegram_id=%s: +%d, -%d, ~%d, total=%d",
+        telegram_id, added_count, removed_count, updated_count, total,
     )
 
     return {
@@ -282,7 +308,10 @@ async def get_watchlist_with_metadata(
     auto_sync: bool = True,
 ) -> dict:
     """
-    Hent brugerens watchlist med beriget metadata (titel, år, rating fra TMDB).
+    Hent brugerens watchlist med beriget metadata (titel, år, rating).
+
+    v0.2.0: Bruger primært cached_* felter fra DB. Fallback til tmdb_metadata
+    for gamle records (oprettet inden v0.2.0) der ikke har cached_*.
 
     Hvis auto_sync=True, sync'er først hvis cache er udløbet.
 
@@ -318,35 +347,45 @@ async def get_watchlist_with_metadata(
     # Hent watchlist fra DB
     db_items = await user_data_service.get_watchlist(telegram_id)
 
-    # Berig med TMDB metadata fra vores tmdb_metadata tabel
+    # Berig hver item: brug cached_* primært, fallback til tmdb_metadata
     enriched_items = []
     for item in db_items:
-        enriched = dict(item)  # Kopiér så vi ikke muterer originalen
+        enriched = dict(item)
 
-        # Forsøg at hente titel/år/rating fra tmdb_metadata cache
-        try:
-            async with _pool_ref().acquire() as conn:
-                meta_row = await conn.fetchrow(
-                    """
-                    SELECT title, year
-                    FROM tmdb_metadata
-                    WHERE tmdb_id = $1 AND media_type = $2
-                    """,
-                    item["tmdb_id"], item["media_type"],
+        # Forsøg primært at bruge cached_* fra DB (sat ved sync)
+        title  = item.get("cached_title")
+        year   = item.get("cached_year")
+        rating = item.get("cached_rating")
+
+        # Fallback: hvis cached_title mangler, prøv tmdb_metadata
+        if not title:
+            try:
+                async with _pool_ref().acquire() as conn:
+                    meta_row = await conn.fetchrow(
+                        """
+                        SELECT title, year
+                        FROM tmdb_metadata
+                        WHERE tmdb_id = $1 AND media_type = $2
+                        """,
+                        item["tmdb_id"], item["media_type"],
+                    )
+                    if meta_row:
+                        title = meta_row["title"]
+                        if not year:
+                            year = meta_row["year"]
+            except Exception as e:
+                logger.warning(
+                    "get_watchlist_with_metadata fallback fejl tmdb=%s: %s",
+                    item["tmdb_id"], e,
                 )
-                if meta_row:
-                    enriched["title"] = meta_row["title"]
-                    enriched["year"]  = meta_row["year"]
-                else:
-                    enriched["title"] = f"#{item['tmdb_id']}"
-                    enriched["year"]  = None
-        except Exception as e:
-            logger.warning(
-                "get_watchlist_with_metadata enrichment fejl tmdb=%s: %s",
-                item["tmdb_id"], e,
-            )
-            enriched["title"] = f"#{item['tmdb_id']}"
-            enriched["year"]  = None
+
+        # Sidste fallback: vis ID hvis vi virkelig intet har
+        if not title:
+            title = f"#{item['tmdb_id']}"
+
+        enriched["title"]  = title
+        enriched["year"]   = year
+        enriched["rating"] = float(rating) if rating else None
 
         enriched_items.append(enriched)
 

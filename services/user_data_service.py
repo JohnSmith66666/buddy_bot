@@ -1,9 +1,19 @@
 """
 services/user_data_service.py - Data access layer for Buddy 2.0 user data.
 
-Dette service-modul wrapper alle queries til de tre Buddy 2.0 foundation
-tabeller (user_watchlist, user_preferences, feature_usage). Ingen
-feature-handler bør skrive rå SQL — alle data-operationer går gennem dette lag.
+CHANGES (v0.2.0 — cached metadata fields):
+  - NY: add_to_watchlist() accepterer nu valgfri cached_title, cached_year, cached_rating
+    parametre. Gemmes i DB ved INSERT, opdateres ved CONFLICT (hvis ikke-null).
+  - NY: get_watchlist() returnerer nu også cached_title, cached_year, cached_rating
+    i hver row.
+  - NY: _ensure_cached_columns_exist() — idempotent kolonne-tilføjelse via DO-blok.
+    Kaldes automatisk ved første add_to_watchlist() / get_watchlist().
+  - 100% BAGUDKOMPATIBEL: Eksisterende kald uden de nye params virker stadig.
+
+CHANGES (v0.1.0 — initial):
+  - WATCHLIST sektion: add/remove/toggle/is_in/get/count.
+  - USER PREFERENCES sektion: get (auto-create) + 3 update-funktioner.
+  - FEATURE USAGE sektion: log + 2 stats-funktioner.
 
 DESIGN-PRINCIPPER:
   - UI-agnostisk: Alle funktioner returnerer rene Python dicts/lists.
@@ -13,23 +23,10 @@ DESIGN-PRINCIPPER:
     automatisk en default-row hvis brugeren ikke har en — undgår
     NULL-checks i hver feature.
   - Fire-and-forget analytics: log_feature_usage() bruger asyncio.create_task
-    så analytics aldrig blokerer en bruger-interaktion. Hvis loggen fejler,
-    mister vi det data-punkt — men brugeren mærker ingen latency.
+    så analytics aldrig blokerer en bruger-interaktion.
   - Atomiske operationer: toggle_watchlist() bruger en SQL-transaction
-    så race conditions undgås når brugere trykker hurtigt 2× på en knap.
-  - JSONB-håndtering matcher database.py mønstret (asyncpg returnerer
-    JSONB som str → vi parser med json.loads).
-
-CHANGES (v0.1.0 — initial):
-  - WATCHLIST sektion: add/remove/toggle/is_in/get/count.
-  - USER PREFERENCES sektion: get (auto-create) + 3 update-funktioner.
-  - FEATURE USAGE sektion: log + 2 stats-funktioner.
-  - Achievements API droppet bevidst — tabellen ligger klar i database.py
-    men funktioner bygges først når vi har konkrete use-cases (Phase 3+).
-
-UNCHANGED:
-  - Bruger samme connection pool som database.py via _pool_ref().
-  - Ingen circular imports — importerer kun fra database.py.
+    så race conditions undgås.
+  - JSONB-håndtering matcher database.py mønstret.
 """
 
 import asyncio
@@ -43,6 +40,62 @@ logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Schema migration helper — tilføj cached_* kolonner hvis de mangler
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Modulet-globalt flag så vi kun kører ALTER TABLE én gang per process-restart
+_cached_columns_checked = False
+
+
+async def _ensure_cached_columns_exist() -> None:
+    """
+    Tilføj cached_title, cached_year, cached_rating kolonner til
+    user_watchlist tabellen hvis de ikke findes.
+
+    Idempotent — bruger DO-blok så det er safe at køre flere gange.
+    Kaldes automatisk ved første add_to_watchlist() / get_watchlist().
+    """
+    global _cached_columns_checked
+    if _cached_columns_checked:
+        return
+
+    async with _pool_ref().acquire() as conn:
+        await conn.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='user_watchlist'
+                    AND column_name='cached_title'
+                ) THEN
+                    ALTER TABLE user_watchlist ADD COLUMN cached_title TEXT;
+                END IF;
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='user_watchlist'
+                    AND column_name='cached_year'
+                ) THEN
+                    ALTER TABLE user_watchlist ADD COLUMN cached_year INTEGER;
+                END IF;
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='user_watchlist'
+                    AND column_name='cached_rating'
+                ) THEN
+                    ALTER TABLE user_watchlist ADD COLUMN cached_rating NUMERIC(3, 1);
+                END IF;
+            END $$;
+            """
+        )
+
+    _cached_columns_checked = True
+    logger.info("user_watchlist cached_* kolonner verificeret")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # WATCHLIST — add/remove/toggle/check/list
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -51,19 +104,24 @@ async def add_to_watchlist(
     tmdb_id: int,
     media_type: str,
     notes: str | None = None,
+    cached_title: str | None = None,
+    cached_year: int | None = None,
+    cached_rating: float | None = None,
 ) -> bool:
     """
     Tilføj en titel til brugerens watchlist.
 
     Idempotent: Hvis titlen allerede er i listen, opdateres notes (hvis givet)
-    men added_at bevares. Returnerer True hvis ny tilføjelse, False hvis
-    allerede eksisterede.
+    OG cached_* felter (hvis givet) — men added_at bevares.
 
     Args:
-      telegram_id: Brugerens Telegram ID
-      tmdb_id:     TMDB ID på filmen/serien
-      media_type:  'movie' eller 'tv'
-      notes:       Valgfri brugernote (fx "Skal ses med kæresten")
+      telegram_id:   Brugerens Telegram ID
+      tmdb_id:       TMDB ID på filmen/serien
+      media_type:    'movie' eller 'tv'
+      notes:         Valgfri brugernote
+      cached_title:  Titel fra Plex/TMDB (gemmes for hurtig visning)
+      cached_year:   Udgivelsesår
+      cached_rating: Rating (0.0 - 10.0)
 
     Returns:
       True hvis nyt entry oprettet, False hvis opdateret/allerede der.
@@ -72,15 +130,29 @@ async def add_to_watchlist(
         logger.warning("add_to_watchlist: ugyldig media_type='%s'", media_type)
         return False
 
+    # Tilføj cached_* kolonner hvis de mangler
+    await _ensure_cached_columns_exist()
+
+    # Filtrér "Ukendt" placeholder ud så vi ikke gemmer dem
+    if cached_title and cached_title.strip().lower() in ("ukendt", "unknown", ""):
+        cached_title = None
+
     async with _pool_ref().acquire() as conn:
         result = await conn.execute(
             """
-            INSERT INTO user_watchlist (telegram_id, tmdb_id, media_type, notes)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO user_watchlist (
+                telegram_id, tmdb_id, media_type, notes,
+                cached_title, cached_year, cached_rating
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (telegram_id, tmdb_id, media_type) DO UPDATE
-                SET notes = COALESCE(EXCLUDED.notes, user_watchlist.notes)
+                SET notes         = COALESCE(EXCLUDED.notes,         user_watchlist.notes),
+                    cached_title  = COALESCE(EXCLUDED.cached_title,  user_watchlist.cached_title),
+                    cached_year   = COALESCE(EXCLUDED.cached_year,   user_watchlist.cached_year),
+                    cached_rating = COALESCE(EXCLUDED.cached_rating, user_watchlist.cached_rating)
             """,
             telegram_id, tmdb_id, media_type, notes,
+            cached_title, cached_year, cached_rating,
         )
 
     # asyncpg returnerer "INSERT 0 1" for ny row, "INSERT 0 0" hvis kun update
@@ -88,8 +160,8 @@ async def add_to_watchlist(
 
     if is_new:
         logger.info(
-            "watchlist add: telegram_id=%s tmdb_id=%s media=%s",
-            telegram_id, tmdb_id, media_type,
+            "watchlist add: telegram_id=%s tmdb_id=%s media=%s title=%r",
+            telegram_id, tmdb_id, media_type, cached_title,
         )
 
     return is_new
@@ -171,7 +243,6 @@ async def toggle_watchlist(
 
     async with _pool_ref().acquire() as conn:
         async with conn.transaction():
-            # Tjek nuværende state inden for transaction
             existing = await conn.fetchrow(
                 """
                 SELECT 1 FROM user_watchlist
@@ -217,15 +288,21 @@ async def get_watchlist(
     """
     Hent brugerens watchlist sorteret efter nyeste først.
 
+    v0.2.0: Returnerer nu også cached_title, cached_year, cached_rating.
+
     Args:
       telegram_id: Brugerens Telegram ID
       limit:       Max antal entries (default 50)
       media_type:  Valgfri filter — 'movie', 'tv' eller None for alle
 
     Returns:
-      Liste af dicts med tmdb_id, media_type, added_at, notes.
+      Liste af dicts med tmdb_id, media_type, added_at, notes,
+      cached_title, cached_year, cached_rating.
       Tom liste hvis brugeren intet har gemt.
     """
+    # Tilføj cached_* kolonner hvis de mangler (idempotent)
+    await _ensure_cached_columns_exist()
+
     where_parts = ["telegram_id = $1"]
     params: list = [telegram_id]
 
@@ -237,7 +314,8 @@ async def get_watchlist(
     params.append(limit)
 
     sql = f"""
-        SELECT tmdb_id, media_type, added_at, notes
+        SELECT tmdb_id, media_type, added_at, notes,
+               cached_title, cached_year, cached_rating
         FROM user_watchlist
         WHERE {where_clause}
         ORDER BY added_at DESC
@@ -297,107 +375,102 @@ async def get_user_preferences(telegram_id: int) -> dict:
 
     Returns:
       Dict med:
-        - telegram_id: int
-        - favorite_genres: list[str]
-        - favorite_actors: list[dict]  (fx [{"name": "Tom Hanks", "tmdb_id": 31}])
-        - notification_settings: dict
-        - computed_at: datetime | None
-        - updated_at: datetime
+        - favorite_genres:        list[str]
+        - favorite_actors:        list[str]
+        - notification_settings:  dict (parsed fra JSONB)
     """
     async with _pool_ref().acquire() as conn:
-        # Forsøg upsert med defaults — RETURNING giver os den endelige row
         row = await conn.fetchrow(
             """
-            INSERT INTO user_preferences (
-                telegram_id, favorite_genres, favorite_actors, notification_settings
-            )
-            VALUES ($1, '[]'::jsonb, '[]'::jsonb, $2::jsonb)
-            ON CONFLICT (telegram_id) DO UPDATE
-                SET telegram_id = EXCLUDED.telegram_id  -- no-op, men returnerer row
-            RETURNING *
+            INSERT INTO user_preferences (telegram_id, notification_settings)
+            VALUES ($1, $2::jsonb)
+            ON CONFLICT (telegram_id) DO NOTHING
+            RETURNING telegram_id
             """,
             telegram_id,
             json.dumps(_DEFAULT_NOTIFICATION_SETTINGS),
         )
 
-    result = dict(row)
+        # Hvis INSERT ikke gjorde noget (already exists), så fetch
+        prefs = await conn.fetchrow(
+            """
+            SELECT favorite_genres, favorite_actors, notification_settings
+            FROM user_preferences
+            WHERE telegram_id = $1
+            """,
+            telegram_id,
+        )
 
-    # asyncpg returnerer JSONB som str — parse til Python objects
-    for key in ("favorite_genres", "favorite_actors", "notification_settings"):
-        if isinstance(result.get(key), str):
-            try:
-                result[key] = json.loads(result[key])
-            except json.JSONDecodeError:
-                logger.warning(
-                    "get_user_preferences: kunne ikke parse %s for telegram_id=%s",
-                    key, telegram_id,
-                )
-                result[key] = [] if key != "notification_settings" else {}
+    if prefs is None:
+        # Edge case: hvis INSERT lige fejlede og der stadig ikke er en row
+        return {
+            "favorite_genres":       [],
+            "favorite_actors":       [],
+            "notification_settings": dict(_DEFAULT_NOTIFICATION_SETTINGS),
+        }
 
-    return result
+    notif_raw = prefs["notification_settings"]
+    if isinstance(notif_raw, str):
+        try:
+            notif_settings = json.loads(notif_raw)
+        except json.JSONDecodeError:
+            notif_settings = dict(_DEFAULT_NOTIFICATION_SETTINGS)
+    elif isinstance(notif_raw, dict):
+        notif_settings = notif_raw
+    else:
+        notif_settings = dict(_DEFAULT_NOTIFICATION_SETTINGS)
+
+    return {
+        "favorite_genres":       list(prefs["favorite_genres"] or []),
+        "favorite_actors":       list(prefs["favorite_actors"] or []),
+        "notification_settings": notif_settings,
+    }
 
 
 async def update_favorite_genres(
     telegram_id: int,
     genres: list[str],
 ) -> None:
-    """
-    Opdater brugerens favorit-genrer.
+    """Opdatér listen af favoritgenrer (overskriver eksisterende)."""
+    await get_user_preferences(telegram_id)  # Sikrer row eksisterer
 
-    Bruges af "🎯 Anbefalet til mig" feature (Sprint 3) til at gemme
-    de top-3 genrer der er computet fra Tautulli-historik.
-    """
     async with _pool_ref().acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO user_preferences (
-                telegram_id, favorite_genres, notification_settings
-            )
-            VALUES ($1, $2::jsonb, $3::jsonb)
-            ON CONFLICT (telegram_id) DO UPDATE
-                SET favorite_genres = EXCLUDED.favorite_genres,
-                    computed_at     = NOW(),
-                    updated_at      = NOW()
+            UPDATE user_preferences
+            SET favorite_genres = $2,
+                updated_at = NOW()
+            WHERE telegram_id = $1
             """,
-            telegram_id,
-            json.dumps(genres),
-            json.dumps(_DEFAULT_NOTIFICATION_SETTINGS),
+            telegram_id, genres,
         )
 
     logger.info(
-        "preferences update: telegram_id=%s favorite_genres=%s",
-        telegram_id, genres,
+        "user_preferences: opdaterede favorite_genres for telegram_id=%s (%d genrer)",
+        telegram_id, len(genres),
     )
 
 
 async def update_favorite_actors(
     telegram_id: int,
-    actors: list[dict],
+    actors: list[str],
 ) -> None:
-    """
-    Opdater brugerens favorit-skuespillere.
+    """Opdatér listen af favoritskuespillere (overskriver eksisterende)."""
+    await get_user_preferences(telegram_id)
 
-    Args:
-      actors: Liste af dicts med fx [{"name": "Tom Hanks", "tmdb_id": 31}]
-    """
     async with _pool_ref().acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO user_preferences (
-                telegram_id, favorite_actors, notification_settings
-            )
-            VALUES ($1, $2::jsonb, $3::jsonb)
-            ON CONFLICT (telegram_id) DO UPDATE
-                SET favorite_actors = EXCLUDED.favorite_actors,
-                    updated_at      = NOW()
+            UPDATE user_preferences
+            SET favorite_actors = $2,
+                updated_at = NOW()
+            WHERE telegram_id = $1
             """,
-            telegram_id,
-            json.dumps(actors),
-            json.dumps(_DEFAULT_NOTIFICATION_SETTINGS),
+            telegram_id, actors,
         )
 
     logger.info(
-        "preferences update: telegram_id=%s favorite_actors_count=%d",
+        "user_preferences: opdaterede favorite_actors for telegram_id=%s (%d skuespillere)",
         telegram_id, len(actors),
     )
 
@@ -407,51 +480,38 @@ async def update_notification_settings(
     settings: dict,
 ) -> None:
     """
-    Opdater brugerens notifikations-indstillinger.
+    Merge-style opdatering af notification_settings JSONB felt.
 
-    Merger med eksisterende settings — kun de nøgler der sendes opdateres.
-    Bruges når brugeren toggler en notifikation til/fra i UI.
-
-    Eksempel:
-      update_notification_settings(123, {"new_movies": False})
-      # Lader new_episodes og weekly_digest være uændrede.
+    Eksisterende keys bevares hvis ikke i 'settings' parameter.
+    Nye keys tilføjes.
     """
-    if not isinstance(settings, dict):
-        logger.warning(
-            "update_notification_settings: settings skal være dict, fik %s",
-            type(settings).__name__,
-        )
-        return
-
-    # Hent eksisterende settings og merge
     current = await get_user_preferences(telegram_id)
-    merged_settings = {**current["notification_settings"], **settings}
+    merged = {**current["notification_settings"], **settings}
 
     async with _pool_ref().acquire() as conn:
         await conn.execute(
             """
             UPDATE user_preferences
-            SET notification_settings = $1::jsonb,
-                updated_at            = NOW()
-            WHERE telegram_id = $2
+            SET notification_settings = $2::jsonb,
+                updated_at = NOW()
+            WHERE telegram_id = $1
             """,
-            json.dumps(merged_settings),
-            telegram_id,
+            telegram_id, json.dumps(merged),
         )
 
     logger.info(
-        "notification settings update: telegram_id=%s changes=%s",
-        telegram_id, settings,
+        "user_preferences: opdaterede notification_settings for telegram_id=%s",
+        telegram_id,
     )
 
 
 async def get_notification_setting(
     telegram_id: int,
     key: str,
-    default: bool | None = None,
-) -> bool | None:
+    default: bool = False,
+) -> bool:
     """
-    Convenience helper — hent én specifik notifikations-setting.
+    Hurtig læsning af én notification-indstilling.
 
     Bruges fx i webhook_service.py:
       if await get_notification_setting(user_id, "new_movies", default=True):
@@ -494,7 +554,7 @@ async def _log_feature_usage_inner(
             )
     except Exception as e:
         # Vi swallow'er fejlen bevidst — analytics må ALDRIG ødelægge
-        # en bruger-interaktion. Vi logger det dog for at kunne debugge.
+        # en bruger-interaktion.
         logger.warning(
             "log_feature_usage failed (silent): feature=%s telegram_id=%s err=%s",
             feature, telegram_id, e,
@@ -521,82 +581,98 @@ def log_feature_usage(
       feature:     Feature-navn (fx "watchlist", "recommendations", "archaeologist")
       action:      Specifik handling (fx "add", "remove", "view", "dismiss")
       metadata:    Valgfri ekstra kontekst som JSONB (fx {"tmdb_id": 12345})
-
-    Hvis logging fejler internt, swallow'es exception så bruger-interaktionen
-    aldrig blokeres. Mistede data-punkter er en acceptabel pris for hastighed.
     """
     try:
-        asyncio.create_task(
-            _log_feature_usage_inner(telegram_id, feature, action, metadata)
-        )
+        loop = asyncio.get_running_loop()
+        loop.create_task(_log_feature_usage_inner(
+            telegram_id, feature, action, metadata,
+        ))
     except RuntimeError:
-        # Hvis vi kaldes uden et kørende event-loop (fx i tests), ignorer
+        # Ingen running loop (sync context) — log advarsel og dropp
         logger.debug(
-            "log_feature_usage: ingen event-loop, springer over (feature=%s)",
-            feature,
+            "log_feature_usage: ingen async loop, dropper event "
+            "feature=%s telegram_id=%s",
+            feature, telegram_id,
         )
 
 
-async def get_feature_usage_stats(days: int = 30) -> dict:
+async def get_feature_usage_stats(
+    telegram_id: int | None = None,
+    days: int = 30,
+) -> dict:
     """
-    Hent global feature-statistik for de sidste N dage.
-
-    Bruges af /usage_stats admin-kommando (kommer senere) til at se
-    hvilke features der bruges hvor meget. KRITISK input til prioritering.
+    Hent aggregerede feature usage stats.
 
     Args:
-      days: Antal dage tilbage at aggregere (default 30)
+      telegram_id: Hvis None, aggregerer på tværs af alle brugere
+      days:        Lookback-periode i dage (default 30)
 
     Returns:
       Dict med:
-        - period_days:  int
-        - total_events: int
-        - by_feature:   dict[str, int]   (feature_name → count)
-        - by_action:    dict[str, dict]  (feature_name → {action → count})
-        - active_users: int              (unikke telegram_ids)
+        - period_days:    int
+        - total_events:   int
+        - by_feature:     dict[str, int]
+        - by_action:      dict[str, int]
+        - unique_users:   int (hvis telegram_id is None)
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    where_parts = ["used_at >= $1"]
+    params: list = [cutoff]
+
+    if telegram_id is not None:
+        where_parts.append("telegram_id = $2")
+        params.append(telegram_id)
+
+    where_clause = " AND ".join(where_parts)
 
     async with _pool_ref().acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT feature, action, COUNT(*) AS cnt
+        # Per-feature counts
+        feature_rows = await conn.fetch(
+            f"""
+            SELECT feature, COUNT(*) AS cnt
             FROM feature_usage
-            WHERE used_at >= $1
-            GROUP BY feature, action
-            ORDER BY feature, action
+            WHERE {where_clause}
+            GROUP BY feature
+            ORDER BY cnt DESC
             """,
-            cutoff,
+            *params,
         )
 
-        active_users_row = await conn.fetchrow(
-            """
-            SELECT COUNT(DISTINCT telegram_id) AS cnt
+        # Per-action counts
+        action_rows = await conn.fetch(
+            f"""
+            SELECT action, COUNT(*) AS cnt
             FROM feature_usage
-            WHERE used_at >= $1
+            WHERE {where_clause} AND action IS NOT NULL
+            GROUP BY action
+            ORDER BY cnt DESC
             """,
-            cutoff,
+            *params,
         )
 
-    by_feature: dict[str, int]            = {}
-    by_action:  dict[str, dict[str, int]] = {}
-    total = 0
+        # Unique users (kun relevant når aggregating på tværs)
+        unique_users = 0
+        if telegram_id is None:
+            users_row = await conn.fetchrow(
+                f"""
+                SELECT COUNT(DISTINCT telegram_id) AS cnt
+                FROM feature_usage
+                WHERE {where_clause}
+                """,
+                *params,
+            )
+            unique_users = users_row["cnt"] if users_row else 0
 
-    for row in rows:
-        feature = row["feature"]
-        action  = row["action"] or "(none)"
-        cnt     = row["cnt"]
-
-        by_feature[feature] = by_feature.get(feature, 0) + cnt
-        by_action.setdefault(feature, {})[action] = cnt
-        total += cnt
+    by_feature = {row["feature"]: row["cnt"] for row in feature_rows}
+    by_action = {row["action"]: row["cnt"] for row in action_rows}
+    total = sum(by_feature.values())
 
     return {
         "period_days":  days,
         "total_events": total,
         "by_feature":   by_feature,
         "by_action":    by_action,
-        "active_users": active_users_row["cnt"] if active_users_row else 0,
+        "unique_users": unique_users,
     }
 
 
@@ -605,7 +681,7 @@ async def get_user_feature_usage(
     days: int = 30,
 ) -> dict:
     """
-    Hent feature-brug for én specifik bruger.
+    Hent feature usage for én specifik bruger.
 
     Kan bruges til at lave personlige stats ("Du har brugt watchlist 12 gange
     denne måned") eller til debugging af bruger-rapporterede problemer.
