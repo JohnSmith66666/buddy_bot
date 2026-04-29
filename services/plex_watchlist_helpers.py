@@ -8,6 +8,17 @@ Dette modul lever separat fra plex_service.py for at holde plex_service.py
 fokuseret på bibliotek-operationer. Watchlist-relaterede helpers er en
 naturligt afgrænset bekymring der er nemmere at vedligeholde isoleret.
 
+CHANGES (v0.2.0 — fix A1 (Plex rating crash)):
+  - FIX: _safe_rating() helper håndterer alle Plex rating-formater robust:
+    * float (8.7) → 8.7
+    * int (8)     → 8.0
+    * string ("8.7" / "PG-13") → 8.7 / None
+    * None        → None
+    * Andet       → None
+  - Tidligere: invalid rating fra Plex (fx "PG-13") gav PostgreSQL fejl
+    "invalid input syntax for type numeric" og titlen blev ikke gemt
+    med rating. Now: vi cast'er silent til None hvis ikke et tal.
+
 CHANGES (v0.1.0 — initial):
   - fetch_plex_watchlist() async wrapper.
   - _fetch_plex_watchlist_sync() synkron implementering.
@@ -30,6 +41,76 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _safe_rating(item) -> float | None:
+    """
+    Hent rating fra et Plex-item på en defensiv måde.
+
+    Plex's audienceRating og rating-attributter kan være:
+      - float (forventet, fx 8.7)
+      - int (sjælden, fx 8)
+      - None (ikke alle titler har rating)
+      - string (sjældent, fx parental rating "PG-13")
+      - Andet uventet
+
+    Vi konverterer alt til float, eller returnerer None hvis det ikke kan lade sig gøre.
+    Dette undgår PostgreSQL-fejl: 'invalid input syntax for type numeric'.
+
+    Returns:
+      float i range [0.0, 10.0] hvis konvertering lykkes, ellers None.
+    """
+    raw = getattr(item, "audienceRating", None)
+    if raw is None:
+        raw = getattr(item, "rating", None)
+    if raw is None:
+        return None
+
+    try:
+        value = float(raw)
+    except (ValueError, TypeError):
+        # String der ikke er et tal, eller andet uventet
+        logger.debug(
+            "_safe_rating: kunne ikke konvertere rating=%r (type=%s) for item '%s'",
+            raw, type(raw).__name__, getattr(item, "title", "?"),
+        )
+        return None
+
+    # Sanity-check: rating skal være i [0.0, 10.0]
+    if value < 0.0 or value > 10.0:
+        logger.debug(
+            "_safe_rating: rating %f out of range for item '%s' — discarding",
+            value, getattr(item, "title", "?"),
+        )
+        return None
+
+    return value
+
+
+def _safe_year(item) -> int | None:
+    """
+    Hent year fra et Plex-item defensivt.
+
+    Plex returnerer normalt int, men kan returnere None eller string i sjældne tilfælde.
+    """
+    raw = getattr(item, "year", None)
+    if raw is None:
+        return None
+
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        logger.debug(
+            "_safe_year: kunne ikke konvertere year=%r for item '%s'",
+            raw, getattr(item, "title", "?"),
+        )
+        return None
+
+    # Sanity-check: realistisk år (1800-2100)
+    if value < 1800 or value > 2100:
+        return None
+
+    return value
+
 
 def _normalize_watchlist_item(item) -> dict | None:
     """
@@ -60,8 +141,8 @@ def _normalize_watchlist_item(item) -> dict | None:
             "tmdb_id":    tmdb_id,
             "media_type": media_type,
             "title":      getattr(item, "title", "Ukendt"),
-            "year":       getattr(item, "year", None),
-            "rating":     getattr(item, "audienceRating", None) or getattr(item, "rating", None),
+            "year":       _safe_year(item),    # ← v0.2.0: defensiv
+            "rating":     _safe_rating(item),  # ← v0.2.0: defensiv (FIX A1)
         }
     except Exception as e:
         logger.warning("_normalize_watchlist_item fejl: %s", e)
