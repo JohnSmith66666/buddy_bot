@@ -1,39 +1,24 @@
 """
 features/watchlist/__init__.py - Watchlist feature for Buddy 2.0.
 
-Brugerens personlige watchlist: titler de har gemt for senere visning.
-Dette er den FØRSTE rigtige feature i Buddy 2.0 og fungerer som template
-for alle fremtidige features.
+CHANGES (v0.2.0 — main menu integration):
+  - Tilføjet category=PERSONAL og status=STUB attributter.
+  - Status=STUB betyder labellen vises med 🔧 emoji i hovedmenuen
+    så brugeren ved featuren er under bygning.
+  - Tilføjet "back:main" handler så ⬅️ Tilbage knap virker.
 
-STATUS: STUB v0.1.0
-  - Feature er registreret i FeatureRegistry.
-  - Hovedmenu-knap virker og åbner en placeholder-besked.
-  - Selve add/remove/list flows bygges i NÆSTE iteration.
-  - Database-laget (user_data_service) er klar — vi mangler kun
-    Telegram-handlers og keyboards.
-
-ARKITEKTUR:
-    features/watchlist/
-    ├── __init__.py     ← denne fil — Feature class + register
-    ├── handlers.py     ← Telegram callbacks (kommer i næste iteration)
-    ├── service.py      ← forretningslogik wrapper (kommer i næste iteration)
-    ├── keyboards.py    ← inline keyboards (kommer i næste iteration)
-    └── messages.py     ← danske tekst-templates (kommer i næste iteration)
+UNCHANGED (v0.1.0):
+  - WatchlistFeature klasse oprettet og registreret.
+  - register_handlers() opretter CallbackQueryHandler for "menu:watchlist".
+  - Stub-handler viser placeholder-besked + tilbage-knap.
 
 CALLBACK_DATA-KONVENTION:
-  - menu:watchlist                — main menu klik (åbn watchlist)
-  - watchlist:list                — vis hele listen
-  - watchlist:add:<tmdb>:<type>   — tilføj titel
-  - watchlist:remove:<tmdb>:<type> — fjern titel
-  - watchlist:toggle:<tmdb>:<type> — toggle (bruges af filmkort-knap)
-  - watchlist:clear:confirm       — bekræft sletning af hele listen
-  - watchlist:back                — tilbage til hovedmenu
-
-CHANGES (v0.1.0 — initial stub):
-  - WatchlistFeature klasse oprettet og registreret.
-  - register_handlers() opretter én CallbackQueryHandler for "menu:watchlist".
-  - Stub-handler viser placeholder-besked + tilbage-knap.
-  - Ingen rigtige flows endnu — næste iteration bygger dem ud.
+  - menu:watchlist                 — main menu klik (åbn watchlist)
+  - watchlist:list                 — vis hele listen (kommer)
+  - watchlist:add:<tmdb>:<type>    — tilføj titel (kommer)
+  - watchlist:remove:<tmdb>:<type> — fjern titel (kommer)
+  - watchlist:toggle:<tmdb>:<type> — toggle (kommer)
+  - watchlist:back                 — tilbage til hovedmenu
 """
 
 import logging
@@ -41,26 +26,21 @@ import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 
-from features import Feature, FeatureRegistry
+from features import Feature, FeatureCategory, FeatureRegistry, FeatureStatus
 from services import user_data_service
 
 logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stub handlers (erstattes i næste iteration med rigtige flows)
+# Stub handlers (erstattes i næste iteration)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _handle_watchlist_menu(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """
-    Stub: Brugeren trykkede '📺 Min watchlist' i hovedmenu.
-
-    Viser midlertidig placeholder + tæller hvor mange titler der er.
-    Næste iteration: vis rigtig liste med tilføj/fjern/se-detaljer knapper.
-    """
+    """Stub: Brugeren trykkede '📺 Min watchlist' i hovedmenu."""
     query = update.callback_query
     await query.answer()
 
@@ -84,7 +64,7 @@ async def _handle_watchlist_menu(
 
     if total == 0:
         text = (
-            "📺 *Min watchlist*\n\n"
+            "📺 *Min watchlist* 🔧\n\n"
             "_Du har ikke gemt nogen titler endnu._\n\n"
             "Når du finder en spændende film eller serie, "
             "kan du gemme den her med ⭐-knappen — så kan vi finde den frem igen senere.\n\n"
@@ -92,7 +72,7 @@ async def _handle_watchlist_menu(
         )
     else:
         text = (
-            f"📺 *Min watchlist*\n\n"
+            f"📺 *Min watchlist* 🔧\n\n"
             f"Du har gemt:\n"
             f"  🎬 *{movie_count}* film\n"
             f"  📺 *{tv_count}* serier\n"
@@ -127,17 +107,16 @@ class WatchlistFeature(Feature):
     """
     📺 Min watchlist — bruger-gemte titler til senere visning.
 
-    Foundation for andre features i Buddy 2.0:
-      - "🎯 Anbefalet til mig" bruger watchlist-data til at forstå smag
-      - "🏛 Biblioteks-Arkæologen" filtrerer titler der allerede er på watchlist
-      - Notifikationer kan vække når en watchlist-titel bliver tilgængelig
+    Foundation for andre features i Buddy 2.0.
     """
 
     id            = "watchlist"
     label         = "📺 Min watchlist"
     enabled       = True
     requires_plex = True
-    menu_order    = 30  # Mellem-tidlig position i hovedmenuen
+    menu_order    = 30
+    category      = FeatureCategory.PERSONAL
+    status        = FeatureStatus.STUB  # 🔧 Under bygning
 
     description = (
         "Gem film og serier til senere visning. "
@@ -145,22 +124,11 @@ class WatchlistFeature(Feature):
     )
 
     def register_handlers(self, app: Application) -> None:
-        """
-        Registrér watchlist-relaterede Telegram handlers.
-
-        v0.1.0 (stub): Kun hovedmenu-callback registreret.
-        Næste iteration: list/add/remove/toggle/clear callbacks.
-        """
+        """Registrér watchlist-relaterede Telegram handlers."""
         # Hovedmenu-knap → åbn watchlist
         app.add_handler(CallbackQueryHandler(
             _handle_watchlist_menu,
             pattern=r"^menu:watchlist$",
         ))
 
-        # FREMTIDIGE handlers (kommenteret ud — kommer i næste iteration):
-        # app.add_handler(CallbackQueryHandler(
-        #     handle_watchlist_action,
-        #     pattern=r"^watchlist:(list|add|remove|toggle|clear):",
-        # ))
-
-        logger.debug("WatchlistFeature handlers registreret (stub v0.1.0)")
+        logger.debug("WatchlistFeature handlers registreret (stub v0.2.0)")

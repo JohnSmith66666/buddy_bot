@@ -199,7 +199,15 @@ from services.subgenre_service import (
 from services.v2_service import find_unwatched_v2
 from services.webhook_service import handle_radarr_webhook, handle_sonarr_webhook
 from features import FeatureRegistry
-import features.watchlist  # noqa: F401 — trigger @FeatureRegistry.register
+import features.main_menu  # noqa: F401
+import features.watch      # noqa: F401
+import features.watchlist  # noqa: F401
+from features.main_menu import register_main_menu_handlers, show_main_menu
+from features.main_menu.keyboards import (
+    FEEDBACK_BUTTON_LABEL,
+    HOME_BUTTON_LABEL,
+    build_persistent_reply_keyboard,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -3412,7 +3420,7 @@ BRUGERGUIDE_URL = "https://johnsmith66666.github.io/buddy-guide/"
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Velkomst-handler for /start."""
+    """Velkomst-handler for /start. Buddy 2.0: viser ny hovedmenu."""
     if not await _guard(update):
         return
     user = update.effective_user
@@ -3421,21 +3429,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _needs_plex_setup(update):
         return
 
-    reply = (
-        f"👋 Hej {user.first_name}!\n\n"
-        "Jeg er din personlige medie-assistent for Plex. "
-        "Tryk på 🍿 *Hvad skal jeg se?* for at finde noget at se, "
-        "eller bare skriv til mig som til en ven.\n\n"
-        "Har du en idé eller fundet en bug? Tryk på 💬 *Feedback*-knappen.\n\n"
-        f"📖 [Brugerguide]({BRUGERGUIDE_URL})"
+    # Send velkomst med persistent reply-keyboard (🏠 Hjem + 💬 Feedback)
+    welcome_text = (
+        f"👋 *Hej {user.first_name}!*\n\n"
+        "Jeg er din personlige medie-assistent for Plex.\n\n"
+        f"🆘 Brug for hjælp? [Læs brugerguide]({BRUGERGUIDE_URL})"
     )
+
     await update.message.reply_text(
-        reply,
+        welcome_text,
         parse_mode="Markdown",
-        reply_markup=_build_main_reply_keyboard(),
+        reply_markup=build_persistent_reply_keyboard(),
         disable_web_page_preview=True,
     )
-    await database.log_message(user.id, "outgoing", reply)
+
+    # Vis hovedmenuen som inline-besked direkte efter
+    await show_main_menu(update, context, edit=False)
 
 
 async def cmd_skift_plex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3600,6 +3609,38 @@ async def handle_info_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # ══════════════════════════════════════════════════════════════════════════════
 # Message handler
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# Persistent reply-keyboard handlers (Buddy 2.0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_home_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Brugeren trykkede '🏠 Hjem' på reply-keyboard — vis hovedmenu."""
+    if not await _guard(update):
+        return
+    if await _needs_plex_setup(update):
+        return
+
+    user = update.effective_user
+    await database.log_message(user.id, "incoming", "[home_button]")
+
+    await show_main_menu(update, context, edit=False)
+
+
+async def handle_feedback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Brugeren trykkede '💬 Feedback' på reply-keyboard — start feedback-flow.
+
+    Genbruger den eksisterende feedback-trigger logik. Vi sender bare en
+    indkommende tekst-besked der matcher den eksisterende handler.
+    """
+    if not await _guard(update):
+        return
+    if await _needs_plex_setup(update):
+        return
+
+    # Den eksisterende feedback-flow trigger forventer "💬 Feedback" tekst
+    # — vi har lige modtaget det, så bare videresend til existing handler
+    await handle_feedback_trigger(update, context)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update):
@@ -3950,10 +3991,30 @@ def main() -> None:
     # Photos håndteres af feedback-flow når bruger er i 'awaiting_feedback' state.
     app.add_handler(MessageHandler(filters.PHOTO, handle_feedback_photo))
 
+    1. PHOTO handler (eksisterende)
+    2. NEW: Home button handler (regex-match)
+    3. NEW: Feedback button handler (regex-match)
+    4. handle_text (general TEXT handler — fanger ALT andet)
+    5. FeatureRegistry.register_all_handlers
+    6. register_main_menu_handlers
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     # ── Buddy 2.0 feature handlers ──────────────────────────────────────────
     FeatureRegistry.register_all_handlers(app)
+
+    # ── Buddy 2.0 main menu handlers (registreres separat pga. enabled=False) ─
+    register_main_menu_handlers(app)
+
+    # ── Reply-keyboard text handlers (🏠 Hjem + 💬 Feedback) ────────────────
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.Regex(rf"^{HOME_BUTTON_LABEL}$"),
+        handle_home_button,
+    ))
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.Regex(rf"^{FEEDBACK_BUTTON_LABEL}$"),
+        handle_feedback_button,
+    ))
     
     app.add_error_handler(handle_error)
 
